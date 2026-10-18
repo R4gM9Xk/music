@@ -6,12 +6,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -22,11 +24,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSheet
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassToggle
 import com.local.music.core.ui.components.PageHeader
+import com.local.music.core.ui.components.ProgressTrack
 import com.local.music.core.ui.components.SectionHeader
 import com.local.music.core.ui.components.SettingRow
 import com.local.music.core.ui.components.SheetAction
@@ -50,8 +54,20 @@ private enum class SettingsSheet { Glass, Motion, Eq, Folders }
  * 扫描入口真实重扫 MediaStore；文件夹过滤选项从当前曲库派生。
  */
 @Composable
-fun SettingsScreen(state: AppState, onRescan: () -> Unit = {}, modifier: Modifier = Modifier) {
+fun SettingsScreen(
+    state: AppState,
+    onRescan: (onDone: () -> Unit) -> Unit = { it() },
+    update: UpdateUiState = UpdateUiState(),
+    currentVersionName: String = "",
+    onCheckUpdate: () -> Unit = {},
+    onStartUpdate: () -> Unit = {},
+    onInstallUpdate: () -> Unit = {},
+    allFilesGranted: Boolean = false,
+    onAllFilesAccess: () -> Unit = {},
+    modifier: Modifier = Modifier,
+) {
     var sheet by remember { mutableStateOf<SettingsSheet?>(null) }
+    var showUpdateSheet by remember { mutableStateOf(false) }
     var scanning by remember { mutableStateOf(false) }
 
     // 扫描完成（曲库对象被整体替换）后结束扫描态
@@ -96,7 +112,7 @@ fun SettingsScreen(state: AppState, onRescan: () -> Unit = {}, modifier: Modifie
                 )
                 RowDivider()
                 SettingRow(
-                    GlassIcons.Mic, "歌词", "优先读取本地 .lrc 与内嵌标签",
+                    GlassIcons.Mic, "歌词", "优先读取本地 .lrc 歌词文件",
                     trailing = { GlassToggle(state.lyricEnabled, onToggle = { state.lyricEnabled = it }) },
                 )
             }
@@ -107,8 +123,10 @@ fun SettingsScreen(state: AppState, onRescan: () -> Unit = {}, modifier: Modifie
                     GlassIcons.Folder, "扫描音乐",
                     if (scanning) "扫描中…" else "已收录 ${state.library.size} 首",
                     onClick = {
-                        scanning = true
-                        onRescan()
+                        if (!scanning) {
+                            scanning = true
+                            onRescan { scanning = false } // 成功/失败/结果相同都复位，不依赖曲库状态变化
+                        }
                     },
                 )
                 RowDivider()
@@ -117,9 +135,100 @@ fun SettingsScreen(state: AppState, onRescan: () -> Unit = {}, modifier: Modifie
                     "${state.excludedFolders.size} 个目录已排除",
                     onClick = { sheet = SettingsSheet.Folders },
                 )
+                RowDivider()
+                SettingRow(
+                    GlassIcons.Book, "歌词文件访问",
+                    if (allFilesGranted) "已授权 · 点击重新扫描歌词" else "未授权 · 点击去授权（读取下载目录等歌词）",
+                    onClick = onAllFilesAccess,
+                )
+                if (state.hiddenBuiltInPlaylists.isNotEmpty()) {
+                    RowDivider()
+                    SettingRow(
+                        GlassIcons.Book, "恢复内置歌单",
+                        "重新显示 ${state.hiddenBuiltInPlaylists.size} 个内置歌单",
+                        onClick = { state.restoreBuiltInPlaylists() },
+                    )
+                }
             }
-            Spacer(Modifier.height(18.dp))
+
+            SectionHeader("关于")
+            SettingsCard {
+                val updateSubtitle = when (update.status) {
+                    UpdateUiState.Status.Idle ->
+                        if (currentVersionName.isEmpty()) "检查新版本" else "当前 v$currentVersionName · 检查新版本"
+                    UpdateUiState.Status.Checking -> "正在检查…"
+                    UpdateUiState.Status.UpToDate -> "已是最新版本"
+                    UpdateUiState.Status.Available ->
+                        "发现新版本 v${update.versionName}，点击更新"
+                    UpdateUiState.Status.Downloading ->
+                        "下载中 ${(update.progress * 100).toInt()}%"
+                    UpdateUiState.Status.ReadyToInstall ->
+                        "已下载 v${update.versionName}，点击安装"
+                    UpdateUiState.Status.Failed ->
+                        "检查失败（${update.message ?: "网络异常"}），点击重试"
+                }
+                SettingRow(
+                    GlassIcons.Down, "检查更新", updateSubtitle,
+                    onClick = {
+                        when (update.status) {
+                            UpdateUiState.Status.Available, UpdateUiState.Status.Downloading,
+                            UpdateUiState.Status.ReadyToInstall,
+                            -> showUpdateSheet = true
+                            else -> onCheckUpdate()
+                        }
+                    },
+                )
             }
+            // 底部避让：悬浮 Chrome（迷你条+导航 ≈ 138dp）+ 手势条
+            Spacer(Modifier.navigationBarsPadding().height(146.dp))
+            }
+        }
+    }
+
+    // ── 更新面板（changelog + 进度 + 一键更新）──────────────
+    GlassSheet(
+        visible = showUpdateSheet && update.status in setOf(
+            UpdateUiState.Status.Available, UpdateUiState.Status.Downloading, UpdateUiState.Status.ReadyToInstall,
+        ),
+        onDismiss = { showUpdateSheet = false },
+        title = if (update.versionName != null) "更新到 v${update.versionName}" else "更新",
+    ) {
+        if (update.changelog != null) {
+            Text(
+                update.changelog,
+                color = LocalGlassColors.current.textSecondary,
+                fontSize = 13.sp,
+                lineHeight = 20.sp,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        if (update.status == UpdateUiState.Status.Downloading) {
+            ProgressTrack(progress = update.progress, onSeek = {})
+            Text(
+                "下载中 ${(update.progress * 100).toInt()}%，完成后自动打开安装程序",
+                color = LocalGlassColors.current.textTertiary, fontSize = 11.5.sp,
+                modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
+            )
+        } else {
+            SheetAction(
+                icon = GlassIcons.Down,
+                label = when (update.status) {
+                    UpdateUiState.Status.ReadyToInstall -> "安装已下载的更新"
+                    else -> "立即更新"
+                },
+                subtitle = when (update.status) {
+                    UpdateUiState.Status.ReadyToInstall -> "无需重新下载"
+                    else -> "下载完成后自动打开安装程序"
+                },
+                onClick = {
+                    if (update.status == UpdateUiState.Status.ReadyToInstall) {
+                        onInstallUpdate()
+                    } else {
+                        onStartUpdate()
+                    }
+                },
+            )
         }
     }
 
@@ -170,7 +279,7 @@ fun SettingsScreen(state: AppState, onRescan: () -> Unit = {}, modifier: Modifie
                 subtitle = if (preset == EqPreset.Off) "不启用音效" else "预设 · 实时生效",
                 emphasized = state.eqPreset == preset,
                 onClick = {
-                    state.eqPreset = preset
+                    state.selectEqPreset(preset) // 立即下发服务端 Equalizer
                     sheet = null
                 },
             )

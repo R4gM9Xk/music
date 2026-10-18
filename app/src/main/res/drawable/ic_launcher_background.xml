@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 图标背景：layer-list 实底 + 对角渐变叠加（GradientDrawable 全版本稳定；
+     禁用 vector 内嵌 aapt:attr 渐变——API 36 系统层渲染失败，见工程记忆） -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#FF211E44" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:type="linear"
+                android:angle="315"
+                android:startColor="#FF3A2F6E"
+                android:endColor="#001E2240" />
+        </shape>
+    </item>
+</layer-list>

@@ -146,4 +146,48 @@ object GlassIcons {
     val Moon: ImageVector = icon("moon") {
         fillPath("M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z")
     }
+
+    /** 下一首播放（列表 + 播放三角） */
+    val PlayNext: ImageVector = icon("play_next") {
+        strokePath("M4 6.5h10M4 11.5h7M4 16.5h7", 1.9f)
+        fillPath("M15.5 9.2 21 12.5l-5.5 3.3z")
+    }
+
+    /** 最后播放（列表 + 加号） */
+    val PlayLast: ImageVector = icon("play_last") {
+        strokePath("M4 6.5h10M4 11.5h10M4 16.5h6", 1.9f)
+        strokePath("M17.5 9.5v7M14 13h7", 1.9f)
+    }
+
+    /** 从队列/歌单移除（圆底减号） */
+    val MinusCircle: ImageVector = icon("minus_circle") {
+        strokePath(circlePath(12f, 12f, 8f), 1.8f)
+        strokePath("M8.5 12h7", 1.8f)
+    }
+
+    /** 排序（上下双箭头） */
+    val Sort: ImageVector = icon("sort") {
+        strokePath("M8 18.5v-13M8 5.5 5.5 8M8 5.5l2.5 2.5", 1.8f)
+        strokePath("M16 5.5v13M16 18.5l-2.5-2.5M16 18.5l2.5-2.5", 1.8f)
+    }
+
+    /** 编辑 / 重命名（铅笔） */
+    val Edit: ImageVector = icon("edit") {
+        strokePath("M4.5 19.5 8 18.8 18.6 8.2a1.9 1.9 0 0 0-2.7-2.7L5.3 16.1z", 1.8f)
+        strokePath("m14.7 6.7 2.7 2.7", 1.8f)
+    }
+
+    /** 删除（垃圾桶） */
+    val Trash: ImageVector = icon("trash") {
+        strokePath("M5.5 6.5h13", 1.8f)
+        strokePath("M9.5 6.5v-1A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5v1", 1.8f)
+        strokePath("M7 6.5l.7 11.4a1.9 1.9 0 0 0 1.9 1.8h4.8a1.9 1.9 0 0 0 1.9-1.8L17 6.5", 1.8f)
+        strokePath("M10.2 10.5v5M13.8 10.5v5", 1.8f)
+    }
+
+    /** 专辑（唱片） */
+    val Disc: ImageVector = icon("disc") {
+        strokePath(circlePath(12f, 12f, 8f), 1.8f)
+        fillPath(circlePath(12f, 12f, 1.6f))
+    }
 }

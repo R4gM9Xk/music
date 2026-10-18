@@ -39,14 +39,19 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.ArtThumb
+import com.local.music.core.ui.components.CollectionActionsSheet
+import com.local.music.core.ui.components.DemoSong
+import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.GlassChrome
 import com.local.music.core.ui.components.GlassIconButton
 import com.local.music.core.ui.components.GlassLevel
-import com.local.music.core.ui.components.GlassSheet
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.LocalHazeState
-import com.local.music.core.ui.components.SheetAction
+import com.local.music.core.ui.components.LocalPlayerFlight
+import com.local.music.core.ui.components.ReorderableColumn
+import com.local.music.core.ui.components.SongActionsSheet
 import com.local.music.core.ui.components.SongRow
+import com.local.music.core.ui.components.SongRowHeight
 import com.local.music.core.ui.components.pressScale
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
@@ -58,13 +63,15 @@ import dev.chrisbanes.haze.rememberHazeState
 
 /**
  * 详情页（歌单 / 专辑 / 艺术家 / 文件夹 / 流派 共用模板）：
- * 数据由 AppState.detailData(state.detail) 解析；播放 / 随机 / 曲目行全部接入播放队列。
+ * 数据由 AppState.detailData(state.detail) 解析；播放 / 随机经 playCollection 入队，
+ * 曲目行 ⋯/长按 = 单曲操作面板，顶栏更多 = 集合操作面板。
  */
 @Composable
 fun PlaylistDetailScreen(state: AppState, modifier: Modifier = Modifier) {
     val palette = LocalAuroraPalette.current
     val data = state.detailData(state.detail)
-    var showMore by remember { mutableStateOf(false) }
+    var actionSong by remember { mutableStateOf<DemoSong?>(null) }
+    var showCollectionMenu by remember { mutableStateOf(false) }
 
     if (data == null) {
         // 目标已被删除（如用户歌单）：退回歌单库
@@ -74,19 +81,19 @@ fun PlaylistDetailScreen(state: AppState, modifier: Modifier = Modifier) {
     }
 
     fun playAll(shuffle: Boolean) {
-        if (data.tracks.isEmpty()) return
-        state.shuffleOn = shuffle
-        state.playSong(if (shuffle) data.tracks.random() else data.tracks.first(), data.tracks)
+        state.playCollection(data.tracks, data.title, shuffle)
         state.screen = GlassScreen.Player
     }
+    val flight = LocalPlayerFlight.current
 
     val hazeState = rememberHazeState()
+    val pageScroll = rememberScrollState()
     CompositionLocalProvider(LocalHazeState provides hazeState) {
         Column(modifier.fillMaxSize().statusBarsPadding()) {
             Column(
                 Modifier
                     .weight(1f)
-                    .verticalScroll(rememberScrollState())
+                    .verticalScroll(pageScroll)
                     .hazeSource(hazeState),
             ) {
             // 顶栏：返回 / 类别 / 更多
@@ -100,7 +107,7 @@ fun PlaylistDetailScreen(state: AppState, modifier: Modifier = Modifier) {
                 }
                 Text(data.header, color = LocalGlassColors.current.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.weight(1f))
-                GlassIconButton(onClick = { showMore = true }, size = 36.dp) {
+                GlassIconButton(onClick = { showCollectionMenu = true }, size = 36.dp) {
                     Icon(GlassIcons.More, null, Modifier.size(19.dp), tint = LocalGlassColors.current.textPrimary)
                 }
             }
@@ -163,23 +170,42 @@ fun PlaylistDetailScreen(state: AppState, modifier: Modifier = Modifier) {
                 }
             }
 
-            // 曲目玻璃卡（.card glass → md 层级）
+            // 曲目玻璃卡（.card glass → md 层级）；自建歌单且无失效引用时曲目行可长按拖拽重排
+            val reorderable = state.detail.kind == DetailTarget.Kind.Playlist &&
+                state.canReorderPlaylist(state.detail.id)
+            val renderTrack: @Composable (Int) -> Unit = { index ->
+                val track = data.tracks[index]
+                SongRow(
+                    song = track,
+                    squareThumb = true,
+                    playing = track.id == state.currentSong.id,
+                    wavePlaying = state.playing,
+                    onMoreClick = { actionSong = track },
+                    // 可重排列表里长按专属于拖拽手势，菜单只走 ⋯ 按钮（避免两种长按语义打架）
+                    onLongClick = if (reorderable) null else ({ actionSong = track }),
+                    onClick = {
+                        state.playSong(track, data.tracks, data.title)
+                        state.screen = GlassScreen.Player
+                    },
+                )
+            }
             GlassSurface(
                 modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
                 level = GlassLevel.Md,
                 shape = RoundedCornerShape(18.dp),
             ) {
                 Column(Modifier.padding(vertical = 6.dp)) {
-                    data.tracks.forEach { track ->
-                        SongRow(
-                            song = track,
-                            squareThumb = true,
-                            playing = track.id == state.currentSong.id,
-                            onClick = {
-                                state.playSong(track, data.tracks)
-                                state.screen = GlassScreen.Player
-                            },
-                        )
+                    if (reorderable) {
+                        // 拖拽域 = 自建歌单的 addedTracks 序；列表随页面滚动（autoscroll 关闭：
+                        // 页面滚动容器含头图等额外内容，视口估算不成立，长歌单 v1 可接受）
+                        ReorderableColumn(
+                            count = data.tracks.size,
+                            rowHeight = SongRowHeight,
+                            scrollState = pageScroll,
+                            onMove = { from, to -> state.movePlaylistTrack(state.detail.id, from, to) },
+                        ) { index -> renderTrack(index) }
+                    } else {
+                        repeat(data.tracks.size) { index -> renderTrack(index) }
                     }
                     if (data.tracks.isEmpty()) {
                         Text(
@@ -203,38 +229,40 @@ fun PlaylistDetailScreen(state: AppState, modifier: Modifier = Modifier) {
                     2 -> state.screen = GlassScreen.Settings
                 }
             },
-            onOpenPlayer = { state.screen = GlassScreen.Player },
+            onOpenPlayer = {
+                // 与 GlassApp 的 Chrome 同走共享元素飞行（忙时兜底直切）
+                val f = flight
+                if (f != null && !f.isActive) {
+                    f.beginEntry(state.currentSong, 1) { state.screen = it }
+                } else {
+                    state.screen = GlassScreen.Player
+                }
+            },
             onPlayPause = state::togglePlayPause,
             onNext = { state.next() },
         )
         }
     }
 
-    // 更多面板：播放全部 / 随机播放 / 删除歌单（仅用户自建）
-    GlassSheet(visible = showMore, onDismiss = { showMore = false }, title = data.title) {
-        SheetAction(
-            icon = GlassIcons.Play, label = "全部播放", subtitle = "${data.tracks.size} 首",
-            onClick = {
-                showMore = false
-                playAll(false)
-            },
+    // 集合操作面板（顶栏更多）：全部播放 / 随机 / 下一首全部 / 最后全部 / 重命名 / 删除歌单
+    CollectionActionsSheet(
+        visible = showCollectionMenu,
+        onDismiss = { showCollectionMenu = false },
+        state = state,
+        target = state.detail,
+        title = data.title,
+        tracks = data.tracks,
+        onPlayAll = { shuffle -> playAll(shuffle) },
+    )
+
+    // 单曲操作面板（曲目行 ⋯ / 长按入口；歌单语境提供"从歌单移除"）
+    actionSong?.let { song ->
+        SongActionsSheet(
+            visible = true,
+            onDismiss = { actionSong = null },
+            state = state,
+            song = song,
+            playlistContextId = if (state.detail.kind == DetailTarget.Kind.Playlist) state.detail.id else null,
         )
-        SheetAction(
-            icon = GlassIcons.Shuffle, label = "随机播放", subtitle = "从随机一首开始",
-            onClick = {
-                showMore = false
-                playAll(true)
-            },
-        )
-        if (state.detail.id.startsWith("user-")) {
-            SheetAction(
-                icon = GlassIcons.Folder, label = "删除歌单",
-                onClick = {
-                    showMore = false
-                    state.deletePlaylist(state.detail.id)
-                    state.screen = GlassScreen.Playlist
-                },
-            )
-        }
     }
 }

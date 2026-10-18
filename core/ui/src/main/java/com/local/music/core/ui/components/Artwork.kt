@@ -208,28 +208,30 @@ data class DemoSong(
     val bitrateKbps: Int = 0,
     /** 封面取色派生的极光配色（扫描时由内嵌封面计算）；null = 无封面/未取色，回退 art 占位配色 */
     val palette: com.local.music.core.ui.theme.AuroraPalette? = null,
+    /** MediaStore DATE_ADDED（秒）：「最近添加」排序键；缓存 v1 旧数据缺省 0 */
+    val dateAddedSec: Long = 0,
 ) {
     val subtitle get() = "$artist · $album"
     val duration: String get() = "%d:%02d".format(durationSec / 60, durationSec % 60)
 }
 
 object DemoData {
-    val songs = listOf(
-        DemoSong("night-flight", "夜航西飞", "林之遥", "城市边缘", 256, ArtStyle.Night, genre = "流行"),
-        DemoSong("tide-signal", "潮汐信号", "海边的卡夫卡", "潮汐信号", 232, ArtStyle.Tide, genre = "电子"),
-        DemoSong("afternoon", "午后三点半", "沈青", "慢下来", 304, ArtStyle.Afternoon, folder = "下载", genre = "民谣"),
-        DemoSong("galaxy", "银河公路", "远山乐队", "长途", 278, ArtStyle.Galaxy, folder = "下载", genre = "摇滚"),
-        DemoSong("old-tape", "旧磁带", "周一", "复刻", 201, ArtStyle.Tape, genre = "流行"),
-        DemoSong("white-room", "白色房间", "林之遥", "城市边缘", 242, ArtStyle.Room, genre = "独立"),
-        DemoSong("rain-tower", "雨落信号塔", "海边的卡夫卡", "潮汐信号", 371, ArtStyle.Tide, folder = "下载", genre = "电子"),
-        DemoSong("south-story", "城南旧事", "沈青", "慢下来", 287, ArtStyle.Afternoon, folder = "录音", genre = "民谣"),
-        // 仅搜索可见（单曲/伴奏版），不进曲库列表——对齐设计稿搜索结果
-        DemoSong("night-shuttle", "夜航班车", "远山乐队", "长途", 238, ArtStyle.Galaxy, inLibrary = false),
-        DemoSong("night-flight-instr", "夜航西飞（伴奏）", "林之遥", "城市边缘", 256, ArtStyle.Night, inLibrary = false),
+    /** 空队列兜底占位曲：仅在曲库尚未装载/无曲库时防越界，正常界面不可见 */
+    val placeholder = DemoSong(
+        id = "placeholder",
+        title = "暂无歌曲",
+        artist = "本地曲库",
+        album = "未扫描",
+        durationSec = 1,
+        art = ArtStyle.Night,
+        inLibrary = false,
     )
 
+    /** 演示曲库已移除：曲库内容唯一来源 = MediaStore 真实扫描（含曲库缓存） */
+    val songs: List<DemoSong> get() = emptyList()
+
     /** 曲库列表（tab「歌曲」与扫描计数口径） */
-    val librarySongs: List<DemoSong> get() = songs.filter { it.inLibrary }
+    val librarySongs: List<DemoSong> get() = emptyList()
 }
 
 fun Int.asTime(): String = "%02d:%02d".format(this / 60, this % 60)

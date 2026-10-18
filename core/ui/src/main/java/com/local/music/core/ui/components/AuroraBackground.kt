@@ -16,10 +16,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import com.local.music.core.ui.theme.LocalAuroraPalette
+import com.local.music.core.ui.theme.LocalIsDark
 
 /** CSS ease-in-out 曲线（cubic-bezier(0.42, 0, 0.58, 1)） */
 private val CssEaseInOut = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
@@ -34,7 +34,8 @@ private val CssEaseInOut = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
 @Composable
 fun AuroraBackground(modifier: Modifier = Modifier) {
     val palette = LocalAuroraPalette.current
-    val isLight = palette.deep.luminance() > 0.5f // 浅色极光：混合/暗角策略反转
+    // 明暗策略跟随主题标记（带滞回），不用动画中的颜色判亮度——过渡中途混合模式会翻转
+    val isLight = !LocalIsDark.current
 
     val transition = rememberInfiniteTransition(label = "aurora")
     // CSS ease-in-out = cubic-bezier(0.42, 0, 0.58, 1)；alternate 往返

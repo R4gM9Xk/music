@@ -1,12 +1,8 @@
 package com.local.music.feature.player.screen
 
-import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.updateTransition
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -22,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -33,6 +30,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -47,6 +45,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
@@ -55,30 +54,34 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
-import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.lerp
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.ArtThumb
 import com.local.music.core.ui.components.DemoCatalog
-import com.local.music.core.ui.components.DemoPlaylist
 import com.local.music.core.ui.components.DemoSong
+import com.local.music.core.ui.components.FlightKeys
 import com.local.music.core.ui.components.GlassIconButton
 import com.local.music.core.ui.components.GlassLevel
-import com.local.music.core.ui.components.GlassSheet
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.LyricLine
 import com.local.music.core.ui.components.LocalHazeState
+import com.local.music.core.ui.components.LocalPlayerFlight
+import com.local.music.core.ui.components.PlayerFlight
 import com.local.music.core.ui.components.ProgressTrack
-import com.local.music.core.ui.components.glassHaze
 import com.local.music.core.ui.components.QueueSheet
-import com.local.music.core.ui.components.SheetAction
+import com.local.music.core.ui.components.SongActionsSheet
 import com.local.music.core.ui.components.asTime
+import com.local.music.core.ui.components.glassHaze
 import com.local.music.core.ui.components.pressScale
+import com.local.music.core.ui.components.trackFlight
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.RepeatMode
@@ -86,30 +89,44 @@ import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.auroraAccentColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
+import kotlin.math.roundToInt
 
 /** 播放页内底部面板 */
-private enum class PlayerSheet { Queue, More, AddTo, Info }
+private enum class PlayerSheet { Queue, More }
 
 /**
  * 播放页 · 歌词主角
- * - 滚动歌词占满中段：当前行由播放进度推导（点行 = seek）；歌词关闭时切换为封面模式
- * - 封面退居左上 64dp 悬浮小窗（点击进入流体云）
+ * - 统一舞台：歌词 rail / 唯一封面 / 纯音乐文案共存，modeT 插值几何——
+ *   封面永不卸载，歌词⇄封面即封面在「左上 64dp 小窗 ⇄ 居中大方块」间边放大边直线平移
  * - 28dp 圆角毛玻璃控制台：收藏 / 队列 / 随机 / 三态循环 全部接入 AppState
+ * - 迷你条进入/收起走共享元素飞行（Flight.kt 状态机 + 覆盖层替身）
  */
 @Composable
 fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
-    val palette = LocalAuroraPalette.current
     val glass = LocalGlassColors.current
     val lyrics = state.currentLyrics
     val song = state.currentSong
+    val flight = LocalPlayerFlight.current
 
     var sheet by remember { mutableStateOf<PlayerSheet?>(null) }
 
+    // 进入飞行落封面模式：entryShowCover 为瞬态，点击封面/手势即清除，不动持久化偏好
+    val showLyrics = state.lyricEnabled && lyrics != null && flight?.entryShowCover != true
+    SideEffect {
+        flight?.visualMode = if (showLyrics) PlayerFlight.VisualMode.Lyrics else PlayerFlight.VisualMode.Cover
+    }
+    // 入场封面模式只对「本次进入」生效：切歌（含自动切歌）后按歌词偏好回到正常语义
+    LaunchedEffect(song.id) {
+        val f = flight ?: return@LaunchedEffect
+        if (f.entryShowCover && f.songSnapshot?.id != song.id) f.entryShowCover = false
+    }
+
     // 左右滑动切模式：左滑 → 封面模式，右滑 → 歌词模式
     val swipeThreshold = with(LocalDensity.current) { 48.dp.toPx() }
-    fun Modifier.modeSwipe() = pointerInput(state.lyricEnabled) {
+    fun Modifier.modeSwipe() = pointerInput(Unit) {
         var total = 0f
         detectHorizontalDragGestures(
             onDragStart = { total = 0f },
@@ -119,199 +136,305 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             },
             onDragEnd = {
                 when {
-                    total <= -swipeThreshold -> state.lyricEnabled = false
-                    total >= swipeThreshold -> state.lyricEnabled = true
+                    total <= -swipeThreshold -> {
+                        flight?.entryShowCover = false
+                        state.lyricEnabled = false
+                    }
+                    total >= swipeThreshold -> {
+                        flight?.entryShowCover = false
+                        state.lyricEnabled = true
+                    }
                 }
             },
         )
     }
 
-    // 播放页自持采样状态：顶栏+歌词舞台为 hazeSource，控制台/底部面板为兄弟效果层
+    // 封面点击：对当前视觉模式取反（entryShowCover 态下首次点击即回到正常切换语义）
+    val onCoverClick: () -> Unit = {
+        flight?.entryShowCover = false
+        state.lyricEnabled = !showLyrics
+    }
+
+    // 播放页自持采样状态：顶栏+舞台为 hazeSource，控制台/底部面板为兄弟效果层
     val playerHaze = rememberHazeState()
     CompositionLocalProvider(LocalHazeState provides playerHaze) {
-        Column(modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+        Column(
+            modifier
+                .fillMaxSize()
+                .trackFlight(FlightKeys.PlayerRoot)
+                .statusBarsPadding()
+                .navigationBarsPadding(),
+        ) {
             Box(Modifier.weight(1f).hazeSource(playerHaze)) {
                 Column(Modifier.fillMaxSize()) {
-                    // ── 顶栏：收起 / 正在播放 / 更多 ─────────────────────
-        Row(
-            Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            GlassIconButton(onClick = { state.screen = GlassScreen.Library }) {
-                Icon(GlassIcons.Down, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
-            }
-            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
-                Text("正在播放", color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("来自「深夜巡航」", color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
-            }
-            GlassIconButton(onClick = { sheet = PlayerSheet.More }) {
-                Icon(GlassIcons.More, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
-            }
-        }
+                    // ── 顶栏：收起 / 正在播放 / 更多（非共享：原地由虚到实）──
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .graphicsLayer { alpha = flight?.softAlpha() ?: 1f }
+                            .padding(start = 20.dp, end = 20.dp, top = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        GlassIconButton(onClick = {
+                            val f = flight
+                            if (f != null) {
+                                f.beginExit(state.currentSong) { state.screen = it }
+                            } else {
+                                state.screen = GlassScreen.Library
+                            }
+                        }) {
+                            Icon(GlassIcons.Down, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                            Text("正在播放", color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("来自「${state.queueSource ?: "本地音乐"}」", color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
+                        }
+                        GlassIconButton(onClick = { sheet = PlayerSheet.More }) {
+                            Icon(GlassIcons.More, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
+                        }
+                    }
 
-        // ── 歌词舞台 / 封面模式 / 纯音乐空态：切换带缩放动效，均可左右滑动 ──
-        val showLyrics = state.lyricEnabled && lyrics != null
-        AnimatedContent(
-            targetState = showLyrics,
-            transitionSpec = {
-                if (targetState) {
-                    // 回歌词：封面缩小退场，歌词轻微放大进入
-                    (fadeIn(GlassMotion.tweenPage()) + scaleIn(GlassMotion.tweenPage(), initialScale = 1.06f))
-                        .togetherWith(fadeOut(GlassMotion.tweenPage()) + scaleOut(GlassMotion.tweenPage(), targetScale = 0.55f))
-                } else {
-                    // 进封面：封面由小变大（0.55 → 1.0），歌词轻缩淡出
-                    (fadeIn(GlassMotion.tweenPage()) + scaleIn(GlassMotion.tweenPage(), initialScale = 0.55f))
-                        .togetherWith(fadeOut(GlassMotion.tweenPage()) + scaleOut(GlassMotion.tweenPage(), targetScale = 0.96f))
-                }
-            },
-            label = "playerMode",
-            modifier = Modifier.weight(1f).modeSwipe(),
-        ) { showLyrics ->
-            // 分支内重读当前歌词：切歌瞬间（旧帧 showLyrics=true 但新歌无 .lrc）不能依赖捕获值
-            val branchLyrics = state.currentLyrics
-            if (showLyrics && branchLyrics != null) {
-                LyricStage(
-                    lines = branchLyrics,
-                    current = state.currentLyricIndex,
-                    onSelect = { index -> state.seekTo(branchLyrics[index].timeSec + 0.01f) },
-                    cover = song.art,
-                    coverBitmap = song.coverBitmap,
-                    onCoverClick = { state.lyricEnabled = !state.lyricEnabled },
-                    modifier = Modifier.fillMaxSize().padding(top = 8.dp, bottom = 4.dp),
-                )
-            } else {
-                // 封面模式：按可用宽高自适应（矮窗口/分屏不挤压控制区）
-                BoxWithConstraints(
-                    Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    val coverSize = minOf(280.dp, maxWidth, maxHeight * 0.85f)
-                    val coverInteraction = remember { MutableInteractionSource() }
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        ArtThumb(
-                            song.art,
-                            Modifier
-                                .size(coverSize)
-                                .pressScale(coverInteraction, pressed = 0.96f)
-                                .clickable(
-                                    interactionSource = coverInteraction, indication = null,
-                                    onClick = { state.lyricEnabled = !state.lyricEnabled },
-                                )
-                                .shadow(18.dp, RoundedCornerShape(28.dp))
-                                .border(1.dp, glass.stroke, RoundedCornerShape(28.dp)),
-                            RoundedCornerShape(28.dp),
-                            bitmap = song.coverBitmap,
+                    // ── 统一舞台：modeT(0=封面端 1=歌词端) 插值，封面中心+尺寸同帧直线过渡 ──
+                    val modeT by updateTransition(showLyrics, label = "playerMode").animateFloat(
+                        transitionSpec = { GlassMotion.tweenLyric() },
+                        label = "modeT",
+                    ) { if (it) 1f else 0f }
+
+                    BoxWithConstraints(
+                        Modifier
+                            .weight(1f)
+                            .modeSwipe()
+                            .padding(top = 8.dp, bottom = 4.dp),
+                    ) {
+                        val density = LocalDensity.current
+                        val stageW = constraints.maxWidth.toFloat()
+                        val stageH = constraints.maxHeight.toFloat()
+                        val pureMusic = lyrics == null && song.mediaUri != null
+
+                        // 封面两端 rect（舞台本地 px）：左上 64dp 小窗 ⇄ 居中大方块
+                        val smallSize = with(density) { 64.dp.toPx() }
+                        val smallLeft = with(density) { 22.dp.toPx() }
+                        val smallTop = with(density) { 14.dp.toPx() }
+                        val bigSize = minOf(with(density) { 280.dp.toPx() }, stageW, stageH * 0.85f)
+                        val bigCenterY = stageH / 2f -
+                            if (pureMusic) with(density) { (18.dp + 20.dp).toPx() / 2f } else 0f
+                        val smallRect = Rect(smallLeft, smallTop, smallLeft + smallSize, smallTop + smallSize)
+                        val bigRect = Rect(
+                            stageW / 2f - bigSize / 2f, bigCenterY - bigSize / 2f,
+                            stageW / 2f + bigSize / 2f, bigCenterY + bigSize / 2f,
                         )
-                        if (branchLyrics == null && song.mediaUri != null) {
-                            Spacer(Modifier.height(20.dp))
+                        // 边缘线性插值 = 中心走直线 + 尺寸线性增长（设计要求的直线平移）
+                        // modeT: 0=封面端(大居中 R28 阴影18) 1=歌词端(左上64dp R18 阴影10)
+                        val coverRect = Rect(
+                            lerp(bigRect.left, smallRect.left, modeT),
+                            lerp(bigRect.top, smallRect.top, modeT),
+                            lerp(bigRect.right, smallRect.right, modeT),
+                            lerp(bigRect.bottom, smallRect.bottom, modeT),
+                        )
+                        val coverShape = RoundedCornerShape(lerp(28.dp, 18.dp, modeT))
+
+                        // 歌词 rail：modeT>0 时在组合内；整体随 modeT 淡入淡出 × softAlpha（歌词区归非共享组）
+                        if (lyrics != null && modeT > 0f) {
+                            LyricRail(
+                                lines = lyrics,
+                                current = state.currentLyricIndex,
+                                onSelect = { index -> state.seekTo(lyrics[index].timeSec + 0.01f) },
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer { alpha = modeT * (flight?.softAlpha() ?: 1f) },
+                            )
+                        }
+
+                        // 唯一封面：永不卸载，切歌只换 bitmap；飞行期让位替身（共享真身 alpha 门控），
+                        // 歌词模式退出时封面不飞，改随非共享组原地淡出
+                        val coverInteraction = remember { MutableInteractionSource() }
+                        Box(
+                            Modifier
+                                .offset {
+                                    IntOffset(coverRect.left.roundToInt(), coverRect.top.roundToInt())
+                                }
+                                .size(with(density) { coverRect.width.toDp() })
+                                .trackFlight(FlightKeys.PlayerCover)
+                                .graphicsLayer {
+                                    val f = flight
+                                    alpha = if (f != null &&
+                                        f.phase == PlayerFlight.Phase.Exiting &&
+                                        f.visualMode == PlayerFlight.VisualMode.Lyrics
+                                    ) {
+                                        f.softAlpha()
+                                    } else {
+                                        f?.playerSharedAlpha() ?: 1f
+                                    }
+                                }
+                                .pressScale(coverInteraction, pressed = 0.95f)
+                                .clickable(interactionSource = coverInteraction, indication = null, onClick = onCoverClick)
+                                .shadow(lerp(18.dp, 10.dp, modeT), coverShape)
+                                .border(1.dp, glass.stroke, coverShape),
+                        ) {
+                            ArtThumb(
+                                song.art,
+                                Modifier.fillMaxSize(),
+                                coverShape,
+                                bitmap = song.coverBitmap,
+                            )
+                        }
+
+                        // 纯音乐空态：无歌词的真实曲目，跟随封面端淡入淡出
+                        if (pureMusic) {
                             Text(
                                 "纯音乐，请欣赏",
                                 color = LocalGlassColors.current.textSecondary, fontSize = 13.sp,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .offset {
+                                        IntOffset(0, (coverRect.bottom + with(density) { 20.dp.toPx() }).roundToInt())
+                                    }
+                                    .graphicsLayer { alpha = 1f - modeT },
                             )
                         }
                     }
                 }
             }
-        }
-                }
-            }
 
-        // ── 玻璃控制台（背景真模糊：采样舞台区）──────────────
-        GlassSurface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(start = 16.dp, end = 16.dp, bottom = 14.dp)
-                .glassHaze(GlassLevel.Md),
-            level = GlassLevel.Md,
-            shape = RoundedCornerShape(28.dp),
-        ) {
-            Column(Modifier.padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 16.dp)) {
-                // 歌曲信息 + 收藏 + 队列
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(song.title, color = LocalGlassColors.current.textPrimary, fontSize = 16.sp,
-                            fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(song.subtitle, color = LocalGlassColors.current.textSecondary, fontSize = 12.sp,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    ConsoleIcon(onClick = { state.toggleFavorite(song.id) }) {
-                        Icon(
-                            if (state.isFavorite(song.id)) GlassIcons.HeartFilled else GlassIcons.Heart, null,
-                            Modifier.size(21.dp), tint = LocalGlassColors.current.textPrimary,
-                        )
-                    }
-                    ConsoleIcon(onClick = { sheet = PlayerSheet.Queue }) {
-                        Icon(GlassIcons.Queue, null, Modifier.size(21.dp),
-                            tint = LocalGlassColors.current.textSecondary)
-                    }
-                }
-
-                // 进度：轨道 + 时间
-                Spacer(Modifier.height(12.dp))
-                ProgressTrack(progress = state.progressFraction, onSeek = state::seekToFraction)
-                Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(state.progressSec.toInt().asTime(), color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
-                    Text(song.duration, color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
-                }
-
-                // 控制键：随机 / 上一首 / 播放 / 下一首 / 循环（三态）
-                Row(
-                    Modifier.fillMaxWidth().padding(top = 10.dp, start = 2.dp, end = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    ConsoleIcon(onClick = state::toggleShuffle) {
-                        Icon(GlassIcons.Shuffle, null, Modifier.size(20.dp),
-                            tint = if (state.shuffleOn) palette.seed3 else LocalGlassColors.current.textSecondary)
-                    }
-                    ConsoleIcon(onClick = { state.prev() }) {
-                        Icon(GlassIcons.Prev, null, Modifier.size(28.dp),
-                            tint = LocalGlassColors.current.textSecondary)
-                    }
-                    PlayPauseButton(playing = state.playing, onClick = state::togglePlayPause)
-                    ConsoleIcon(onClick = { state.next() }) {
-                        Icon(GlassIcons.Next, null, Modifier.size(28.dp),
-                            tint = LocalGlassColors.current.textSecondary)
-                    }
-                    ConsoleIcon(onClick = state::cycleRepeat) {
-                        Box(Modifier.size(20.dp)) {
-                            Icon(GlassIcons.Repeat, null, Modifier.size(20.dp),
-                                tint = if (state.repeatMode != RepeatMode.Off) {
-                                    palette.seed3
-                                } else {
-                                    LocalGlassColors.current.textSecondary
-                                },
+            // ── 玻璃控制台（背景真模糊：采样舞台区）。玻璃本体/歌名/副标题/播放/下一首 = 共享真身；
+            //    收藏/队列/进度/时间/随机/上一首/循环 = 非共享原地淡入淡出。
+            //    底部面板打开时控制台整体让位（与 GlassApp 对 Chrome 的 ModalState 策略同源——
+            //    面板与控制台都是带 hazeEffect 的兄弟层，重叠时 HWUI 合成顺序会串台）
+            val sheetOpen = sheet != null
+            val sharedAlpha = { (flight?.playerSharedAlpha() ?: 1f) * (if (sheetOpen) 0f else 1f) }
+            val softAlpha = { (flight?.softAlpha() ?: 1f) * (if (sheetOpen) 0f else 1f) }
+            GlassSurface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp, bottom = 14.dp)
+                    .trackFlight(FlightKeys.PlayerGlass)
+                    .graphicsLayer { alpha = sharedAlpha() },
+                level = GlassLevel.Md,
+                shape = RoundedCornerShape(28.dp),
+                blur = GlassLevel.Md,
+            ) {
+                Column(Modifier.padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 16.dp)) {
+                    // 歌曲信息 + 收藏 + 队列
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(song.title, color = LocalGlassColors.current.textPrimary, fontSize = 16.sp,
+                                fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .trackFlight(FlightKeys.PlayerTitle)
+                                    .graphicsLayer { alpha = sharedAlpha() })
+                            Text(song.subtitle, color = LocalGlassColors.current.textSecondary, fontSize = 12.sp,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .trackFlight(FlightKeys.PlayerArtist)
+                                    .graphicsLayer { alpha = sharedAlpha() })
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        ConsoleIcon(
+                            onClick = { state.toggleFavorite(song.id) },
+                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
+                        ) {
+                            Icon(
+                                if (state.isFavorite(song.id)) GlassIcons.HeartFilled else GlassIcons.Heart, null,
+                                Modifier.size(21.dp), tint = LocalGlassColors.current.textPrimary,
                             )
-                            if (state.repeatMode == RepeatMode.One) {
-                                // 单曲循环角标
-                                Box(
-                                    Modifier
-                                        .align(Alignment.TopEnd)
-                                        .size(6.dp)
-                                        .clip(CircleShape)
-                                        .background(palette.seed3),
+                        }
+                        ConsoleIcon(
+                            onClick = { sheet = PlayerSheet.Queue },
+                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
+                        ) {
+                            Icon(GlassIcons.Queue, null, Modifier.size(21.dp),
+                                tint = LocalGlassColors.current.textSecondary)
+                        }
+                    }
+
+                    // 进度：轨道 + 时间
+                    Spacer(Modifier.height(12.dp))
+                    Box(Modifier.graphicsLayer { alpha = softAlpha() }) {
+                        ProgressTrack(progress = state.progressFraction, onSeek = state::seekToFraction)
+                    }
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp)
+                            .graphicsLayer { alpha = softAlpha() },
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(state.progressSec.toInt().asTime(), color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
+                        Text(song.duration, color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
+                    }
+
+                    // 控制键：随机 / 上一首 / 播放 / 下一首 / 循环（三态）
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 10.dp, start = 2.dp, end = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        ConsoleIcon(onClick = state::toggleShuffle, modifier = Modifier.graphicsLayer { alpha = softAlpha() }) {
+                            Icon(GlassIcons.Shuffle, null, Modifier.size(20.dp),
+                                tint = if (state.shuffleOn) auroraAccentColor() else LocalGlassColors.current.textSecondary)
+                        }
+                        ConsoleIcon(onClick = { state.prev() }, modifier = Modifier.graphicsLayer { alpha = softAlpha() }) {
+                            Icon(GlassIcons.Prev, null, Modifier.size(28.dp),
+                                tint = LocalGlassColors.current.textSecondary)
+                        }
+                        PlayPauseButton(
+                            playing = state.playing,
+                            onClick = state::togglePlayPause,
+                            modifier = Modifier
+                                .trackFlight(FlightKeys.PlayerPlay)
+                                .graphicsLayer { alpha = sharedAlpha() },
+                        )
+                        ConsoleIcon(
+                            onClick = { state.next() },
+                            modifier = Modifier
+                                .trackFlight(FlightKeys.PlayerNext)
+                                .graphicsLayer { alpha = sharedAlpha() },
+                        ) {
+                            Icon(GlassIcons.Next, null, Modifier.size(28.dp),
+                                tint = LocalGlassColors.current.textSecondary)
+                        }
+                        ConsoleIcon(onClick = state::cycleRepeat, modifier = Modifier.graphicsLayer { alpha = softAlpha() }) {
+                            Box(Modifier.size(20.dp)) {
+                                Icon(GlassIcons.Repeat, null, Modifier.size(20.dp),
+                                    tint = if (state.repeatMode != RepeatMode.Off) {
+                                        auroraAccentColor()
+                                    } else {
+                                        LocalGlassColors.current.textSecondary
+                                    },
                                 )
+                                if (state.repeatMode == RepeatMode.One) {
+                                    // 单曲循环角标
+                                    Box(
+                                        Modifier
+                                            .align(Alignment.TopEnd)
+                                            .size(6.dp)
+                                            .clip(CircleShape)
+                                            .background(auroraAccentColor()),
+                                    )
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // 底部提示行
-        Text(
-            if (state.lyricEnabled) "点击歌词行可跳转 · 左右滑动切换封面 / 歌词" else "左右滑动切换封面 / 歌词",
-            color = LocalGlassColors.current.textFaint, fontSize = 10.5.sp,
-            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-        )
+            // 底部提示行（按当前视觉模式而非持久化偏好）
+            Text(
+                if (showLyrics) "点击歌词行可跳转 · 左右滑动切换封面 / 歌词" else "左右滑动切换封面 / 歌词",
+                color = LocalGlassColors.current.textFaint, fontSize = 10.5.sp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp)
+                    .graphicsLayer { alpha = softAlpha() },
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            )
         }
     }
 
-    // ── 底部面板：队列 / 更多 / 加入歌单 / 歌曲信息 ────────
+    // ── 底部面板：队列 / 更多（单曲操作面板统一组件）────────
     QueueSheet(
         visible = sheet == PlayerSheet.Queue,
         onDismiss = { sheet = null },
@@ -321,107 +444,28 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             state.playSong(state.queue[index], state.queue)
             sheet = null
         },
+        onMove = state::moveQueueItem,
+        onRemove = state::removeQueueItem,
+        onClearUpNext = state::clearUpNext,
+        isPlaying = state.playing,
     )
-    GlassSheet(
+    SongActionsSheet(
         visible = sheet == PlayerSheet.More,
         onDismiss = { sheet = null },
-        title = song.title,
-    ) {
-        SheetAction(
-            icon = if (state.isFavorite(song.id)) GlassIcons.HeartFilled else GlassIcons.Heart,
-            label = if (state.isFavorite(song.id)) "取消收藏" else "收藏",
-            emphasized = state.isFavorite(song.id),
-            onClick = {
-                state.toggleFavorite(song.id)
-                sheet = null
-            },
-        )
-        SheetAction(
-            icon = GlassIcons.Plus,
-            label = "加入歌单",
-            subtitle = "添加到已有歌单",
-            onClick = { sheet = PlayerSheet.AddTo },
-        )
-        SheetAction(
-            icon = GlassIcons.Book,
-            label = "歌曲信息",
-            subtitle = state.currentFormatText,
-            onClick = { sheet = PlayerSheet.Info },
-        )
-    }
-    GlassSheet(
-        visible = sheet == PlayerSheet.AddTo,
-        onDismiss = { sheet = null },
-        title = "加入歌单",
-    ) {
-        (DemoCatalog.playlists + state.userPlaylists).forEach { playlist ->
-            val added = state.isSongInPlaylist(playlist.id, song.id)
-            PlaylistPickRow(playlist, added = added) {
-                // 已在歌单中的曲目点击不生效（保持面板打开，展示"已添加"反馈）
-                if (state.addToPlaylist(playlist.id, song.id)) sheet = null
-            }
-        }
-    }
-    GlassSheet(
-        visible = sheet == PlayerSheet.Info,
-        onDismiss = { sheet = null },
-        title = "歌曲信息",
-    ) {
-        InfoRow("标题", song.title)
-        InfoRow("艺术家", song.artist)
-        InfoRow("专辑", song.album)
-        InfoRow("时长", song.duration)
-        InfoRow("格式", state.currentFormatText)
-        InfoRow("文件夹", song.folder)
-    }
+        state = state,
+        song = song,
+    )
 }
 
-/** 「加入歌单」选择行：封面 + 歌单名 + 计数；added = 已含该曲目 */
+/**
+ * 歌词 rail：点击行 seek 到该行 + 500ms 弹性滚动居中；上下 18% 羽化渐隐。
+ * （原 LyricStage 去掉内嵌封面小窗——封面由统一舞台接管，rail 只负责歌词）
+ */
 @Composable
-private fun PlaylistPickRow(playlist: DemoPlaylist, added: Boolean = false, onClick: () -> Unit) {
-    val interactionSource = remember { MutableInteractionSource() }
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .pressScale(interactionSource, pressed = 0.98f)
-            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        ArtThumb(playlist.art, Modifier.size(40.dp), RoundedCornerShape(10.dp), bordered = true)
-        Column(Modifier.weight(1f)) {
-            Text(playlist.title, color = LocalGlassColors.current.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.Medium,
-                maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(playlist.meta, color = LocalGlassColors.current.textTertiary, fontSize = 11.5.sp)
-        }
-        if (added) {
-            Text("已添加", color = LocalGlassColors.current.textFaint, fontSize = 11.5.sp)
-        }
-    }
-}
-
-@Composable
-private fun InfoRow(label: String, value: String) {
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(label, color = LocalGlassColors.current.textTertiary, fontSize = 13.sp, modifier = Modifier.width(72.dp))
-        Text(value, color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, modifier = Modifier.weight(1f))
-    }
-}
-
-/** 歌词舞台：点击行 seek 到该行 + 500ms 弹性滚动居中；上下 18% 羽化渐隐 */
-@Composable
-private fun LyricStage(
+private fun LyricRail(
     lines: List<LyricLine>,
     current: Int,
     onSelect: (Int) -> Unit,
-    cover: ArtStyle,
-    coverBitmap: androidx.compose.ui.graphics.ImageBitmap?,
-    onCoverClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
@@ -434,7 +478,7 @@ private fun LyricStage(
         label = "railOffset",
     )
 
-    BoxWithConstraints(modifier.clipToBounds()) { // .lystage overflow:hidden
+    BoxWithConstraints(modifier.clipToBounds()) {
         val stageHeightPx = with(density) { maxHeight.toPx() }
         // 切歌：清空旧行坐标并归零偏移，避免上一首的 rail 位置带入新歌词
         LaunchedEffect(lines) {
@@ -485,22 +529,6 @@ private fun LyricStage(
                 }
             }
         }
-
-        // 封面小窗：左上 64dp 悬浮（top 14 / left 22，圆角 18，高光描边）
-        val coverInteraction = remember { MutableInteractionSource() }
-        ArtThumb(
-            style = cover,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(start = 22.dp, top = 14.dp)
-                .pressScale(coverInteraction, pressed = 0.94f)
-                .size(64.dp)
-                .shadow(10.dp, RoundedCornerShape(18.dp)) // box-shadow 0 10px 26px 黑40%
-                .clip(RoundedCornerShape(18.dp))
-                .border(1.dp, LocalGlassColors.current.stroke, RoundedCornerShape(18.dp))
-                .clickable(interactionSource = coverInteraction, indication = null, onClick = onCoverClick),
-            bitmap = coverBitmap,
-        )
     }
 }
 
@@ -569,11 +597,15 @@ private fun smoothstep(t: Float): Float {
 
 /** 播放/暂停大按钮：66dp 圆，hi→lo 玻璃渐变 + 高光描边 + 内嵌顶部亮线，按压 scale(.93) */
 @Composable
-private fun PlayPauseButton(playing: Boolean, onClick: () -> Unit) {
+private fun PlayPauseButton(
+    playing: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val glass = LocalGlassColors.current
     val interactionSource = remember { MutableInteractionSource() }
     Box(
-        Modifier
+        modifier
             .pressScale(interactionSource, pressed = 0.93f)
             .size(66.dp)
             .clip(CircleShape)
@@ -604,10 +636,14 @@ private fun PlayPauseButton(playing: Boolean, onClick: () -> Unit) {
 
 /** 控制台小图标按钮：按压 scale(.88) */
 @Composable
-private fun ConsoleIcon(onClick: () -> Unit, content: @Composable () -> Unit) {
+private fun ConsoleIcon(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
     val interactionSource = remember { MutableInteractionSource() }
     Box(
-        Modifier
+        modifier
             .pressScale(interactionSource, pressed = 0.88f)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
             .padding(6.dp),

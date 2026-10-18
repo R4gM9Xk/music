@@ -10,8 +10,10 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.MediaStore
 import androidx.palette.graphics.Palette
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.toArgb
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.LyricLine
@@ -37,9 +39,11 @@ object MediaLibrary {
             MediaStore.Audio.Media.DURATION,
             MediaStore.Audio.Media.DATA,
             MediaStore.Audio.Media.RELATIVE_PATH,
+            MediaStore.Audio.Media.DATE_ADDED,
         )
         // 不带 selection：is_music/duration 在部分扫描路径下不可靠（adb 推送扫成 NULL），
-        // 全量拉回后按 RELATIVE_PATH 在代码内过滤
+        // 全量拉回外部音频后按 RELATIVE_PATH 分组——不限定 Music/，Download/QQ 等任意
+        // 公共目录的音频都收；不想要的目录用设置页「过滤文件夹」排除
         context.contentResolver.query(
             MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
             projection, null, null,
@@ -53,12 +57,10 @@ object MediaLibrary {
             val colDuration = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
             val colData = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
             val colPath = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.RELATIVE_PATH)
+            val colDateAdded = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
 
             while (cursor.moveToNext()) {
                 val relativePath = cursor.getString(colPath) ?: continue
-                if (!relativePath.trimStart('/').startsWith("Music/", ignoreCase = true)) continue
-                android.util.Log.d(TAG, "hit: $relativePath ${cursor.getString(colTitle)}")
-
                 val id = cursor.getLong(colId)
                 val dataPath = cursor.getString(colData) ?: continue
                 val fileName = dataPath.substringAfterLast('/')
@@ -84,7 +86,9 @@ object MediaLibrary {
                 }
 
                 songs += DemoSong(
-                    id = "m$id",
+                    // 稳定 id = 文件绝对路径：MediaStore _id 会在重扫/数据库重建后漂移，
+                    // 快照里的队列/收藏用它对位会错位甚至丢失；路径跨扫描稳定
+                    id = "f$dataPath",
                     title = title,
                     artist = artist,
                     album = album,
@@ -100,6 +104,7 @@ object MediaLibrary {
                     bitDepth = format?.bitDepth ?: 0,
                     bitrateKbps = format?.bitrateKbps ?: 0,
                     palette = coverBitmap?.let { paletteFromBitmap(it) },
+                    dateAddedSec = cursor.getLong(colDateAdded),
                 )
             }
         }
@@ -109,19 +114,19 @@ object MediaLibrary {
 
     private const val TAG = "MediaLibrary"
 
-    /** 封面落盘为 PNG（cache/covers/）：媒体通知 / 锁屏 / 流体云需要可寻址的 artworkUri */
-    private fun persistCover(context: Context, name: String, bitmap: androidx.compose.ui.graphics.ImageBitmap): String {
+    /** 封面落盘为 PNG（cache/covers/）：媒体通知 / 锁屏 / 流体云需要可寻址的 artworkUri；失败返回 null（空串也是无效 uri） */
+    private fun persistCover(context: Context, name: String, bitmap: androidx.compose.ui.graphics.ImageBitmap): String? {
         return try {
             val dir = java.io.File(context.externalCacheDir, "covers").apply { mkdirs() }
             val file = java.io.File(dir, "$name.png")
-            if (!file.exists()) {
+            if (!file.exists() || file.length() == 0L) {
                 java.io.FileOutputStream(file).use { out ->
                     bitmap.asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 90, out)
                 }
             }
             Uri.fromFile(file).toString()
         } catch (e: Exception) {
-            ""
+            null
         }
     }
 
@@ -248,7 +253,8 @@ object MediaLibrary {
             if (content.isEmpty()) return@forEach
             stamps.forEach { match ->
                 val (mm, ss, frac) = match.destructured
-                val sec = mm.toInt() * 60 + ss.toInt() + (frac.padEnd(3, '0').take(3).toInt() / 1000f) +
+                // offset 取负：主流 LRC 约定正 offset 让歌词提前显示
+                val sec = mm.toInt() * 60 + ss.toInt() + (frac.padEnd(3, '0').take(3).toInt() / 1000f) -
                     offsetMs / 1000f
                 out += LyricLine(content, sec)
             }
@@ -283,4 +289,95 @@ object MediaLibrary {
     /** 无封面歌曲的占位风格：按序循环 6 种演示封面 */
     private fun fallbackArt(index: Int): ArtStyle =
         ArtStyle.entries[index % FALLBACK_ART_COUNT]
+
+    // ── 曲库缓存：启动即时真实化 ──────────────────────────
+    // （真机 56 首全量重扫 = 每首 MediaMetadataRetriever + MediaExtractor，十几秒级；
+    //   缓存让冷启动 <1s 呈现恢复场景，随后的全量重扫在后台对账并重写缓存）
+
+    private const val CACHE_FILE = "library_cache.json"
+    private const val CACHE_VERSION = 2
+
+    /** 读曲库缓存：无/损坏/版本不符返回 null（自愈：随后的全量重扫会重写） */
+    fun loadCache(context: Context): List<DemoSong>? = runCatching {
+        val file = java.io.File(context.filesDir, CACHE_FILE)
+        if (!file.isFile) return@runCatching null
+        val root = org.json.JSONObject(file.readText())
+        if (root.optInt("v") != CACHE_VERSION) return@runCatching null
+        val arr = root.optJSONArray("songs") ?: return@runCatching null
+        val songs = mutableListOf<DemoSong>()
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            val dataPath = o.optString("dataPath")
+            songs += DemoSong(
+                id = o.getString("id"),
+                title = o.getString("title"),
+                artist = o.getString("artist"),
+                album = o.getString("album"),
+                durationSec = o.getInt("durationSec"),
+                art = ArtStyle.entries.getOrElse(o.optInt("art", 0)) { ArtStyle.Night },
+                folder = o.optString("folder", "Music"),
+                genre = o.optString("genre", "独立"),
+                mediaUri = o.optString("mediaUri").ifEmpty { null },
+                coverBitmap = o.optString("artworkUri").ifEmpty { null }?.let { uri ->
+                    android.graphics.BitmapFactory.decodeFile(uri.removePrefix("file://"))?.asImageBitmap()
+                },
+                artworkUri = o.optString("artworkUri").ifEmpty { null },
+                lyricLines = if (dataPath.isEmpty()) null else readLrc(context, dataPath),
+                codec = o.optString("codec"),
+                sampleRateHz = o.optInt("sampleRateHz"),
+                bitDepth = o.optInt("bitDepth"),
+                bitrateKbps = o.optInt("bitrateKbps"),
+                palette = o.optJSONArray("palette")?.takeIf { it.length() == 5 }?.let { p ->
+                    AuroraPalette(
+                        seed = Color(p.optInt(0)),
+                        seed2 = Color(p.optInt(1)),
+                        seed3 = Color(p.optInt(2)),
+                        deep = Color(p.optInt(3)),
+                        deep2 = Color(p.optInt(4)),
+                    )
+                },
+                dateAddedSec = o.optLong("dateAdded"),
+            )
+        }
+        if (songs.isEmpty()) null else songs
+    }.getOrNull()
+
+    /** 扫描成功后写缓存（IO 线程调用）；失败静默（下次重扫再写） */
+    fun writeCache(context: Context, songs: List<DemoSong>) {
+        runCatching {
+            val arr = org.json.JSONArray()
+            songs.forEach { s ->
+                arr.put(org.json.JSONObject().apply {
+                    put("id", s.id)
+                    put("title", s.title)
+                    put("artist", s.artist)
+                    put("album", s.album)
+                    put("durationSec", s.durationSec)
+                    put("art", s.art.ordinal)
+                    put("folder", s.folder)
+                    put("genre", s.genre)
+                    put("mediaUri", s.mediaUri ?: "")
+                    put("dataPath", s.id.removePrefix("f")) // 稳定 id = "f" + 文件绝对路径
+                    put("artworkUri", s.artworkUri ?: "")
+                    put("codec", s.codec)
+                    put("sampleRateHz", s.sampleRateHz)
+                    put("bitDepth", s.bitDepth)
+                    put("bitrateKbps", s.bitrateKbps)
+                    put("dateAdded", s.dateAddedSec)
+                    s.palette?.let { p ->
+                        put("palette", org.json.JSONArray().apply {
+                            put(p.seed.toArgb())
+                            put(p.seed2.toArgb())
+                            put(p.seed3.toArgb())
+                            put(p.deep.toArgb())
+                            put(p.deep2.toArgb())
+                        })
+                    }
+                })
+            }
+            java.io.File(context.filesDir, CACHE_FILE).writeText(
+                org.json.JSONObject().put("v", CACHE_VERSION).put("songs", arr).toString(),
+            )
+        }
+    }
 }

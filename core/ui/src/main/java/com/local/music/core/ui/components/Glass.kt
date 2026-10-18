@@ -4,6 +4,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
@@ -77,12 +78,15 @@ fun Modifier.pressScale(
  * （backdrop-filter 的跨版本近似：半透明填充 + saturate 视觉补偿由极光底色保证；
  *   滚动列表内禁用实时模糊是规范面板的性能预算要求）
  */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun GlassSurface(
     modifier: Modifier = Modifier,
     level: GlassLevel = GlassLevel.Md,
     shape: Shape = androidx.compose.foundation.shape.RoundedCornerShape(28.dp),
     onClick: (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null,
+    blur: GlassLevel? = null,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val glass = LocalGlassColors.current
@@ -90,11 +94,20 @@ fun GlassSurface(
     var m = modifier
         .pressScale(interactionSource, pressed = if (onClick != null) 0.97f else 1f)
         .clip(shape)
+    // 模糊必须落在 clip(shape) 之后：hazeEffect 的背景涂抹以其矩形节点 bounds 为界，
+    // 不裁形的话毛玻璃会溢出胶囊/卡片的圆角（白色矩形框）
+    if (blur != null) m = m.glassHaze(blur)
+    m = m
         .background(glass.fill(level))
         .border(1.dp, glass.strokeSoft, shape)
         .glassTopLine(glass.topLine)
-    if (onClick != null) {
-        m = m.clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+    if (onClick != null || onLongClick != null) {
+        m = m.combinedClickable(
+            interactionSource = interactionSource,
+            indication = null,
+            onClick = onClick ?: {},
+            onLongClick = onLongClick,
+        )
     }
     Box(m, content = content)
 }

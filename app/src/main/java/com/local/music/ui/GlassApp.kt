@@ -3,12 +3,19 @@ package com.local.music.ui
 import android.Manifest
 import android.app.Activity
 import android.content.ComponentName
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
@@ -27,9 +34,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -47,10 +58,14 @@ import com.local.music.core.ui.components.AuroraBackground
 import com.local.music.core.ui.components.GlassChrome
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSurface
+import com.local.music.core.ui.components.FlightKeys
 import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.components.LocalModalState
+import com.local.music.core.ui.components.LocalPlayerFlight
 import com.local.music.core.ui.components.ModalState
+import com.local.music.core.ui.components.PlayerFlight
 import com.local.music.core.ui.components.asTime
+import com.local.music.core.ui.components.trackFlight
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.ThemeMode
@@ -68,6 +83,7 @@ import com.local.music.player.MediaControllerEngine
 import com.local.music.player.MediaLibrary
 import com.local.music.player.MusicPlaybackService
 import com.local.music.state.SettingsStore
+import com.local.music.update.UpdateManager
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import kotlinx.coroutines.Dispatchers
@@ -91,11 +107,63 @@ fun GlassApp() {
     val scope = rememberCoroutineScope()
     val store = remember { SettingsStore(context) }
     val modalState = remember { ModalState() }
+    // 播放页共享元素飞行动效（迷你条 ⇄ 播放页），纯 UI 态不进 AppState
+    val flight = remember { PlayerFlight(scope) }
+
+    // ── 所有文件访问（MANAGE_EXTERNAL_STORAGE）：读取任意公共目录的同名 .lrc 歌词 ──
+    var allFilesGranted by remember { mutableStateOf(Environment.isExternalStorageManager()) }
+    var jumpedAllFiles by remember { mutableStateOf(false) } // 每进程只自动跳一次，避免拒绝后反复打扰
+    fun openAllFilesAccessPage() {
+        jumpedAllFiles = true
+        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${context.packageName}"))
+        runCatching { context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            .onFailure { // 个别 ROM 无直达页：退到总列表
+                runCatching {
+                    context.startActivity(
+                        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }
+            }
+    }
+    fun maybeRequestAllFiles() {
+        if (!allFilesGranted && !jumpedAllFiles) openAllFilesAccessPage()
+    }
+
+    fun loadRealLibrary(onDone: () -> Unit = {}) {
+        scope.launch {
+            // 扫描可能因权限被撤销抛 SecurityException：容错并上报，不让协程崩溃
+            val result = withContext(Dispatchers.IO) { runCatching { MediaLibrary.load(context) } }
+            result.exceptionOrNull()?.let {
+                android.util.Log.e("MediaLibrary", "scan failed", it)
+                state.reportEngineFailure("读取媒体库失败，请检查存储权限")
+            }
+            val songs = result.getOrDefault(emptyList())
+            android.util.Log.d("MediaLibrary", "loadRealLibrary got ${songs.size}")
+            state.loadLibrary(songs)
+            if (songs.isNotEmpty()) {
+                withContext(Dispatchers.IO) { runCatching { MediaLibrary.writeCache(context, songs) } }
+            } else if (!state.librarySettled) {
+                state.markLibrarySettled() // 无缓存且扫描为空：确认无曲库（演示模式终态）
+            }
+            onDone()
+        }
+    }
 
     // 持久化：绑定存盘桥 + 启动恢复现场（restore 与曲库装载谁先到都幂等收敛）
     LaunchedEffect(Unit) {
         state.bindStore(store)
-        runCatching { store.read() }.getOrNull()?.let { state.restore(it) }
+        val snapshot = runCatching { store.read() }.getOrNull()
+        if (snapshot != null) {
+            state.restore(snapshot)
+        } else {
+            state.markHydrated() // 首次启动/快照损坏：无现场可保护，放行存盘
+        }
+        // 曲库缓存即时真实化（应用私有文件、无需权限）：恢复场景 <1s 呈现，
+        // 随后的全量重扫在后台对账（新增/删除歌曲、封面刷新）并重写缓存
+        val cached = withContext(Dispatchers.IO) {
+            runCatching { MediaLibrary.loadCache(context) }.getOrNull()
+        }
+        if (cached != null) state.loadLibrary(cached)
     }
     // 设置变更 → 存盘（播放进度的存盘由 tick 每 5s 节流 + 各行为触发）
     LaunchedEffect(Unit) {
@@ -103,34 +171,58 @@ fun GlassApp() {
             .drop(1)
             .collect { state.scheduleSave() }
     }
-    // 退后台立即落盘：防抖 500ms 窗口内进程被杀会丢最近一次修改
+    // 退后台立即落盘：防抖 500ms 窗口内进程被杀会丢最近一次修改；
+    // 回前台刷新所有文件访问态——用户在系统页授权后回来时自动重扫曲库拾取歌词
     val activity = context as? ComponentActivity
     DisposableEffect(activity) {
         val lifecycleObserver = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP) {
                 scope.launch { store.flush() }
             }
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val grantedNow = Environment.isExternalStorageManager()
+                val grantedBefore = allFilesGranted
+                allFilesGranted = grantedNow
+                if (jumpedAllFiles && grantedNow && !grantedBefore) {
+                    jumpedAllFiles = false
+                    loadRealLibrary() // 授权回来：重扫拾取各目录 .lrc
+                }
+            }
         }
         activity?.lifecycle?.addObserver(lifecycleObserver)
         onDispose { activity?.lifecycle?.removeObserver(lifecycleObserver) }
     }
 
-    fun loadRealLibrary() {
-        scope.launch {
-            val songs = withContext(Dispatchers.IO) { MediaLibrary.load(context) }
-            android.util.Log.d("MediaLibrary", "loadRealLibrary got ${songs.size}")
-            state.loadLibrary(songs)
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { result ->
+        when (result[Manifest.permission.READ_MEDIA_AUDIO]) {
+            true -> {
+                loadRealLibrary()
+                maybeRequestAllFiles() // 音频权限落定后再引导所有文件访问
+            }
+            false -> {
+                state.abandonPendingPlayback() // 曲库永远不可用：放弃待恢复现场，按演示态如实存盘
+                state.markLibrarySettled()
+            }
+            null -> Unit // 本次只补申请了通知权限
         }
     }
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted -> if (granted) loadRealLibrary() }
 
     LaunchedEffect(Unit) {
-        val granted = ContextCompat.checkSelfPermission(
-            context, Manifest.permission.READ_MEDIA_AUDIO,
+        fun granted(permission: String) = ContextCompat.checkSelfPermission(
+            context, permission,
         ) == PackageManager.PERMISSION_GRANTED
-        if (granted) loadRealLibrary() else permissionLauncher.launch(Manifest.permission.READ_MEDIA_AUDIO)
+        val audioGranted = granted(Manifest.permission.READ_MEDIA_AUDIO)
+        val toRequest = buildList {
+            if (!audioGranted) add(Manifest.permission.READ_MEDIA_AUDIO)
+            if (!granted(Manifest.permission.POST_NOTIFICATIONS)) add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (audioGranted) {
+            loadRealLibrary()
+            maybeRequestAllFiles() // 启动即引导一次（每进程一次；拒绝可从设置页再进）
+        }
+        if (toRequest.isNotEmpty()) permissionLauncher.launch(toRequest.toTypedArray())
     }
 
     // 连接播放服务：MediaController 就绪后注入 AppState（通知/锁屏/后台由 service 承担）
@@ -151,8 +243,8 @@ fun GlassApp() {
             ContextCompat.getMainExecutor(context),
         )
         onDispose {
-            runCatching { future.get().release() }
-            future.cancel(false)
+            // 非阻塞释放：内部等 future 就绪后再 release（future.get() 会卡主线程）
+            runCatching { MediaController.releaseFuture(future) }
         }
     }
 
@@ -167,26 +259,40 @@ fun GlassApp() {
     LaunchedEffect(state.motionLevel) {
         GlassMotion.scale = state.motionLevel.factor
     }
-    // 深浅色 → 系统栏图标外观（浅色模式用深色图标）
+    // 深浅色 → 系统栏图标外观（浅色模式用深色图标）；首帧后重设一次，
+    // 部分 ROM（ColorOS）在窗口装饰初始化时会吃掉启动期的 isAppearanceLight 设置
     val view = LocalView.current
     LaunchedEffect(state.themeMode) {
-        (context as? Activity)?.window?.let { window ->
-            WindowCompat.getInsetsController(window, view).apply {
-                isAppearanceLightStatusBars = state.themeMode == ThemeMode.Light
-                isAppearanceLightNavigationBars = state.themeMode == ThemeMode.Light
-            }
+        val window = (context as? Activity)?.window ?: return@LaunchedEffect
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        val light = state.themeMode == ThemeMode.Light
+        fun apply() {
+            controller.isAppearanceLightStatusBars = light
+            controller.isAppearanceLightNavigationBars = light
         }
+        apply()
+        withFrameNanos { }
+        apply()
+        view.post { apply() }
     }
-    // 返回键：模态面板优先关闭 → 详情回来源页 → 其余回曲库
+    // 应用内更新：启动 5s 后静默检查（失败无声，有新版点亮设置行）
+    val updateManager = remember { UpdateManager(context, scope) }
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(5_000)
+        updateManager.checkSilently()
+    }
+
+    // 返回键：模态面板优先关闭 → 详情回来源页 → 播放页逆向飞行收起 → 其余回曲库
     BackHandler(enabled = state.screen != GlassScreen.Library) {
         when {
             modalState.isOpen -> modalState.requestDismiss()
             state.screen == GlassScreen.Detail -> state.backFromDetail()
+            state.screen == GlassScreen.Player -> flight.beginExit(state.currentSong) { state.screen = it }
             else -> state.screen = GlassScreen.Library
         }
     }
 
-    CompositionLocalProvider(LocalModalState provides modalState) {
+    CompositionLocalProvider(LocalModalState provides modalState, LocalPlayerFlight provides flight) {
         GlassTheme(
             palette = state.palette,
             isDark = state.themeMode == ThemeMode.Dark,
@@ -194,15 +300,42 @@ fun GlassApp() {
         ) {
             val appHazeState = rememberHazeState()
             CompositionLocalProvider(LocalHazeState provides appHazeState) {
-                Box(Modifier.fillMaxSize()) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .trackFlight(FlightKeys.AppRoot, keepOnDispose = true),
+                ) {
                     AuroraBackground()
 
-                    Column(Modifier.fillMaxSize()) {
-                        // 内容区：三个主屏（曲库/发现/我的）按 tab 顺序整屏左右平移，其余页淡入上移
-                        Box(Modifier.weight(1f).hazeSource(appHazeState)) {
-                            AnimatedContent(
+                    Box(Modifier.fillMaxSize()) {
+                        // 内容区：三个主屏（曲库/发现/我的）按 tab 顺序整屏左右平移，其余页淡入上移。
+                        // 恒全高——Chrome 悬浮在根层后绘，显隐不再挤占布局（飞行两端/模态开合零 reflow）
+                        Box(Modifier.fillMaxSize().hazeSource(appHazeState)) {
+                            if (!state.librarySettled) {
+                                // 启动收敛中（曲库缓存/首扫未到）：不渲染任何演示内容
+                                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    Text(
+                                        "正在整理曲库…",
+                                        color = LocalGlassColors.current.textSecondary,
+                                        fontSize = 12.sp,
+                                    )
+                                }
+                            } else AnimatedContent(
                             targetState = state.screen,
                             transitionSpec = {
+                                when {
+                                    // 共享元素飞行·进入：播放页元素自理（EnterTransition.None），旧 tab 页淡出
+                                    flight.isActive && targetState == GlassScreen.Player -> {
+                                        EnterTransition.None togetherWith fadeOut(GlassMotion.tweenFlight())
+                                    }
+                                    // 共享元素飞行·退出中段翻页：库页淡入接管，播放页元素已全透明离场
+                                    flight.isActive && initialState == GlassScreen.Player -> {
+                                        fadeIn(
+                                            tween(((GlassMotion.Flight * GlassMotion.scale * 0.6f)).toInt().coerceAtLeast(1),
+                                                easing = GlassMotion.Curve),
+                                        ) togetherWith ExitTransition.None
+                                    }
+                                    else -> {
                                 val order = mapOf(
                                     GlassScreen.Library to 0,
                                     GlassScreen.Playlist to 1,
@@ -226,6 +359,8 @@ fun GlassApp() {
                                         slideInVertically(GlassMotion.tweenPage()) { it / 20 })
                                         .togetherWith(fadeOut(GlassMotion.tweenPage()))
                                 }
+                                    }
+                                }
                             },
                             label = "screen",
                             ) { target ->
@@ -235,13 +370,38 @@ fun GlassApp() {
                                     GlassScreen.Playlist -> PlaylistScreen(state)
                                     GlassScreen.Detail -> PlaylistDetailScreen(state)
                                     GlassScreen.Search -> SearchScreen(state)
-                                    GlassScreen.Settings -> SettingsScreen(state, onRescan = { loadRealLibrary() })
+                                    GlassScreen.Settings -> SettingsScreen(
+                                        state,
+                                        onRescan = { onDone -> loadRealLibrary(onDone) },
+                                        update = updateManager.state,
+                                        currentVersionName = remember {
+                                            try {
+                                                context.packageManager
+                                                    .getPackageInfo(context.packageName, 0).versionName ?: ""
+                                            } catch (e: Exception) {
+                                                ""
+                                            }
+                                        },
+                                        onCheckUpdate = updateManager::check,
+                                        onStartUpdate = updateManager::startUpdate,
+                                        onInstallUpdate = updateManager::install,
+                                        allFilesGranted = allFilesGranted,
+                                        onAllFilesAccess = {
+                                            if (allFilesGranted) {
+                                                loadRealLibrary() // 已授权：重扫刷新歌词
+                                            } else {
+                                                openAllFilesAccessPage()
+                                            }
+                                        },
+                                    )
                                 }
                             }
                         }
-                        // 底部 Chrome（迷你条 + 导航）：三个主屏共享，切换时完全静止；
-                        // 模态面板打开时让位（面板 scrim 盖不住同级后绘制的 Chrome）
-                        if (state.screen in TAB_SCREENS && !modalState.isOpen) {
+                        // 底部 Chrome（迷你条 + 导航）：悬浮于根层、与内容区同层后绘——
+                        // 显隐只控组合不控布局，内容区恒全高，飞行两端/模态开合/tab 切换均无 reflow。
+                        // 飞行期不组合：进入时随 screen=Player 卸载（替身按冻结 mini 几何原地无缝接位），
+                        // 退出时等 t=0.15 翻页才随 Library 出现（迷你条/胶囊由真身曲线淡入接位）
+                        if (state.screen in TAB_SCREENS && state.librarySettled && !modalState.isOpen) {
                             GlassChrome(
                                 song = state.currentSong,
                                 playing = state.playing,
@@ -258,12 +418,23 @@ fun GlassApp() {
                                         else -> GlassScreen.Settings
                                     }
                                 },
-                                onOpenPlayer = { state.screen = GlassScreen.Player },
+                                onOpenPlayer = {
+                                    val navSelected = when (state.screen) {
+                                        GlassScreen.Playlist -> 1
+                                        GlassScreen.Settings -> 2
+                                        else -> 0
+                                    }
+                                    flight.beginEntry(state.currentSong, navSelected) { state.screen = it }
+                                },
                                 onPlayPause = state::togglePlayPause,
                                 onNext = { state.next() },
+                                modifier = Modifier.align(Alignment.BottomCenter),
                             )
                         }
                     }
+
+                    // 共享元素飞行覆盖层：6 个替身（玻璃/封面/歌名/作者/播放/下一首），纯绘制不挡触摸
+                    PlayerFlightOverlay(flight, playing = state.playing)
 
                     // 播放错误提示条（4s 自动消退，点击关闭）
                     state.playbackError?.let { message ->

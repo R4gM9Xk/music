@@ -104,6 +104,15 @@ fun lerpGlassColors(from: GlassColors, to: GlassColors, fraction: Float): GlassC
     lyricAdjacent = lerp(from.lyricAdjacent, to.lyricAdjacent, fraction),
 )
 
+/** AuroraPalette 全字段插值（深浅主题各自动画后按进度混合，避免中途整包跳变） */
+fun lerpPalette(from: AuroraPalette, to: AuroraPalette, fraction: Float): AuroraPalette = AuroraPalette(
+    seed = lerp(from.seed, to.seed, fraction),
+    seed2 = lerp(from.seed2, to.seed2, fraction),
+    seed3 = lerp(from.seed3, to.seed3, fraction),
+    deep = lerp(from.deep, to.deep, fraction),
+    deep2 = lerp(from.deep2, to.deep2, fraction),
+)
+
 // ── 动效（统一弹簧曲线）───────────────────────────────────
 object GlassMotion {
     /** cubic-bezier(.32,.72,.28,1) —— 全 app 唯一缓动曲线 */
@@ -117,12 +126,14 @@ object GlassMotion {
     const val Lyric = 500     // 歌词滚动 / 高亮 500ms
     const val Page = 360      // 页面切换 360ms 淡入上移
     const val Hover = 250     // tab / 开关等微交互
+    const val Flight = 500    // 共享元素飞行（迷你条 ⇄ 播放页）500ms
 
     fun <T> tweenPress() = tween<T>((Press * scale).toInt().coerceAtLeast(1), easing = Curve)
     fun <T> tweenPalette() = tween<T>((Palette * scale).toInt().coerceAtLeast(1), easing = Curve)
     fun <T> tweenLyric() = tween<T>((Lyric * scale).toInt().coerceAtLeast(1), easing = Curve)
     fun <T> tweenPage() = tween<T>((Page * scale).toInt().coerceAtLeast(1), easing = Curve)
     fun <T> tweenHover() = tween<T>((Hover * scale).toInt().coerceAtLeast(1), easing = Curve)
+    fun <T> tweenFlight() = tween<T>((Flight * scale).toInt().coerceAtLeast(1), easing = Curve)
 }
 
 /** 玻璃强度（设置页三档）：按系数派生填充与描边透明度 */
@@ -180,8 +191,10 @@ fun GlassTheme(
         animationSpec = tween(GlassMotion.Palette, easing = GlassMotion.Curve),
         label = "themeFraction",
     )
-    // 浅色模式：底色用同一取色的浅色派生，玻璃切换为浅色令牌
-    val effectivePalette = if (themeFraction < 0.5f) palette else palette.light()
+    // 深浅两套取色各自动画后按主题进度混合（浅色 = deep 系拉高明度的派生）
+    val darkPalette = animatePalette(palette)
+    val lightPalette = animatePalette(palette.light())
+    val effectivePalette = lerpPalette(darkPalette, lightPalette, themeFraction)
     val darkGlass = glassIntensity.derive(GlassColors())
     val lightGlass = glassIntensity.derive(GlassColors.light())
     val glass = lerpGlassColors(darkGlass, lightGlass, themeFraction)
@@ -197,3 +210,10 @@ fun GlassTheme(
 
 /** 深浅模式标记：极光背景混合/暗角、系统栏外观等处使用 */
 val LocalIsDark = compositionLocalOf { true }
+
+/** 强调色（选中/开启态）：深色用浅强调 seed3，浅色下 seed3 太浅改用主色 seed */
+@Composable
+fun auroraAccentColor(): Color {
+    val palette = LocalAuroraPalette.current
+    return if (LocalIsDark.current) palette.seed3 else palette.seed
+}

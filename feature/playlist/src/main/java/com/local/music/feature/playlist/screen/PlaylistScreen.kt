@@ -1,6 +1,7 @@
 package com.local.music.feature.playlist.screen
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -9,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -32,7 +34,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.ArtThumb
+import com.local.music.core.ui.components.CollectionActionsSheet
 import com.local.music.core.ui.components.DemoCatalog
+import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.GlassSheet
 import com.local.music.core.ui.components.GlassSurface
@@ -52,13 +56,14 @@ import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 
 /**
- * 歌单库：2×2 玻璃封面墙（常驻 + 用户自建，各自带参进详情）
+ * 歌单库：2×2 玻璃封面墙（常驻 + 用户自建，各自带参进详情，长按 = 集合操作面板）
  * + 「我喜欢的 / 最近播放」动态卡；＋ 新建歌单（命名面板）。
  */
 @Composable
 fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
     var showCreate by remember { mutableStateOf(false) }
     var newName by remember { mutableStateOf("") }
+    var collectionMenu by remember { mutableStateOf<CollectionMenuData?>(null) }
 
     val hazeState = rememberHazeState()
     CompositionLocalProvider(LocalHazeState provides hazeState) {
@@ -70,8 +75,8 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                     .hazeSource(hazeState),
             ) {
             PageHeader(title = "歌单", actionIcon = GlassIcons.Plus, onAction = { showCreate = true })
-            // 玻璃封面墙
-            (DemoCatalog.playlists + state.userPlaylists).chunked(2).forEach { pair ->
+            // 玻璃封面墙（内建歌单已被删除的不再显示）
+            (state.visibleBuiltInPlaylists() + state.userPlaylists).chunked(2).forEach { pair ->
                 Row(
                     Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -81,6 +86,13 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                             title = playlist.title, meta = playlist.meta, art = playlist.art,
                             onClick = {
                                 state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, playlist.id))
+                            },
+                            onLongClick = {
+                                collectionMenu = CollectionMenuData(
+                                    DetailTarget(DetailTarget.Kind.Playlist, playlist.id),
+                                    playlist.title,
+                                    state.resolvePlaylist(playlist.id)?.tracks.orEmpty(),
+                                )
                             },
                             modifier = Modifier.weight(1f),
                         )
@@ -96,14 +108,30 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
             ) {
                 Column {
                     FavoriteRow(
-                        "我喜欢的音乐", "${state.favorites.size} 首", ArtStyle.Room,
-                    ) { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.FavoritesId)) }
+                        "我喜欢的音乐", "${state.resolvedFavorites.size} 首", ArtStyle.Room,
+                        onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.FavoritesId)) },
+                        onLongClick = {
+                            collectionMenu = CollectionMenuData(
+                                DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.FavoritesId),
+                                "我喜欢的音乐",
+                                state.resolvedFavorites,
+                            )
+                        },
+                    )
                     FavoriteRow(
                         "最近播放", "${state.playedIds.size} 首", ArtStyle.Afternoon,
-                    ) { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.RecentId)) }
+                        onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.RecentId)) },
+                        onLongClick = {
+                            collectionMenu = CollectionMenuData(
+                                DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.RecentId),
+                                "最近播放",
+                                state.resolvePlaylist(DemoCatalog.RecentId)?.tracks.orEmpty(),
+                            )
+                        },
+                    )
                 }
             }
-            Spacer(Modifier.height(18.dp))
+            Spacer(Modifier.navigationBarsPadding().height(146.dp))
             }
         }
     }
@@ -138,18 +166,58 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
             },
         )
     }
+
+    // 集合操作面板（歌单卡 / 动态卡的长按入口）
+    collectionMenu?.let { menu ->
+        CollectionActionsSheet(
+            visible = true,
+            onDismiss = { collectionMenu = null },
+            state = state,
+            target = menu.target,
+            title = menu.title,
+            tracks = menu.tracks,
+            onPlayAll = { shuffle ->
+                state.playCollection(menu.tracks, menu.title, shuffle)
+                state.screen = GlassScreen.Player
+            },
+        )
+    }
 }
 
+/** 卡片长按的集合菜单数据（同 LibraryScreen 的局部形态，歌单墙独立持有） */
+private data class CollectionMenuData(
+    val target: DetailTarget,
+    val title: String,
+    val tracks: List<DemoSong>,
+)
+
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun FavoriteRow(title: String, meta: String, art: ArtStyle, onClick: () -> Unit) {
+private fun FavoriteRow(
+    title: String,
+    meta: String,
+    art: ArtStyle,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+) {
     val interactionSource = remember { MutableInteractionSource() }
+    val rowClickable = if (onLongClick != null) {
+        Modifier.combinedClickable(
+            interactionSource = interactionSource,
+            indication = null,
+            onClick = onClick,
+            onLongClick = onLongClick,
+        )
+    } else {
+        Modifier.clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+    }
     Row(
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 6.dp)
             .clip(RoundedCornerShape(14.dp))
             .pressScale(interactionSource, pressed = 0.98f)
-            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+            .then(rowClickable)
             .padding(horizontal = 14.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),

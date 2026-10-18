@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 液态波纹：水滴落入液面的三重涟漪 = 「液态玻璃流」的液 + 声波的扩散。
+     全部用 evenOdd 填充圆环（stroke 圆在系统图标管线上渲染不可控），圆心略下沉取光学重心。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 中心水滴 r=7 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M47,57 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0 Z" />
+
+    <!-- 涟漪 · 内：R=19 / r=14 -->
+    <path
+        android:fillColor="#FFF2F4FF"
+        android:fillType="evenOdd"
+        android:pathData="M35,57 a19,19 0 1,0 38,0 a19,19 0 1,0 -38,0 Z M40,57 a14,14 0 1,0 28,0 a14,14 0 1,0 -28,0 Z" />
+
+    <!-- 涟漪 · 中：R=27.5 / r=23.3 -->
+    <path
+        android:fillColor="#9EFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M26.5,57 a27.5,27.5 0 1,0 55,0 a27.5,27.5 0 1,0 -55,0 Z M30.7,57 a23.3,23.3 0 1,0 46.6,0 a23.3,23.3 0 1,0 -46.6,0 Z" />
+
+    <!-- 涟漪 · 外：R=34.9 / r=31.1 -->
+    <path
+        android:fillColor="#59FFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M19.1,57 a34.9,34.9 0 1,0 69.8,0 a34.9,34.9 0 1,0 -69.8,0 Z M22.9,57 a31.1,31.1 0 1,0 62.2,0 a31.1,31.1 0 1,0 -62.2,0 Z" />
+</vector>

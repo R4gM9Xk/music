@@ -68,7 +68,7 @@ class SettingsStore(context: Context) : SnapshotStore {
     companion object {
         private const val TAG = "SettingsStore"
         private val KEY_STATE = stringPreferencesKey("app_state_snapshot")
-        private const val VERSION = 2
+        private const val VERSION = 3
 
         private fun JSONArray.strings(): List<String> = List(length()) { getString(it) }
 
@@ -112,10 +112,12 @@ class SettingsStore(context: Context) : SnapshotStore {
                     s.addedTracks.forEach { (id, tracks) -> put(id, JSONArray(tracks)) }
                 },
             )
+            put("hiddenPlaylists", JSONArray(s.hiddenBuiltInPlaylists.toList()))
             put("queueIds", JSONArray(s.queueIds))
             put("queueIndex", s.queueIndex)
             put("progressSec", s.progressSec.toDouble())
             put("currentSongId", s.currentSongId ?: JSONObject.NULL)
+            put("songSort", s.songSort)
         }.toString()
 
         /** JSON 优先；非 JSON（旧格式）走 legacy 解析迁移；损坏数据记日志后返回 null */
@@ -156,10 +158,12 @@ class SettingsStore(context: Context) : SnapshotStore {
                     obj.keys().forEach { id -> put(id, obj.optJSONArray(id)?.strings() ?: emptyList()) }
                 }
             } ?: emptyMap(),
+            hiddenBuiltInPlaylists = o.stringSet("hiddenPlaylists"),
             queueIds = o.stringList("queueIds"),
             queueIndex = o.optInt("queueIndex", 0),
             progressSec = o.optDouble("progressSec", 0.0).toFloat(),
             currentSongId = o.optString("currentSongId").takeIf { o.has("currentSongId") && !o.isNull("currentSongId") },
+            songSort = o.optString("songSort", "Title"),
         )
 
         // ── v1（旧版）：\u001F 分字段 / \u001E 分集合项 / \u001D 分子字段，仅作迁移 ──

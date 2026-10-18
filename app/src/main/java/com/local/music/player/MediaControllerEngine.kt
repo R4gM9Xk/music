@@ -92,22 +92,23 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
         )
     }
 
+    private fun SongSpec.toMediaItem(): MediaItem =
+        MediaItem.Builder()
+            .setMediaId(id)
+            .setUri(uri)
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(title)
+                    .setArtist(artist)
+                    .setAlbumTitle(album)
+                    .setArtworkUri(artworkUri?.let(Uri::parse))
+                    .build(),
+            )
+            .build()
+
     /** 整条队列下发给服务端播放器：起始位置随 setMediaItems 原子下发（独立 seekTo 会在装载窗口被丢弃） */
     override fun loadQueue(specs: List<SongSpec>, startIndex: Int, startSec: Float, autoPlay: Boolean) {
-        val items = specs.map { spec ->
-            MediaItem.Builder()
-                .setMediaId(spec.id)
-                .setUri(spec.uri)
-                .setMediaMetadata(
-                    MediaMetadata.Builder()
-                        .setTitle(spec.title)
-                        .setArtist(spec.artist)
-                        .setAlbumTitle(spec.album)
-                        .setArtworkUri(spec.artworkUri?.let(Uri::parse))
-                        .build(),
-                )
-                .build()
-        }
+        val items = specs.map { it.toMediaItem() }
         val startPositionMs = if (startSec > 0f) (startSec * 1000).toLong() else C.TIME_UNSET
         controller.setMediaItems(
             items,
@@ -156,7 +157,41 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
 
     override fun hasPreviousMediaItem(): Boolean = controller.hasPreviousMediaItem()
 
+    // 增量队列编辑：MediaController 原生 API 即可原地改队列，当前曲不受影响；
+    // move 语义（toIndex 以移除后的列表坐标计）与 AppState 侧 Kotlin removeAt/add 一致。
+    // shuffle 开启时插入走服务端命令（DefaultShuffleOrder 会把新项随机放置，
+    // 服务端重建播放序保证「下一首播放 = 紧跟当前曲、最后播放 = 队尾」）
+    override fun addQueueItems(index: Int, specs: List<SongSpec>) {
+        if (controller.shuffleModeEnabled && specs.isNotEmpty()) {
+            val pinLast = index >= controller.mediaItemCount
+            runCatching {
+                controller.sendCustomCommand(
+                    SessionCommand(MusicPlaybackService.CMD_INSERT_SHUFFLE_FIX, Bundle.EMPTY),
+                    Bundle().apply {
+                        putInt(MusicPlaybackService.KEY_INDEX, index)
+                        putSerializable(MusicPlaybackService.KEY_SPECS, ArrayList(specs))
+                        putString(
+                            MusicPlaybackService.KEY_PIN_MODE,
+                            if (pinLast) MusicPlaybackService.PIN_LAST else MusicPlaybackService.PIN_NEXT,
+                        )
+                    },
+                )
+            }.onFailure { controller.addMediaItems(index, specs.map { it.toMediaItem() }) }
+        } else {
+            controller.addMediaItems(index, specs.map { it.toMediaItem() })
+        }
+    }
+
+    override fun moveQueueItem(fromIndex: Int, toIndex: Int) = controller.moveMediaItem(fromIndex, toIndex)
+
+    override fun removeQueueItems(fromIndex: Int, toIndex: Int) {
+        controller.removeMediaItems(fromIndex, toIndex)
+    }
+
     override fun currentMediaId(): String? = controller.currentMediaItem?.mediaId
+
+    override fun mediaIds(): List<String> =
+        (0 until controller.mediaItemCount).map { controller.getMediaItemAt(it).mediaId }
 
     override fun isEnginePlaying(): Boolean = controller.isPlaying
 

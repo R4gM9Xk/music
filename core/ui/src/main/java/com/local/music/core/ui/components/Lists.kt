@@ -1,6 +1,7 @@
 package com.local.music.core.ui.components
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -41,8 +42,12 @@ import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.auroraAccentColor
 
-/** 大标题页头：30sp 粗体 + 可选右侧玻璃圆钮（.hd）；actionLabel 作为按钮读屏描述 */
+/** SongRow 固定行高（9+48+9dp）：队列滚动定位与拖拽重排共享的数学基准 */
+val SongRowHeight = 66.dp
+
+/** 大标题页头：30sp 粗体 + 可选右侧玻璃圆钮（.hd），可挂第二动作（渲染在主动作左侧）；actionLabel 作为按钮读屏描述 */
 @Composable
 fun PageHeader(
     title: String,
@@ -50,6 +55,9 @@ fun PageHeader(
     actionIcon: ImageVector? = null,
     onAction: (() -> Unit)? = null,
     actionLabel: String? = null,
+    action2Icon: ImageVector? = null,
+    onAction2: (() -> Unit)? = null,
+    action2Label: String? = null,
 ) {
     Row(
         modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 12.dp),
@@ -58,16 +66,30 @@ fun PageHeader(
     ) {
         Text(title, color = LocalGlassColors.current.textPrimary, fontSize = 30.sp, fontWeight = FontWeight.Bold,
             letterSpacing = (-0.6).sp)
-        if (actionIcon != null && onAction != null) {
-            GlassIconButton(
-                onClick = onAction,
-                modifier = if (actionLabel != null) {
-                    Modifier.semantics { contentDescription = actionLabel }
-                } else {
-                    Modifier
-                },
-            ) {
-                Icon(actionIcon, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (action2Icon != null && onAction2 != null) {
+                GlassIconButton(
+                    onClick = onAction2,
+                    modifier = if (action2Label != null) {
+                        Modifier.semantics { contentDescription = action2Label }
+                    } else {
+                        Modifier
+                    },
+                ) {
+                    Icon(action2Icon, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
+                }
+            }
+            if (actionIcon != null && onAction != null) {
+                GlassIconButton(
+                    onClick = onAction,
+                    modifier = if (actionLabel != null) {
+                        Modifier.semantics { contentDescription = actionLabel }
+                    } else {
+                        Modifier
+                    },
+                ) {
+                    Icon(actionIcon, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
+                }
             }
         }
     }
@@ -154,7 +176,10 @@ fun GlassTabs(
     }
 }
 
-/** 歌曲行：48dp 圆角12 缩略图 + 标题/副标题 + 时长或播放波形（.row）；onMoreClick 提供时"更多"才是独立按钮 */
+/** 歌曲行：48dp 圆角12 缩略图 + 标题/副标题 + 时长或播放波形（.row）
+ *  onMoreClick 提供时"更多"是独立按钮；onRemoveClick（队列行）与 onLongClick（操作菜单）同理。
+ *  onRemoveClick 优先级高于 onMoreClick（队列行不需要菜单，只要移除）。 */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun SongRow(
     song: DemoSong,
@@ -163,18 +188,31 @@ fun SongRow(
     squareThumb: Boolean = false,
     trailing: String? = song.duration,
     onMoreClick: (() -> Unit)? = null,
+    onRemoveClick: (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit = {},
+    wavePlaying: Boolean = true,
 ) {
     val palette = LocalAuroraPalette.current
     val interactionSource = remember { MutableInteractionSource() }
-    val moreInteractionSource = remember { MutableInteractionSource() }
+    val actionInteractionSource = remember { MutableInteractionSource() }
+    val rowClickable = if (onLongClick != null) {
+        Modifier.combinedClickable(
+            interactionSource = interactionSource,
+            indication = null,
+            onClick = onClick,
+            onLongClick = onLongClick,
+        )
+    } else {
+        Modifier.clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+    }
     Row(
         modifier
             .fillMaxWidth()
             .padding(horizontal = 6.dp)
             .clip(RoundedCornerShape(14.dp))
             .pressScale(interactionSource, pressed = 0.98f)
-            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+            .then(rowClickable)
             .padding(horizontal = 14.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -189,25 +227,39 @@ fun SongRow(
             Text(
                 song.title, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                color = if (playing) palette.seed3 else LocalGlassColors.current.textPrimary,
+                // 播放态强调色用 auroraAccentColor()（浅色回退 seed）：seed3 过浅压不住浅色背景
+                color = if (playing) auroraAccentColor() else LocalGlassColors.current.textPrimary,
             )
             Spacer(Modifier.height(2.dp))
             Text(song.subtitle, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         if (playing) {
-            WaveIndicator(barCount = 4)
+            WaveIndicator(barCount = 4, playing = wavePlaying)
         } else if (onMoreClick != null) {
             // "更多"是独立触点：不再吞进整行的播放点击
             Box(
                 Modifier
                     .size(36.dp)
                     .clip(RoundedCornerShape(10.dp))
-                    .clickable(interactionSource = moreInteractionSource, indication = null, onClick = onMoreClick)
+                    .clickable(interactionSource = actionInteractionSource, indication = null, onClick = onMoreClick)
                     .semantics { contentDescription = "更多操作" },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(GlassIcons.More, null, Modifier.size(16.dp),
+                    tint = LocalGlassColors.current.textFaint)
+            }
+        } else if (onRemoveClick != null) {
+            // 队列行移除：36dp 独立触点
+            Box(
+                Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable(interactionSource = actionInteractionSource, indication = null, onClick = onRemoveClick)
+                    .semantics { contentDescription = "从队列移除" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(GlassIcons.MinusCircle, null, Modifier.size(16.dp),
                     tint = LocalGlassColors.current.textFaint)
             }
         } else if (trailing != null) {
@@ -225,7 +277,7 @@ fun SectionHeader(text: String, modifier: Modifier = Modifier) {
     )
 }
 
-/** 歌单卡：md 玻璃卡 + 封面 1.6:1 + 底部 lo 玻璃文字区（.pcard glass / .pt） */
+/** 歌单卡：md 玻璃卡 + 封面 1.6:1 + 底部 lo 玻璃文字区（.pcard glass / .pt）；onLongClick = 操作菜单 */
 @Composable
 fun PlaylistCard(
     title: String,
@@ -234,6 +286,7 @@ fun PlaylistCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     bitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    onLongClick: (() -> Unit)? = null,
 ) {
     val glass = LocalGlassColors.current
     GlassSurface(
@@ -241,6 +294,7 @@ fun PlaylistCard(
         level = GlassLevel.Md,
         shape = RoundedCornerShape(18.dp),
         onClick = onClick,
+        onLongClick = onLongClick,
     ) {
         Column {
             ArtThumb(art, Modifier.fillMaxWidth().aspectRatio(1.6f), RoundedCornerShape(0.dp), bitmap = bitmap)

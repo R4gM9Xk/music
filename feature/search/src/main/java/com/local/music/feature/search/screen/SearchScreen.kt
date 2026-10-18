@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
@@ -30,38 +31,43 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.Color
 import com.local.music.core.ui.components.DemoCatalog
+import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.GlassChrome
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassTextField
 import com.local.music.core.ui.components.LocalHazeState
+import com.local.music.core.ui.components.LocalPlayerFlight
 import com.local.music.core.ui.components.PlaylistCard
 import com.local.music.core.ui.components.SectionHeader
+import com.local.music.core.ui.components.SongActionsSheet
 import com.local.music.core.ui.components.SongRow
 import com.local.music.core.ui.components.pressScale
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
-import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.auroraAccentColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 
 /**
  * 搜索：真输入框（实时过滤标题/艺术家/专辑）+ 历史芯片 + 带数据的结果
- * （歌曲行播放入队、专辑卡进专辑详情）。
+ * （歌曲行播放入队、专辑卡进专辑详情；歌曲行 ⋯/长按 = 单曲操作面板）。
  */
 @Composable
 fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
-    val palette = LocalAuroraPalette.current
     val query = state.searchQuery
     val results = state.searchSongs(query)
     val albums = state.searchAlbumGroups(query)
-    var showAllAlbums by remember { mutableStateOf(false) }
+    // 展开态跟随查询词重置（remember 以 query 为 key，换词自动收起）
+    var showAllAlbums by remember(query) { mutableStateOf(false) }
+    var actionSong by remember { mutableStateOf<DemoSong?>(null) }
+    val flight = LocalPlayerFlight.current
 
     val hazeState = rememberHazeState()
     CompositionLocalProvider(LocalHazeState provides hazeState) {
-        Column(modifier.fillMaxSize().statusBarsPadding()) {
+        Column(modifier.fillMaxSize().statusBarsPadding().imePadding()) {
             Column(
                 Modifier
                     .weight(1f)
@@ -84,7 +90,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                 )
                 val cancelInteraction = remember { MutableInteractionSource() }
                 Text(
-                    "取消", color = palette.seed3, fontSize = 13.sp,
+                    "取消", color = auroraAccentColor(), fontSize = 13.sp,
                     modifier = Modifier
                         .pressScale(cancelInteraction, pressed = 0.92f)
                         .clickable(interactionSource = cancelInteraction, indication = null) {
@@ -122,9 +128,12 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         SongRow(
                             song = song,
                             playing = song.id == state.currentSong.id,
+                            wavePlaying = state.playing,
+                            onMoreClick = { actionSong = song },
+                            onLongClick = { actionSong = song },
                             onClick = {
                                 state.addSearchHistory(query)
-                                state.playSong(song, results)
+                                state.playSong(song, results, "搜索")
                                 state.screen = GlassScreen.Player
                             },
                         )
@@ -152,7 +161,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         val expandInteraction = remember { MutableInteractionSource() }
                         Text(
                             if (showAllAlbums) "收起" else "全部 ${albums.size} 张专辑",
-                            color = palette.seed3, fontSize = 12.5.sp, fontWeight = FontWeight.Medium,
+                            color = auroraAccentColor(), fontSize = 12.5.sp, fontWeight = FontWeight.Medium,
                             modifier = Modifier
                                 .padding(start = 20.dp, end = 20.dp, bottom = 14.dp)
                                 .pressScale(expandInteraction, pressed = 0.92f)
@@ -175,10 +184,28 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                     2 -> state.screen = GlassScreen.Settings
                 }
             },
-            onOpenPlayer = { state.screen = GlassScreen.Player },
+            onOpenPlayer = {
+                // 与 GlassApp 的 Chrome 同走共享元素飞行（忙时兜底直切）
+                val f = flight
+                if (f != null && !f.isActive) {
+                    f.beginEntry(state.currentSong, 0) { state.screen = it }
+                } else {
+                    state.screen = GlassScreen.Player
+                }
+            },
             onPlayPause = state::togglePlayPause,
             onNext = { state.next() },
         )
+        }
+
+        // 单曲操作面板（搜索结果的 ⋯ / 长按入口）
+        actionSong?.let { song ->
+            SongActionsSheet(
+                visible = true,
+                onDismiss = { actionSong = null },
+                state = state,
+                song = song,
+            )
         }
     }
 }

@@ -70,16 +70,12 @@ object DemoCatalog {
             DemoData.songs.filter { it.album == "复刻" }),
     )
 
-    /** 常驻歌单（曲目为曲库子集；收藏 / 最近播放 / 用户自建由 AppState 动态解析） */
+    /** 常驻歌单（曲目随演示曲库移除已清空，作为可删除/可加歌的空壳歌单；收藏 / 最近播放 / 用户自建由 AppState 动态解析） */
     val playlists = listOf(
-        DemoPlaylist("pl-midnight", "深夜巡航", "32 首 · 2 小时", ArtStyle.Night,
-            listOf("night-flight", "white-room", "tide-signal", "galaxy", "afternoon").mapById()),
-        DemoPlaylist("pl-commute", "通勤电台", "58 首 · 3.6 小时", ArtStyle.Tide,
-            listOf("tide-signal", "rain-tower", "galaxy", "night-shuttle", "afternoon", "south-story").mapById()),
-        DemoPlaylist("pl-rainy", "雨天单曲循环", "21 首 · 1.4 小时", ArtStyle.Galaxy,
-            listOf("rain-tower", "night-flight", "white-room", "tide-signal").mapById()),
-        DemoPlaylist("pl-lossless", "无损试音", "14 首 · FLAC", ArtStyle.Tape,
-            listOf("old-tape", "night-flight", "galaxy").mapById()),
+        DemoPlaylist("pl-midnight", "深夜巡航", "0 首", ArtStyle.Night, listOf("night-flight", "white-room", "tide-signal", "galaxy", "afternoon").mapById()),
+        DemoPlaylist("pl-commute", "通勤电台", "0 首", ArtStyle.Tide, listOf("tide-signal", "rain-tower", "galaxy", "night-shuttle", "afternoon", "south-story").mapById()),
+        DemoPlaylist("pl-rainy", "雨天单曲循环", "0 首", ArtStyle.Galaxy, listOf("rain-tower", "night-flight", "white-room", "tide-signal").mapById()),
+        DemoPlaylist("pl-lossless", "无损试音", "0 首", ArtStyle.Tape, listOf("old-tape", "night-flight", "galaxy").mapById()),
     )
 
     val artists: List<String> get() = DemoData.songs.map { it.artist }.distinct()

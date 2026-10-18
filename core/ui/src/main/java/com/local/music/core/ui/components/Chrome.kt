@@ -33,6 +33,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
@@ -139,14 +140,17 @@ fun MiniPlayerBar(
 ) {
     val palette = LocalAuroraPalette.current
     val glass = LocalGlassColors.current
+    val flight = LocalPlayerFlight.current
     val interactionSource = remember { MutableInteractionSource() }
     GlassSurface(
         modifier = modifier
             .fillMaxWidth()
             .height(62.dp)
-            .glassHaze(GlassLevel.Hi),
+            .trackFlight(FlightKeys.MiniGlass, keepOnDispose = true)
+            .graphicsLayer { alpha = flight?.miniSharedAlpha() ?: 1f },
         level = GlassLevel.Hi,
         shape = RoundedCornerShape(20.dp),
+        blur = GlassLevel.Hi,
         onClick = onClick,
     ) {
         Row(
@@ -154,18 +158,20 @@ fun MiniPlayerBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(11.dp),
         ) {
-            ArtThumb(song.art, Modifier.size(42.dp), RoundedCornerShape(11.dp), bordered = true, bitmap = song.coverBitmap)
+            ArtThumb(song.art, Modifier.trackFlight(FlightKeys.MiniCover, keepOnDispose = true).size(42.dp), RoundedCornerShape(11.dp), bordered = true, bitmap = song.coverBitmap)
             Column(Modifier.weight(1f)) {
                 Text(song.title, color = glass.textPrimary, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.trackFlight(FlightKeys.MiniTitle, keepOnDispose = true))
                 Text(song.artist, color = glass.textSecondary, fontSize = 11.sp,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.trackFlight(FlightKeys.MiniArtist, keepOnDispose = true))
             }
-            MiniBarButton(onPlayPause) {
+            MiniBarButton(onPlayPause, Modifier.trackFlight(FlightKeys.MiniPlay, keepOnDispose = true)) {
                 Icon(if (playing) GlassIcons.Pause else GlassIcons.Play, null,
                     Modifier.size(22.dp), tint = glass.textPrimary)
             }
-            MiniBarButton(onNext) {
+            MiniBarButton(onNext, Modifier.trackFlight(FlightKeys.MiniNext, keepOnDispose = true)) {
                 Icon(GlassIcons.Next, null, Modifier.size(22.dp), tint = glass.textPrimary)
             }
         }
@@ -190,10 +196,14 @@ fun MiniPlayerBar(
 }
 
 @Composable
-private fun MiniBarButton(onClick: () -> Unit, content: @Composable () -> Unit) {
+private fun MiniBarButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
     val interactionSource = remember { MutableInteractionSource() }
     Box(
-        Modifier
+        modifier
             .pressScale(interactionSource, pressed = 0.88f)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
             .padding(4.dp),
@@ -215,9 +225,10 @@ fun GlassNavBar(
         Triple("我的", GlassIcons.User, 2),
     )
     GlassSurface(
-        modifier = modifier.fillMaxWidth().height(58.dp).glassHaze(GlassLevel.Md),
+        modifier = modifier.fillMaxWidth().height(58.dp),
         level = GlassLevel.Md,
         shape = CircleShape,
+        blur = GlassLevel.Md,
     ) {
         Row(Modifier.fillMaxSize()) {
             items.forEach { (label, icon, index) ->
@@ -281,6 +292,7 @@ fun GlassChrome(
     onNext: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val flight = LocalPlayerFlight.current
     Column(
         modifier
             .fillMaxWidth()
@@ -289,6 +301,12 @@ fun GlassChrome(
     ) {
         MiniPlayerBar(song, playing, progress, onOpenPlayer, onPlayPause, onNext)
         Spacer(Modifier.height(8.dp))
-        GlassNavBar(navSelected, onNavSelect)
+        // 导航胶囊：飞行期间随 t 消隐/复原；rect 供进入飞行的覆盖层渐隐替身使用
+        GlassNavBar(
+            navSelected, onNavSelect,
+            Modifier
+                .trackFlight(FlightKeys.MiniNav, keepOnDispose = true)
+                .graphicsLayer { alpha = flight?.navAlpha() ?: 1f },
+        )
     }
 }
