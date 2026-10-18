@@ -1,9 +1,9 @@
 {
-  "versionCode": 2,
-  "versionName": "1.0.1",
-  "changelog": "移除演示曲库；扫描支持任意目录；应用内在线更新",
+  "versionCode": 3,
+  "versionName": "1.0.2",
+  "changelog": "队列拖动重排与清空；统一歌曲/歌单动作菜单；歌单编辑与重命名；曲库排序（含中文拼音序）；读取任意目录 .lrc 歌词；播放页共享元素动效",
   "apk": "https://gh-proxy.com/https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-debug.apk",
   "apkMirror": "https://cdn.jsdelivr.net/gh/R4gM9Xk/music@main/apk/app-debug.apk",
   "apkAlt": "https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-debug.apk",
-  "sha256": "371d9e909684a678f122763fbd1a17e07b1382d8e46e3ac01077cd823ff6fdb6"
+  "sha256": "627219ceaa8636c47aa55001531e5e880450433048311739b0694c494675ad81"
 }
