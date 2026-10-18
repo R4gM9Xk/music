@@ -34,7 +34,7 @@ cat > update.json <<EOF
   "versionName": "$VER",
   "changelog": "$NOTES",
   "apk": "https://gh-proxy.com/$RAW_BASE",
-  "apkMirror": "https://cdn.jsdelivr.net/gh/$REPO@main/apk/app-debug.apk",
+  "apkMirror": "https://ghfast.top/$RAW_BASE",
   "apkAlt": "$RAW_BASE",
   "sha256": "$SHA"
 }
