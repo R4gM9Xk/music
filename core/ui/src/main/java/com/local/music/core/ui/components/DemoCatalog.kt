@@ -45,6 +45,7 @@ data class DetailData(
 object DemoCatalog {
     val FavoritesId = "__favorites"
     val RecentId = "__recent"
+    val MostPlayedId = "__most_played"
 
     /** 初始进度 98s（01:38）时高亮第 4 行，对齐设计稿 */
     val lyrics = listOf(

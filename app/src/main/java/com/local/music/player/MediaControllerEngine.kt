@@ -25,6 +25,10 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
     override var onPlayingChanged: ((Boolean) -> Unit)? = null
     override var onFormatChanged: ((SongFormat?) -> Unit)? = null
     override var onMediaItemChanged: ((String?) -> Unit)? = null
+    override var onAutoAdvanced: ((String?) -> Unit)? = null
+
+    /** 上一曲 mediaId：用于在自动切歌时报告「哪首播完了」（D1 完播计数） */
+    private var lastMediaId: String? = null
     override var onError: ((String) -> Unit)? = null
 
     /** 断连已上报标记（重连后清位，避免每个调用都重复刷错误横幅） */
@@ -38,6 +42,13 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
                 }
 
                 override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    val previous = lastMediaId
+                    lastMediaId = mediaItem?.mediaId
+                    // 完播计数（D1）：只有 AUTO 才算「播完上一首」——
+                    // 手动切歌(SEEK)/随机跳转/列表重建都不计，与「播放次数」的用户预期一致
+                    if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                        onAutoAdvanced?.invoke(previous)
+                    }
                     onMediaItemChanged?.invoke(mediaItem?.mediaId)
                 }
 

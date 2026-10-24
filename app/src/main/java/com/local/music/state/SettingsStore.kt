@@ -75,7 +75,7 @@ class SettingsStore(context: Context) : SnapshotStore {
         private const val TAG = "SettingsStore"
         private val KEY_STATE = stringPreferencesKey("app_state_snapshot")
         private val KEY_SCAN_FILTER_SHORT = booleanPreferencesKey("scan_filter_short")
-        private const val VERSION = 6
+        private const val VERSION = 7
 
         /**
          * 扫描过滤开关的同步读取（MediaLibrary.load 扫描线程专用；GlassApp 调用点无需感知该设置）：
@@ -140,6 +140,11 @@ class SettingsStore(context: Context) : SnapshotStore {
             put("repeatMode", s.repeatMode)
             put("playbackSpeed", s.playbackSpeed.toDouble())
             put("scanFilterShort", s.scanFilterShort)
+            // 播放次数（v7）：id → 次数；空表也写（结构稳定，解码侧统一 optJSONObject 兜底）
+            put(
+                "playCounts",
+                JSONObject().apply { s.playCounts.forEach { (id, n) -> put(id, n) } },
+            )
         }.toString()
 
         /** JSON 优先；非 JSON（旧格式）走 legacy 解析迁移；损坏数据记日志后返回 null */
@@ -191,6 +196,9 @@ class SettingsStore(context: Context) : SnapshotStore {
             playbackSpeed = o.optDouble("playbackSpeed", 1.0) // 旧版本（≤v4）无此字段：走默认值零迁移
                 .toFloat().takeIf { it > 0f } ?: 1f,
             scanFilterShort = o.optBoolean("scanFilterShort", true), // 旧版本（≤v5）无此字段：走默认值零迁移
+            playCounts = o.optJSONObject("playCounts")?.let { obj -> // 旧版本（≤v6）无此字段：空表零迁移
+                buildMap { obj.keys().forEach { id -> put(id, obj.optInt(id, 0)) } }
+            } ?: emptyMap(),
         )
 
         // ── v1（旧版）：\u001F 分字段 / \u001E 分集合项 / \u001D 分子字段，仅作迁移 ──

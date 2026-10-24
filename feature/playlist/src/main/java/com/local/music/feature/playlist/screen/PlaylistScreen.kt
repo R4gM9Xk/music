@@ -178,6 +178,18 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                             )
                         },
                     )
+                    FavoriteRow(
+                        // D1：按完播次数取前 50，计数同源 resolvePlaylist（失效 id 已过滤）
+                        "最常播放", "${state.resolvePlaylist(DemoCatalog.MostPlayedId)?.tracks?.size ?: 0} 首", ArtStyle.Tape,
+                        onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.MostPlayedId)) },
+                        onLongClick = {
+                            collectionActions(
+                                DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.MostPlayedId),
+                                "最常播放",
+                                state.resolvePlaylist(DemoCatalog.MostPlayedId)?.tracks.orEmpty(),
+                            )
+                        },
+                    )
                 }
             }
             Spacer(Modifier.navigationBarsPadding().height(146.dp))

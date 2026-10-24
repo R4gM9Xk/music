@@ -57,6 +57,7 @@ data class AppStateSnapshot(
     val repeatMode: String = RepeatMode.Off.name, // 循环模式名（同上）
     val playbackSpeed: Float = 1.0f, // 播放速度（v5 起编码，旧版本解码走默认值）
     val scanFilterShort: Boolean = true, // 扫描过滤短音频（v6 起编码，旧版本解码走默认值）
+    val playCounts: Map<String, Int> = emptyMap(), // 播放次数（v7 起编码，旧版本解码走空表）
 )
 
 /** 持久化桥接：AppState 只面向它，实现在 app 模块（DataStore） */
@@ -146,6 +147,8 @@ interface PlayerEngine {
     var onPlayingChanged: ((Boolean) -> Unit)?
     var onFormatChanged: ((SongFormat?) -> Unit)?
     var onMediaItemChanged: ((String?) -> Unit)?
+    /** 引擎自动切换（完播/自动下一首）回调：仅用于播放次数统计（D1）——手动切歌不计 */
+    var onAutoAdvanced: ((String?) -> Unit)?
     var onError: ((String) -> Unit)?
     fun loadQueue(specs: List<SongSpec>, startIndex: Int, startSec: Float, autoPlay: Boolean)
     fun setRepeatMode(repeatAll: Boolean, repeatOne: Boolean)
@@ -247,6 +250,8 @@ class AppState {
     var shuffleOn by mutableStateOf(false)
     var repeatMode by mutableStateOf(RepeatMode.Off)
     val playedIds = mutableStateListOf<String>() // 最近播放（新→旧，按 id 去重）
+    /** 播放次数（id → 累计完播次数）：D1 最常播放的依据；快照 v7 持久化 */
+    val playCounts = mutableStateMapOf<String, Int>()
 
     /** 播放中实时格式（ExoPlayer Format 回流）；null 时展示扫描值 */
     var liveFormat by mutableStateOf<SongFormat?>(null)
@@ -376,6 +381,8 @@ class AppState {
         }
         engine.onFormatChanged = { liveFormat = it }
         engine.onMediaItemChanged = { mediaId -> syncFromEngine(mediaId) }
+        // 完播计数（D1）：引擎报告「自动切换到下一首」时才 +1（手动切歌不计数）
+        engine.onAutoAdvanced = { finishedId -> finishedId?.let { bumpPlayCount(it) } }
         engine.onError = { message ->
             playbackError = message
             playing = false
@@ -502,6 +509,7 @@ class AppState {
                 repeatMode = repeatMode.name,
                 playbackSpeed = playbackSpeed,
                 scanFilterShort = scanFilterShort,
+                playCounts = playCounts.toMap(),
             )
         } else {
             AppStateSnapshot(
@@ -529,6 +537,7 @@ class AppState {
                 repeatMode = repeatMode.name,
                 playbackSpeed = playbackSpeed,
                 scanFilterShort = scanFilterShort,
+                playCounts = playCounts.toMap(),
             )
         }
     }
@@ -546,6 +555,8 @@ class AppState {
         repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeatMode) }.getOrDefault(RepeatMode.Off)
         playbackSpeed = if (snapshot.playbackSpeed > 0f) snapshot.playbackSpeed else 1f
         scanFilterShort = snapshot.scanFilterShort // 旧版本（≤v5）无此字段：走默认值 true 零迁移
+        playCounts.clear()
+        playCounts.putAll(snapshot.playCounts) // 旧版本（≤v6）无此字段：空表零迁移
         excludedFolders.clear()
         excludedFolders.addAll(snapshot.excludedFolders)
         favorites.clear()
@@ -853,6 +864,8 @@ class AppState {
 
     /** 演示模式完播（引擎路径的完播 / 单曲循环由服务端播放器承担） */
     private fun handleTrackEnd() {
+        // 完播计数（D1）：只在真正播到结尾时 +1，手动切歌/拖动进度不计
+        bumpPlayCount(currentSong.id)
         when (repeatMode) {
             RepeatMode.One -> {
                 progressSec = 0f
@@ -1265,6 +1278,15 @@ class AppState {
             val tracks = playedIds.mapNotNull { songById(it) }
             return DemoPlaylist(id, "最近播放", "${tracks.size} 首", ArtStyle.Afternoon, tracks)
         }
+        if (id == DemoCatalog.MostPlayedId) {
+            // 最常播放（D1）：按完播次数降序取前 50；次数相同按曲名稳定排序（避免每次进页面抖动）；
+            // 失效 id 自然被 songById 过滤（与「最近播放」同口径，计数不会虚高）
+            val tracks = playCounts.entries
+                .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
+                .take(50)
+                .mapNotNull { songById(it.key) }
+            return DemoPlaylist(id, "最常播放", "${tracks.size} 首", ArtStyle.Tape, tracks)
+        }
         val base = DemoCatalog.playlist(id)
             ?: userPlaylists.firstOrNull { it.id == id }
             ?: return null
@@ -1304,5 +1326,10 @@ class AppState {
         playedIds.remove(id)
         playedIds.add(0, id)
         if (playedIds.size > 50) playedIds.removeAt(playedIds.lastIndex)
+    }
+
+    /** 累计播放次数（D1）：只在「完播」时计（切歌/手动跳转不算），与 rememberPlayed 同点位 */
+    private fun bumpPlayCount(id: String) {
+        playCounts[id] = (playCounts[id] ?: 0) + 1
     }
 }
