@@ -85,6 +85,7 @@ import com.local.music.feature.settings.screen.SettingsScreen
 import com.local.music.player.MediaControllerEngine
 import com.local.music.player.MediaLibrary
 import com.local.music.player.MusicPlaybackService
+import com.local.music.player.QueueStateStore
 import com.local.music.state.SettingsStore
 import com.local.music.update.UpdateManager
 import dev.chrisbanes.haze.hazeSource
@@ -109,6 +110,15 @@ fun GlassApp() {
     val state = remember { AppState() }
     val scope = rememberCoroutineScope()
     val store = remember { SettingsStore(context) }
+    // 播放现场写盘串行器（C4）：单线程 + 后写覆盖先写，避免 tick 高频写乱序
+    val queueStateExecutor = remember {
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "queue-state-writer").apply { isDaemon = true }
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { queueStateExecutor.shutdown() }
+    }
     val modalState = remember { ModalState() }
     // 播放页共享元素飞行动效（迷你条 ⇄ 播放页），纯 UI 态不进 AppState
     val flight = remember { PlayerFlight(scope) }
@@ -162,6 +172,14 @@ fun GlassApp() {
     // 持久化：绑定存盘桥 + 启动恢复现场（restore 与曲库装载谁先到都幂等收敛）
     LaunchedEffect(Unit) {
         state.bindStore(store)
+        // C4：播放现场的服务端副本（进程被杀后 onPlaybackResumption 靠它恢复）。
+        // 切 IO 线程写：scheduleSave 由 tick 每 5s 调用，同步写会卡 UI；
+        // 用单线程串行执行器保证「后写的覆盖先写的」，不会出现乱序写
+        state.queueStateWriter = { specs, index, positionSec ->
+            queueStateExecutor.execute {
+                QueueStateStore.write(context, specs, index, positionSec)
+            }
+        }
         val snapshot = runCatching { store.read() }.getOrNull()
         if (snapshot != null) {
             state.restore(snapshot)

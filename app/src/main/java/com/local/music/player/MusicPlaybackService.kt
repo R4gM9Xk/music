@@ -79,6 +79,32 @@ class MusicPlaybackService : MediaSessionService() {
                         )
                     }
 
+                    /**
+                     * 进程被杀后系统媒体入口（通知栏恢复 / 蓝牙重连 / 车机）拉起服务时的续播回调。
+                     *
+                     * 此时没有 Activity，AppState 不存在——现场只能从 [QueueStateStore] 读
+                     * （AppState.scheduleSave 时同步写的 queue_state.json）。
+                     * 返回的 MediaItemsWithStartPosition 让播放器直接装载队列并定位到上次进度。
+                     * 无现场（首装 / 用户清空过队列）返回空列表：系统按默认行为处理，不强行播放。
+                     */
+                    override fun onPlaybackResumption(
+                        mediaSession: MediaSession,
+                        controller: MediaSession.ControllerInfo,
+                    ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+                        val state = QueueStateStore.read(this@MusicPlaybackService)
+                        if (state == null || state.specs.isEmpty()) {
+                            return Futures.immediateFuture(
+                                MediaSession.MediaItemsWithStartPosition(emptyList(), 0, C.TIME_UNSET),
+                            )
+                        }
+                        val items = state.specs.map { it.toMediaItem() }
+                        val index = state.index.coerceIn(0, items.lastIndex)
+                        val positionMs = (state.positionSec * 1000f).toLong().coerceAtLeast(0L)
+                        return Futures.immediateFuture(
+                            MediaSession.MediaItemsWithStartPosition(items, index, positionMs),
+                        )
+                    }
+
                     override fun onCustomCommand(
                         session: MediaSession,
                         controller: MediaSession.ControllerInfo,

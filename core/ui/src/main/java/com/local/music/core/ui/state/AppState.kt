@@ -452,8 +452,19 @@ class AppState {
 
     fun scheduleSave() {
         if (!hydrated) return // 恢复完成前不落盘，防止默认演示状态覆盖磁盘快照
-        store?.schedule(snapshot())
+        val snap = snapshot()
+        store?.schedule(snap)
+        // C4：同步写一份「服务可读」的播放现场（specs + index + position），供进程被杀后
+        // 系统媒体入口（通知/蓝牙重连）经 onPlaybackResumption 恢复——服务端读不了 DataStore，
+        // 也不想让它反向依赖状态层，故用同 schema 的独立 JSON 文件做桥。
+        // specs 由 AppState 侧构造（快照只存 id，无法反推标题/封面等字段）。
+        queueStateWriter?.invoke(queue.mapNotNull { it.toSpec() }, snap.queueIndex, snap.progressSec)
     }
+
+    /** 服务端可读的播放现场写出器（实现在 app 模块：写 files/queue_state.json）。
+     *  与快照同一触发点，避免两套存盘时机不一致。
+     *  注意：实现方必须自行切到 IO 线程——本函数在 UI tick 里被调（每 5s）。 */
+    var queueStateWriter: ((specs: List<SongSpec>, index: Int, positionSec: Float) -> Unit)? = null
 
     /** 设置指纹：GlassApp 用 snapshotFlow 监听设置变更触发存盘 */
     fun settingsKey(): String =
