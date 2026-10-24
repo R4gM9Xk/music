@@ -76,6 +76,7 @@ import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.LyricLine
 import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.components.LocalModalState
+import com.local.music.core.ui.components.SongActionsSheet
 import com.local.music.core.ui.components.LocalPlayerFlight
 import com.local.music.core.ui.components.PlayerFlight
 import com.local.music.core.ui.components.ProgressTrack
@@ -706,7 +707,19 @@ private fun PlaybackOptionsSheet(
         }
     }
     val activeMode = state.effectiveSleepTimerMode()
+    val modal = LocalModalState.current
     GlassSheet(visible = visible, onDismiss = onDismiss, title = "播放选项") {
+        // 当前歌曲操作：More 改挂播放选项后，歌曲信息/加入歌单等从这里二次进入
+        // （modal 单槽 show 原位替换，SongActionsSheet 返回键/点 scrim 关闭行为不变）
+        GroupLabel("当前歌曲")
+        SheetAction(
+            icon = GlassIcons.More,
+            label = "歌曲操作",
+            subtitle = state.currentSong.title,
+            onClick = {
+                modal.show { SongActionsSheet(visible = modal.visible, onDismiss = modal::requestDismiss, state = state, song = state.currentSong) }
+            },
+        )
         GroupLabel("定时关闭")
         SleepTimerOptions.forEach { option ->
             SheetAction(

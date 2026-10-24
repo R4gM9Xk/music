@@ -75,7 +75,7 @@ class SettingsStore(context: Context) : SnapshotStore {
         private const val TAG = "SettingsStore"
         private val KEY_STATE = stringPreferencesKey("app_state_snapshot")
         private val KEY_SCAN_FILTER_SHORT = booleanPreferencesKey("scan_filter_short")
-        private const val VERSION = 7
+        private const val VERSION = 8
 
         /**
          * 扫描过滤开关的同步读取（MediaLibrary.load 扫描线程专用；GlassApp 调用点无需感知该设置）：
@@ -156,6 +156,8 @@ class SettingsStore(context: Context) : SnapshotStore {
             )
             // 自定义主题色（v7）：null 存 JSONObject.NULL，解码侧 isNull 判断
             put("customSeedArgb", s.customSeedArgb ?: JSONObject.NULL)
+            // 队列语境标签（v8）：null 存 JSONObject.NULL（「来自『…』」展示）
+            put("queueSource", s.queueSource ?: JSONObject.NULL)
         }.toString()
 
         /** JSON 优先；非 JSON（旧格式）走 legacy 解析迁移；损坏数据记日志后返回 null */
@@ -212,6 +214,8 @@ class SettingsStore(context: Context) : SnapshotStore {
             } ?: emptyMap(),
             customSeedArgb = o.takeIf { it.has("customSeedArgb") && !it.isNull("customSeedArgb") }
                 ?.optInt("customSeedArgb"), // 旧版本（≤v6）无此字段：null 零迁移
+            queueSource = o.takeIf { it.has("queueSource") && !it.isNull("queueSource") }
+                ?.optString("queueSource"), // 旧版本（≤v7）无此字段：null 零迁移
         )
 
         // ── v1（旧版）：\u001F 分字段 / \u001E 分集合项 / \u001D 分子字段，仅作迁移 ──

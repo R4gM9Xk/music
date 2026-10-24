@@ -301,6 +301,13 @@ fun SettingsScreen(
                     },
                 )
                 RowDivider()
+                // B3 开关：默认滤除 <30s 音频；重扫由用户手动触发（subtitle 提示生效时机）
+                SettingRow(
+                    GlassIcons.Folder, "扫描过滤",
+                    if (state.scanFilterShort) "已过滤短于 30 秒的音频 · 重扫后生效" else "收录全部音频 · 重扫后生效",
+                    trailing = { GlassToggle(state.scanFilterShort, onToggle = { state.toggleScanFilter() }) },
+                )
+                RowDivider()
                 SettingRow(
                     GlassIcons.Folder, "过滤文件夹",
                     "${state.excludedFolders.size} 个目录已排除",

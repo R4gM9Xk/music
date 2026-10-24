@@ -60,6 +60,7 @@ data class AppStateSnapshot(
     val scanFilterShort: Boolean = true, // 扫描过滤短音频（v6 起编码，旧版本解码走默认值）
     val playCounts: Map<String, Int> = emptyMap(), // 播放次数（v7 起编码，旧版本解码走空表）
     val customSeedArgb: Int? = null, // 自定义主题色（v7 起编码；null = 未自定义）
+    val queueSource: String? = null, // 队列语境标签（v8 起编码；null = 整库/未知，播放页「来自『…』」展示用）
 )
 
 /** 持久化桥接：AppState 只面向它，实现在 app 模块（DataStore） */
@@ -307,6 +308,12 @@ class AppState {
     /** 扫描过滤：默认滤除短于 30 秒的音频（通知音/录音碎片）；切换后需在设置页手动重扫生效（快照 v6 持久化） */
     var scanFilterShort by mutableStateOf(true)
 
+    /** 切换扫描过滤开关（持久化；重扫由用户在设置页手动触发） */
+    fun toggleScanFilter() {
+        scanFilterShort = !scanFilterShort
+        scheduleSave()
+    }
+
     /** 曲库页排序面板：歌曲 tab 排序（快照持久化） */
     fun selectSongSort(sort: SongSort) {
         songSort = sort
@@ -491,7 +498,7 @@ class AppState {
     /** 设置指纹：GlassApp 用 snapshotFlow 监听设置变更触发存盘 */
     fun settingsKey(): String =
         "$followCover|$lyricEnabled|${glassLevel.name}|${motionLevel.name}|${eqPreset.name}|${themeMode.name}|" +
-            "$shuffleOn|${repeatMode.name}|$playbackSpeed|$scanFilterShort|$customSeedArgb|" +
+            "$shuffleOn|${repeatMode.name}|$playbackSpeed|$scanFilterShort|$customSeedArgb|${queueSource.orEmpty()}|" +
             excludedFolders.joinToString(",")
 
     fun snapshot(): AppStateSnapshot {
@@ -526,6 +533,7 @@ class AppState {
                 scanFilterShort = scanFilterShort,
                 playCounts = playCounts.toMap(),
                 customSeedArgb = customSeedArgb,
+                queueSource = queueSource,
             )
         } else {
             AppStateSnapshot(
@@ -555,6 +563,7 @@ class AppState {
                 scanFilterShort = scanFilterShort,
                 playCounts = playCounts.toMap(),
                 customSeedArgb = customSeedArgb,
+                queueSource = queueSource,
             )
         }
     }
@@ -575,6 +584,7 @@ class AppState {
         playCounts.clear()
         playCounts.putAll(snapshot.playCounts) // 旧版本（≤v6）无此字段：空表零迁移
         customSeedArgb = snapshot.customSeedArgb // 旧版本（≤v6）无此字段：null 零迁移
+        queueSource = snapshot.queueSource // 旧版本（≤v7）无此字段：null 零迁移（「来自『…』」语境标签）
         excludedFolders.clear()
         excludedFolders.addAll(snapshot.excludedFolders)
         favorites.clear()

@@ -43,6 +43,8 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -461,6 +463,18 @@ fun GlassApp() {
                             if (last != null && last != size) flight.onRootSizeChanged()
                             lastRootSize = size
                         }
+                        // 飞行期全内容区指针消费（Initial 隧道先行）：PlayerScreen 内部的消费层
+                        // 盖不到 AnimatedContent 旧页（曲库/详情仍在退场渲染），双击迷你条的第二击
+                        // 会穿透到列表行触发 playSong——根层统一兜住（Idle 时零开销）
+                        .then(
+                            if (flight.isActive) Modifier.pointerInput(Unit) {
+                                awaitPointerEventScope {
+                                    while (true) {
+                                        awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
+                                    }
+                                }
+                            } else Modifier,
+                        )
                         .trackFlight(FlightKeys.AppRoot, keepOnDispose = true),
                 ) {
                     AuroraBackground()

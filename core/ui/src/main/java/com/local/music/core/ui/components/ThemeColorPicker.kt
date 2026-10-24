@@ -2,6 +2,7 @@ package com.local.music.core.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -62,6 +63,8 @@ fun ThemeColorSwatches(
                                 color = if (on) glass.textPrimary else glass.strokeSoft,
                                 shape = CircleShape,
                             )
+                            // clickable 在 semantics 之前：读屏把 role/selected 合并到同一可点击节点
+                            .clickable(onClickLabel = "选择主题色") { onSelect(color) }
                             .semantics {
                                 this.role = Role.RadioButton
                                 this.selected = on
