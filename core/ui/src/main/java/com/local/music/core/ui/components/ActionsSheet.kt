@@ -201,6 +201,10 @@ fun SongInfoSheet(
         InfoRow("标题", song.title)
         InfoRow("艺术家", song.artist)
         InfoRow("专辑", song.album)
+        // 未知字段（0/空）不占行：扫描未取到的标签不展示空值噪声
+        if (song.genre.isNotBlank()) InfoRow("流派", song.genre)
+        if (song.year > 0) InfoRow("年份", song.year.toString())
+        if (song.trackNo > 0) InfoRow("音轨", song.trackNo.toString())
         InfoRow("时长", song.duration)
         InfoRow("格式", songFormatText(song, live))
         InfoRow("文件夹", song.folder)
