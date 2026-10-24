@@ -9,6 +9,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionResult
 import com.local.music.core.ui.state.PlayerEngine
 import com.local.music.core.ui.state.SongFormat
 import com.local.music.core.ui.state.SongSpec
@@ -25,6 +26,9 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
     override var onFormatChanged: ((SongFormat?) -> Unit)? = null
     override var onMediaItemChanged: ((String?) -> Unit)? = null
     override var onError: ((String) -> Unit)? = null
+
+    /** 断连已上报标记（重连后清位，避免每个调用都重复刷错误横幅） */
+    private var reportedDisconnected = false
 
     init {
         controller.addListener(
@@ -106,6 +110,24 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
             )
             .build()
 
+    /**
+     * 断连检测：MediaController.Listener 只能在 Builder 注册，而引擎拿到的是成品 controller，
+     * 无处挂 onDisconnected——改用轻量心跳：play/pause/seek/skip/positionSec 等入口检查 isConnected，
+     * 断连即上报并置位（重连后清位）；tick 周期调 positionSec，断连一个心跳内可见，
+     * UI 走既有错误横幅而非假死。返回 false = 已断连（调用方 no-op 返回）。
+     */
+    private fun checkConnected(): Boolean {
+        if (controller.isConnected) {
+            reportedDisconnected = false
+            return true
+        }
+        if (!reportedDisconnected) {
+            reportedDisconnected = true
+            onError?.invoke("播放服务连接已断开")
+        }
+        return false
+    }
+
     /** 整条队列下发给服务端播放器：起始位置随 setMediaItems 原子下发（独立 seekTo 会在装载窗口被丢弃） */
     override fun loadQueue(specs: List<SongSpec>, startIndex: Int, startSec: Float, autoPlay: Boolean) {
         val items = specs.map { it.toMediaItem() }
@@ -134,24 +156,50 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
     /** 均衡器预设：经自定义命令下发服务端（android.media.audiofx.Equalizer） */
     override fun setEqPreset(presetName: String) {
         runCatching {
-            controller.sendCustomCommand(
+            val future = controller.sendCustomCommand(
                 SessionCommand(MusicPlaybackService.CMD_SET_EQ, Bundle.EMPTY),
                 Bundle().apply { putString(MusicPlaybackService.KEY_PRESET, presetName) },
+            )
+            // 异步结果留痕：EQ 曾静默失效（历史坑），失败只打日志供诊断、不打扰用户
+            future.addListener(
+                {
+                    val result = runCatching { future.get() }.getOrNull()
+                    if (result == null || result.resultCode != SessionResult.RESULT_SUCCESS) {
+                        android.util.Log.w(
+                            "MediaControllerEngine",
+                            "自定义命令下发失败 cmd=${MusicPlaybackService.CMD_SET_EQ} " +
+                                "resultCode=${result?.resultCode}",
+                        )
+                    }
+                },
+                Runnable::run, // 直接执行器：仅记日志，无需线程切换
             )
         }
     }
 
-    override fun play() = controller.play()
+    override fun play() {
+        if (checkConnected()) controller.play()
+    }
 
-    override fun pause() = controller.pause()
+    override fun pause() {
+        if (checkConnected()) controller.pause()
+    }
 
-    override fun seekTo(sec: Float) = controller.seekTo((sec * 1000).toLong())
+    override fun seekTo(sec: Float) {
+        if (checkConnected()) controller.seekTo((sec * 1000).toLong())
+    }
 
-    override fun skipTo(index: Int) = controller.seekToDefaultPosition(index)
+    override fun skipTo(index: Int) {
+        if (checkConnected()) controller.seekToDefaultPosition(index)
+    }
 
-    override fun skipToNext() = controller.seekToNextMediaItem()
+    override fun skipToNext() {
+        if (checkConnected()) controller.seekToNextMediaItem()
+    }
 
-    override fun skipToPrevious() = controller.seekToPreviousMediaItem()
+    override fun skipToPrevious() {
+        if (checkConnected()) controller.seekToPreviousMediaItem()
+    }
 
     override fun hasNextMediaItem(): Boolean = controller.hasNextMediaItem()
 
@@ -160,10 +208,11 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
     // 增量队列编辑：MediaController 原生 API 即可原地改队列，当前曲不受影响；
     // move 语义（toIndex 以移除后的列表坐标计）与 AppState 侧 Kotlin removeAt/add 一致。
     // shuffle 开启时插入走服务端命令（DefaultShuffleOrder 会把新项随机放置，
-    // 服务端重建播放序保证「下一首播放 = 紧跟当前曲、最后播放 = 队尾」）
-    override fun addQueueItems(index: Int, specs: List<SongSpec>) {
+    // 服务端重建播放序保证「下一首播放 = 紧跟当前曲、最后播放 = 队尾」；
+    // pinLast 由调用方显式传入意图——不再用 index >= mediaItemCount 猜位置，
+    // 当前曲在队尾时「下一首播放」曾被误判成「最后播放」）
+    override fun addQueueItems(index: Int, specs: List<SongSpec>, pinLast: Boolean) {
         if (controller.shuffleModeEnabled && specs.isNotEmpty()) {
-            val pinLast = index >= controller.mediaItemCount
             runCatching {
                 controller.sendCustomCommand(
                     SessionCommand(MusicPlaybackService.CMD_INSERT_SHUFFLE_FIX, Bundle.EMPTY),
@@ -195,7 +244,10 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
 
     override fun isEnginePlaying(): Boolean = controller.isPlaying
 
-    override fun positionSec(): Float = (controller.currentPosition.coerceAtLeast(0)) / 1000f
+    override fun positionSec(): Float {
+        checkConnected() // 心跳入口：断连在此上报；返回值仍取 controller 缓存的当前进度
+        return (controller.currentPosition.coerceAtLeast(0)) / 1000f
+    }
 
     override fun durationSec(): Float {
         val d = controller.duration

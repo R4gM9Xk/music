@@ -38,6 +38,7 @@ class UpdateManager(
 
     /** 手动检查（设置页点击；失败显示原因） */
     fun check() {
+        if (state.status == UpdateUiState.Status.Checking) return // 并发防护：检查中忽略重复点击
         scope.launch {
             state = UpdateUiState(status = UpdateUiState.Status.Checking)
             val info = fetchManifest()
@@ -74,6 +75,7 @@ class UpdateManager(
     /** 一键更新：下载 → 校验 → 自动拉起安装器 */
     fun startUpdate() {
         val info = pendingInfo ?: return
+        if (state.status == UpdateUiState.Status.Downloading) return // 并发防护：下载中忽略重复点击
         scope.launch {
             state = UpdateUiState(
                 status = UpdateUiState.Status.Downloading,
@@ -89,7 +91,7 @@ class UpdateManager(
                 }
                 else -> state = state.copy(
                     status = UpdateUiState.Status.Failed,
-                    message = "下载失败，请重试",
+                    message = "网络异常或下载中断",
                 )
             }
         }
@@ -97,7 +99,13 @@ class UpdateManager(
 
     /** 拉起系统安装器（已下载即可反复调用）；未授权时跳授权页 */
     fun install() {
-        if (!apkFile.isFile) return
+        if (!apkFile.isFile) {
+            state = state.copy(
+                status = UpdateUiState.Status.Failed,
+                message = "安装包已丢失，请重新下载",
+            )
+            return
+        }
         if (!context.packageManager.canRequestPackageInstalls()) {
             context.startActivity(
                 Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
@@ -147,7 +155,8 @@ class UpdateManager(
             o.optString("apkMirror").ifEmpty { null },
             o.optString("apkAlt").ifEmpty { null },
         )
-        if (urls.isEmpty()) return null
+        // 清单内 APK 链接强制 https：出现非 https 地址即整份清单判无效，跳源
+        if (urls.isEmpty() || urls.any { !it.startsWith("https://") }) return null
         return UpdateInfo(
             versionCode = code,
             versionName = o.optString("versionName", code.toString()),
@@ -157,7 +166,7 @@ class UpdateManager(
         )
     }
 
-    /** 按清单地址逐个尝试下载；成功时校验 sha256（清单给出时） */
+    /** 按清单地址逐个尝试下载；sha256 缺失或不符均视为校验失败（fail-closed），换下一个源 */
     private fun downloadApk(info: UpdateInfo): File? {
         apkFile.parentFile?.mkdirs()
         val tmp = File(apkFile.parentFile, "app-update.tmp")
@@ -165,9 +174,9 @@ class UpdateManager(
             val ok = runCatching {
                 downloadTo(url, tmp) { read, total -> updateProgress(read, total) }
                 val actual = sha256Of(tmp)
-                if (info.sha256 != null && actual != info.sha256) {
+                if (info.sha256 == null || actual != info.sha256) {
                     tmp.delete()
-                    return@runCatching false // 哈希不符：换下一个源
+                    return@runCatching false // sha256 缺失（疑似被代理裁剪）或不符：跳过该源
                 }
                 tmp.renameTo(apkFile) || (apkFile.delete() && tmp.renameTo(apkFile))
             }.getOrDefault(false)
@@ -223,7 +232,13 @@ class UpdateManager(
                         }
                     }
                 }
-                target.length() > 0L
+                if (target.length() < MIN_APK_BYTES) return@runCatching false
+                // 文件头必须是 APK/ZIP 魔数 "PK"，挡掉代理返回的错误页/半包
+                val head = ByteArray(2)
+                val headOk = target.inputStream().use { it.read(head) } == 2 &&
+                    head[0] == 'P'.code.toByte() && head[1] == 'K'.code.toByte()
+                if (!headOk) return@runCatching false
+                true
             } finally {
                 conn.disconnect()
             }
@@ -243,6 +258,9 @@ class UpdateManager(
     }.getOrDefault("")
 
     companion object {
+        /** 下载通过下限：APK 至少 1MB（再叠文件头 "PK" 魔数校验） */
+        private const val MIN_APK_BYTES = 1L * 1024 * 1024
+
         /** 清单地址链：gh-proxy（国内可达优先）→ raw 直连 → jsDelivr（CDN，可能有最长数小时缓存） */
         private val MANIFEST_URLS = listOf(
             "https://gh-proxy.com/https://raw.githubusercontent.com/R4gM9Xk/music/main/update.json",

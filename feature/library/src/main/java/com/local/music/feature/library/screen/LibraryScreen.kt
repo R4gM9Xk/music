@@ -15,9 +15,9 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -70,38 +70,55 @@ private data class CollectionMenu(
 fun LibraryScreen(state: AppState, modifier: Modifier = Modifier) {
     var tab by remember { mutableIntStateOf(0) }
     var showSort by remember { mutableStateOf(false) }
-    val songs = state.sortedSongs()
+    // 排序结果缓存：library 引用（重扫/缓存刷新才换新列表）或排序变化才重算，
+    // 播放/暂停、切歌等高频重组不再触发整库 Collator 重排
+    val songs = remember(state.library, state.songSort) { state.sortedSongs() }
+    // 艺术家行的专辑数：整库一次性预计算（每专辑归其首曲艺术家，再按艺术家计数），
+    // 避免艺术家 tab 每行重新整库分组（O(n×m)）；songSort 非必要键，与 songs 缓存同刻失效便于理解
+    val albumCountByArtist = remember(state.library, state.songSort) {
+        state.library.groupBy { it.album }
+            .mapValues { (_, albumSongs) -> albumSongs.first().artist }
+            .values.groupingBy { it }.eachCount()
+    }
     var actionSong by remember { mutableStateOf<DemoSong?>(null) }
     var collectionMenu by remember { mutableStateOf<CollectionMenu?>(null) }
 
     Column(modifier.fillMaxSize().statusBarsPadding()) {
-        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-            PageHeader(
-                title = "音乐",
-                actionIcon = if (state.themeMode == com.local.music.core.ui.state.ThemeMode.Dark) {
-                    GlassIcons.Gear // 深色下的"太阳"造型
-                } else {
-                    GlassIcons.Moon
-                },
-                onAction = state::toggleTheme,
-                actionLabel = "切换深浅色模式",
-                // 排序入口只对歌曲 tab 有意义：仅歌曲 tab 显示
-                action2Icon = if (tab == 0) GlassIcons.Sort else null,
-                onAction2 = { showSort = true },
-                action2Label = "排序歌曲",
-            )
-            GlassSearchBox(
-                text = "搜索歌曲、专辑、艺术家", placeholder = true,
-                onClick = { state.screen = GlassScreen.Search },
-                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 12.dp),
-            )
-            GlassTabs(
-                tabs = listOf("歌曲", "专辑", "艺术家", "文件夹", "流派", "歌单"),
-                selected = tab, onSelect = { tab = it },
-            )
+        // 整页懒加载：页头/搜索/tab 与各 tab 内容统一进 LazyColumn（原 Column+verticalScroll
+        // 一次性组合整库行，长曲库下卡顿）；页头随内容滚动，视觉结构与原实现一致
+        LazyColumn(Modifier.weight(1f)) {
+            item {
+                PageHeader(
+                    title = "音乐",
+                    actionIcon = if (state.themeMode == com.local.music.core.ui.state.ThemeMode.Dark) {
+                        GlassIcons.Gear // 深色下的"太阳"造型
+                    } else {
+                        GlassIcons.Moon
+                    },
+                    onAction = state::toggleTheme,
+                    actionLabel = "切换深浅色模式",
+                    // 排序入口只对歌曲 tab 有意义：仅歌曲 tab 显示
+                    action2Icon = if (tab == 0) GlassIcons.Sort else null,
+                    onAction2 = { showSort = true },
+                    action2Label = "排序歌曲",
+                )
+            }
+            item {
+                GlassSearchBox(
+                    text = "搜索歌曲、专辑、艺术家", placeholder = true,
+                    onClick = { state.screen = GlassScreen.Search },
+                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 12.dp),
+                )
+            }
+            item {
+                GlassTabs(
+                    tabs = listOf("歌曲", "专辑", "艺术家", "文件夹", "流派", "歌单"),
+                    selected = tab, onSelect = { tab = it },
+                )
+            }
             when (tab) {
-                // 歌曲（按当前排序展示，播放入队同序）
-                0 -> songs.forEach { song ->
+                // 歌曲（按当前排序展示，播放入队同序）：key = 稳定歌曲 id，行可复用、排序变化随键移动
+                0 -> items(songs, key = { it.id }) { song ->
                     SongRow(
                         song = song,
                         playing = song == state.currentSong,
@@ -113,95 +130,105 @@ fun LibraryScreen(state: AppState, modifier: Modifier = Modifier) {
                 }
                 // 专辑
                 1 -> state.albumGroups().chunked(2).forEach { pair ->
-                    Row(
-                        Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        pair.forEach { album ->
-                            PlaylistCard(
-                                title = album.key, meta = album.meta, art = album.art,
-                                onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Album, album.key)) },
-                                onLongClick = {
-                                    collectionMenu = CollectionMenu(
-                                        DetailTarget(DetailTarget.Kind.Album, album.key), album.key, album.songs,
-                                    )
-                                },
-                                modifier = Modifier.weight(1f),
-                                bitmap = album.coverBitmap,
-                            )
+                    item(key = "album:${pair.first().key}") {
+                        Row(
+                            Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            pair.forEach { album ->
+                                PlaylistCard(
+                                    title = album.key, meta = album.meta, art = album.art,
+                                    onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Album, album.key)) },
+                                    onLongClick = {
+                                        collectionMenu = CollectionMenu(
+                                            DetailTarget(DetailTarget.Kind.Album, album.key), album.key, album.songs,
+                                        )
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                    bitmap = album.coverBitmap,
+                                )
+                            }
                         }
                     }
                 }
-                // 艺术家
+                // 艺术家（专辑数读整屏预计算的 albumCountByArtist，不再每行整库分组）
                 2 -> state.artistGroups().forEach { group ->
-                    GroupRow(
-                        art = group.art,
-                        title = group.key,
-                        meta = "${group.songs.size} 首 · ${state.albumGroups().count { it.songs.first().artist == group.key }} 张专辑",
-                        bitmap = group.coverBitmap,
-                        onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Artist, group.key)) },
-                        onLongClick = {
-                            collectionMenu = CollectionMenu(
-                                DetailTarget(DetailTarget.Kind.Artist, group.key), group.key, group.songs,
-                            )
-                        },
-                    )
+                    item(key = "artist:${group.key}") {
+                        GroupRow(
+                            art = group.art,
+                            title = group.key,
+                            meta = "${group.songs.size} 首 · ${albumCountByArtist[group.key] ?: 0} 张专辑",
+                            bitmap = group.coverBitmap,
+                            onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Artist, group.key)) },
+                            onLongClick = {
+                                collectionMenu = CollectionMenu(
+                                    DetailTarget(DetailTarget.Kind.Artist, group.key), group.key, group.songs,
+                                )
+                            },
+                        )
+                    }
                 }
                 // 文件夹（排除项不显示，与设置联动）
                 3 -> state.folderGroups(state.excludedFolders).forEach { group ->
-                    GroupRow(
-                        art = group.art,
-                        title = group.key,
-                        meta = "${group.songs.size} 首",
-                        bitmap = group.coverBitmap,
-                        onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Folder, group.key)) },
-                        onLongClick = {
-                            collectionMenu = CollectionMenu(
-                                DetailTarget(DetailTarget.Kind.Folder, group.key), group.key, group.songs,
-                            )
-                        },
-                    )
+                    item(key = "folder:${group.key}") {
+                        GroupRow(
+                            art = group.art,
+                            title = group.key,
+                            meta = "${group.songs.size} 首",
+                            bitmap = group.coverBitmap,
+                            onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Folder, group.key)) },
+                            onLongClick = {
+                                collectionMenu = CollectionMenu(
+                                    DetailTarget(DetailTarget.Kind.Folder, group.key), group.key, group.songs,
+                                )
+                            },
+                        )
+                    }
                 }
                 // 流派
                 4 -> state.genreGroups().forEach { group ->
-                    GroupRow(
-                        art = group.art,
-                        title = group.key,
-                        meta = "${group.songs.size} 首",
-                        bitmap = group.coverBitmap,
-                        onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Genre, group.key)) },
-                        onLongClick = {
-                            collectionMenu = CollectionMenu(
-                                DetailTarget(DetailTarget.Kind.Genre, group.key), group.key, group.songs,
-                            )
-                        },
-                    )
+                    item(key = "genre:${group.key}") {
+                        GroupRow(
+                            art = group.art,
+                            title = group.key,
+                            meta = "${group.songs.size} 首",
+                            bitmap = group.coverBitmap,
+                            onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Genre, group.key)) },
+                            onLongClick = {
+                                collectionMenu = CollectionMenu(
+                                    DetailTarget(DetailTarget.Kind.Genre, group.key), group.key, group.songs,
+                                )
+                            },
+                        )
+                    }
                 }
                 // 歌单
                 5 -> (state.visibleBuiltInPlaylists() + state.userPlaylists).chunked(2).forEach { pair ->
-                    Row(
-                        Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        pair.forEach { playlist ->
-                            PlaylistCard(
-                                title = playlist.title, meta = playlist.meta, art = playlist.art,
-                                onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, playlist.id)) },
-                                onLongClick = {
-                                    collectionMenu = CollectionMenu(
-                                        DetailTarget(DetailTarget.Kind.Playlist, playlist.id),
-                                        playlist.title,
-                                        state.resolvePlaylist(playlist.id)?.tracks.orEmpty(),
-                                    )
-                                },
-                                modifier = Modifier.weight(1f),
-                            )
+                    item(key = "playlist:${pair.first().id}") {
+                        Row(
+                            Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            pair.forEach { playlist ->
+                                PlaylistCard(
+                                    title = playlist.title, meta = playlist.meta, art = playlist.art,
+                                    onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, playlist.id)) },
+                                    onLongClick = {
+                                        collectionMenu = CollectionMenu(
+                                            DetailTarget(DetailTarget.Kind.Playlist, playlist.id),
+                                            playlist.title,
+                                            state.resolvePlaylist(playlist.id)?.tracks.orEmpty(),
+                                        )
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
                         }
                     }
                 }
             }
             // 底部避让：悬浮 Chrome（迷你条+导航 ≈ 138dp）+ 手势条
-            Spacer(Modifier.navigationBarsPadding().height(146.dp))
+            item { Spacer(Modifier.navigationBarsPadding().height(146.dp)) }
         }
     }
 

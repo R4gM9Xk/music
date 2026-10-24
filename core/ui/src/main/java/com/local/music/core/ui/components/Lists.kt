@@ -27,7 +27,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -164,6 +167,11 @@ fun GlassTabs(
                     .background(if (on) palette.seed else glass.lo)
                     .border(1.dp, if (on) Color.Transparent else glass.strokeSoft, RoundedCornerShape(50))
                     .clickable(interactionSource = interactionSource, indication = null) { onSelect(index) }
+                    .semantics {
+                        // 读屏语义：tab 角色 + 选中态（与 Chrome.kt 底导航 GlassNavBar 同款）
+                        this.role = Role.Tab
+                        this.selected = on
+                    }
                     .padding(horizontal = 15.dp, vertical = 7.dp),
             ) {
                 Text(

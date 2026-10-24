@@ -35,7 +35,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -53,6 +55,7 @@ import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.LocalIsDark
 import com.local.music.core.ui.theme.auroraAccentColor
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -101,11 +104,30 @@ fun GlassSheet(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val modal = LocalModalState.current
-    // 打开时注册到全局模态状态（含退场动画结束后的注销）
-    DisposableEffect(visible) {
-        if (visible) modal.register(onDismiss)
+    // onDismiss 每次重组都是新实例：经 State 转调，注册的回调始终走最新的 onDismiss
+    val latestDismiss by rememberUpdatedState(onDismiss)
+    // 已注册回调实例（register/unregister 须同一实例：ModalState 按实例比对清空 dismiss）
+    var registeredDismiss by remember { mutableStateOf<(() -> Unit)?>(null) }
+    // 打开即注册；关闭时等退场动画播完再注销——提前注销会让 Chrome/控制台在
+    // 退场 sheet 仍可见时提前复位，与面板滑出重叠。退场中途重开先撤掉待注销的旧注册
+    LaunchedEffect(visible) {
+        if (visible) {
+            registeredDismiss?.let(modal::unregister)
+            val dismiss: () -> Unit = { latestDismiss() }
+            registeredDismiss = dismiss
+            modal.register(dismiss)
+        } else if (registeredDismiss != null) {
+            // 退场时长与 AnimatedVisibility 的 exit 同源（tweenPage）
+            delay(GlassMotion.tweenPage<Float>().durationMillis.toLong())
+            registeredDismiss?.let(modal::unregister)
+            registeredDismiss = null
+        }
+    }
+    // 面板随宿主整体离场（无退场动画，如单曲面板收进 null 态卸载）：立即注销兜底
+    DisposableEffect(Unit) {
         onDispose {
-            if (visible) modal.unregister(onDismiss)
+            registeredDismiss?.let(modal::unregister)
+            registeredDismiss = null
         }
     }
     AnimatedVisibility(
@@ -273,7 +295,12 @@ fun QueueSheet(
     val rowPx = with(density) { SongRowHeight.toPx() }.toInt()
     // 段头标签（已播放/正在播放）近似高度：定位公式要计入，否则当前曲定位偏低
     val labelPx = with(density) { 34.dp.toPx() }.toInt()
-    val safeIndex = currentIndex.coerceIn(0, queue.lastIndex)
+    // 空队列时 lastIndex=-1，coerceIn(0,-1) 会抛 IAE（冷启动默认屏=Player，权限拒/无音频即触发）
+    val safeIndex = if (queue.isEmpty()) 0 else currentIndex.coerceIn(0, queue.lastIndex)
+    // 拖拽手势闭包被 ReorderableList 的 pointerInput 冻结（键不含数据版本，长拖期间不重启），
+    // 长拖中自动切歌会推进 currentIndex：经 rememberUpdatedState 让换算读实时值，
+    // 避免松手提交时用拖拽起点的陈旧 safeIndex 提交错误移动
+    val liveSafeIndex by rememberUpdatedState(safeIndex)
     LaunchedEffect(visible, currentIndex) {
         if (!visible) return@LaunchedEffect
         // 等面板完成布局（maxValue>0）后按行高定位
@@ -331,7 +358,7 @@ fun QueueSheet(
                 count = upcomingCount,
                 rowHeight = SongRowHeight,
                 scrollState = scrollState,
-                onMove = { from, to -> onMove(from + safeIndex + 1, to + safeIndex + 1) },
+                onMove = { from, to -> onMove(from + liveSafeIndex + 1, to + liveSafeIndex + 1) },
                 autoscroll = true,
             ) { upcomingIndex ->
                 val queueIndex = safeIndex + 1 + upcomingIndex

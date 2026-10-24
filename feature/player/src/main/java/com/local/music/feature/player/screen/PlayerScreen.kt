@@ -50,6 +50,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -163,7 +164,27 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                 .fillMaxSize()
                 .trackFlight(FlightKeys.PlayerRoot)
                 .statusBarsPadding()
-                .navigationBarsPadding(),
+                .navigationBarsPadding()
+                // 飞行期触摸闸门：graphicsLayer alpha 不挡触摸，进入等待期/退出期播放页全透明
+                // 仍可点（双击迷你条误触透明控制台、误点中央透明封面清 entryShowCover 连锁）。
+                // 在 Initial 隧道先行消费全部指针事件——子层 clickable/滑动手势全部失效；
+                // phase 回到 Idle 即摘除（.then(Modifier) 零开销，正常态歌词行点击/左右滑不受影响）。
+                // 替身层在 GlassApp 根层的 Overlay（无 pointerInput），不受此闸门影响
+                .then(
+                    if (flight?.isActive == true) {
+                        Modifier.pointerInput(Unit) {
+                            awaitPointerEventScope {
+                                while (true) {
+                                    awaitPointerEvent(PointerEventPass.Initial)
+                                        .changes
+                                        .forEach { it.consume() }
+                                }
+                            }
+                        }
+                    } else {
+                        Modifier
+                    },
+                ),
         ) {
             Box(Modifier.weight(1f).hazeSource(playerHaze)) {
                 Column(Modifier.fillMaxSize()) {

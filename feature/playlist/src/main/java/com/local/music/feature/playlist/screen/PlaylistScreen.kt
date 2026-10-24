@@ -20,7 +20,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,7 +41,6 @@ import com.local.music.core.ui.components.GlassSheet
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassTextField
-import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.components.PageHeader
 import com.local.music.core.ui.components.PlaylistCard
 import com.local.music.core.ui.components.SectionHeader
@@ -52,8 +50,6 @@ import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalGlassColors
-import dev.chrisbanes.haze.hazeSource
-import dev.chrisbanes.haze.rememberHazeState
 
 /**
  * 歌单库：2×2 玻璃封面墙（常驻 + 用户自建，各自带参进详情，长按 = 集合操作面板）
@@ -65,15 +61,13 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
     var newName by remember { mutableStateOf("") }
     var collectionMenu by remember { mutableStateOf<CollectionMenuData?>(null) }
 
-    val hazeState = rememberHazeState()
-    CompositionLocalProvider(LocalHazeState provides hazeState) {
-        Column(modifier.fillMaxSize().statusBarsPadding()) {
-            Column(
-                Modifier
-                    .weight(1f)
-                    .verticalScroll(rememberScrollState())
-                    .hazeSource(hazeState),
-            ) {
+    // 无自有 haze source：本屏内容与面板均无 hazeEffect 消费（面板挂 app 级），整屏录制纯开销
+    Column(modifier.fillMaxSize().statusBarsPadding()) {
+        Column(
+            Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState()),
+        ) {
             PageHeader(title = "歌单", actionIcon = GlassIcons.Plus, onAction = { showCreate = true })
             // 玻璃封面墙（内建歌单已被删除的不再显示）
             (state.visibleBuiltInPlaylists() + state.userPlaylists).chunked(2).forEach { pair ->
@@ -119,7 +113,8 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                         },
                     )
                     FavoriteRow(
-                        "最近播放", "${state.playedIds.size} 首", ArtStyle.Afternoon,
+                        // 计数与详情页同源（resolvePlaylist 已过滤失效 id）：playedIds 未过滤会虚高
+                        "最近播放", "${state.resolvePlaylist(DemoCatalog.RecentId)?.tracks?.size ?: 0} 首", ArtStyle.Afternoon,
                         onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.RecentId)) },
                         onLongClick = {
                             collectionMenu = CollectionMenuData(
@@ -133,7 +128,6 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
             }
             Spacer(Modifier.navigationBarsPadding().height(146.dp))
             }
-        }
     }
 
     // 新建歌单面板

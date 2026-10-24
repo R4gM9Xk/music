@@ -30,7 +30,7 @@ object MediaLibrary {
 
     fun load(context: Context): List<DemoSong> {
         val songs = mutableListOf<DemoSong>()
-        android.util.Log.d(TAG, "scan start")
+        val coverDataPaths = mutableListOf<String>() // 本次扫描落盘了封面的歌曲（收尾清扫孤儿封面时保留）
         val projection = arrayOf(
             MediaStore.Audio.Media._ID,
             MediaStore.Audio.Media.TITLE,
@@ -49,7 +49,6 @@ object MediaLibrary {
             projection, null, null,
             "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC",
         )?.use { cursor ->
-            android.util.Log.d(TAG, "query rows=${cursor.count}")
             val colId = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
             val colTitle = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
             val colArtist = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
@@ -85,6 +84,8 @@ object MediaLibrary {
                     else -> dir.ifEmpty { "Music" }
                 }
 
+                val persistedUri = coverBitmap?.let { persistCover(context, dataPath, it) }
+                if (persistedUri != null) coverDataPaths += dataPath
                 songs += DemoSong(
                     // 稳定 id = 文件绝对路径：MediaStore _id 会在重扫/数据库重建后漂移，
                     // 快照里的队列/收藏用它对位会错位甚至丢失；路径跨扫描稳定
@@ -97,7 +98,7 @@ object MediaLibrary {
                     folder = folder,
                     mediaUri = uri.toString(),
                     coverBitmap = coverBitmap,
-                    artworkUri = coverBitmap?.let { persistCover(context, "song$id", it) },
+                    artworkUri = persistedUri,
                     lyricLines = readLrc(context, dataPath),
                     codec = format?.codec ?: dataPath.substringAfterLast('.', "").uppercase(),
                     sampleRateHz = format?.sampleRateHz ?: 0,
@@ -108,17 +109,26 @@ object MediaLibrary {
                 )
             }
         }
-        android.util.Log.d(TAG, "scan done, loaded=${songs.size}")
+        sweepCovers(context, coverDataPaths) // 全量扫描收尾：清掉孤儿封面（含旧 song<id>.png 命名，天然迁移）
         return songs
     }
 
-    private const val TAG = "MediaLibrary"
+    /**
+     * 封面缓存文件（单一事实源）：covers 目录下按 dataPath 稳定哈希命名——
+     * 旧键 song<MediaStore _id> 会随重扫/数据库重建漂移且从不清理（无限增长）；
+     * persistCover 落盘与 loadCache 读缓存共用此命名，全量扫描收尾按它清扫孤儿。
+     */
+    fun coverFileFor(context: Context, dataPath: String): java.io.File =
+        java.io.File(
+            java.io.File(context.externalCacheDir, "covers"),
+            "c" + Integer.toHexString(dataPath.hashCode()) + ".png",
+        )
 
     /** 封面落盘为 PNG（cache/covers/）：媒体通知 / 锁屏 / 流体云需要可寻址的 artworkUri；失败返回 null（空串也是无效 uri） */
-    private fun persistCover(context: Context, name: String, bitmap: androidx.compose.ui.graphics.ImageBitmap): String? {
+    private fun persistCover(context: Context, dataPath: String, bitmap: androidx.compose.ui.graphics.ImageBitmap): String? {
         return try {
-            val dir = java.io.File(context.externalCacheDir, "covers").apply { mkdirs() }
-            val file = java.io.File(dir, "$name.png")
+            val file = coverFileFor(context, dataPath)
+            file.parentFile?.mkdirs()
             if (!file.exists() || file.length() == 0L) {
                 java.io.FileOutputStream(file).use { out ->
                     bitmap.asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 90, out)
@@ -127,6 +137,17 @@ object MediaLibrary {
             Uri.fromFile(file).toString()
         } catch (e: Exception) {
             null
+        }
+    }
+
+    /** 清扫 covers 目录孤儿：删除不在本次曲库命名集内的文件；externalCacheDir 为 null 等异常静默跳过（与 persistCover 防御一致） */
+    private fun sweepCovers(context: Context, keepDataPaths: List<String>) {
+        val covers = context.externalCacheDir?.let { java.io.File(it, "covers") } ?: return
+        val keep = keepDataPaths.map { coverFileFor(context, it).name }.toSet()
+        runCatching {
+            covers.listFiles()?.forEach { file ->
+                if (file.isFile && file.name !in keep) file.delete()
+            }
         }
     }
 
@@ -308,6 +329,14 @@ object MediaLibrary {
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
             val dataPath = o.optString("dataPath")
+            // 封面统一按 dataPath 重导出（缓存存的就是 dataPath，不依赖落盘时的旧文件名）；
+            // 无 dataPath 的条目沿用缓存里的 artworkUri
+            val artworkUri = if (dataPath.isEmpty()) {
+                o.optString("artworkUri").ifEmpty { null }
+            } else {
+                coverFileFor(context, dataPath)
+                    .takeIf { it.isFile && it.length() > 0L }?.let { Uri.fromFile(it).toString() }
+            }
             songs += DemoSong(
                 id = o.getString("id"),
                 title = o.getString("title"),
@@ -318,10 +347,10 @@ object MediaLibrary {
                 folder = o.optString("folder", "Music"),
                 genre = o.optString("genre", "独立"),
                 mediaUri = o.optString("mediaUri").ifEmpty { null },
-                coverBitmap = o.optString("artworkUri").ifEmpty { null }?.let { uri ->
+                coverBitmap = artworkUri?.let { uri ->
                     android.graphics.BitmapFactory.decodeFile(uri.removePrefix("file://"))?.asImageBitmap()
                 },
-                artworkUri = o.optString("artworkUri").ifEmpty { null },
+                artworkUri = artworkUri,
                 lyricLines = if (dataPath.isEmpty()) null else readLrc(context, dataPath),
                 codec = o.optString("codec"),
                 sampleRateHz = o.optInt("sampleRateHz"),

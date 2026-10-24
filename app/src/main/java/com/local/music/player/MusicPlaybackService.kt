@@ -76,8 +76,7 @@ class MusicPlaybackService : MediaSessionService() {
                         }
                         if (customCommand.customAction == CMD_SET_EQ) {
                             applyEqPreset(args.getString(KEY_PRESET))
-                        }
-                        if (customCommand.customAction == CMD_INSERT_SHUFFLE_FIX) {
+                        } else if (customCommand.customAction == CMD_INSERT_SHUFFLE_FIX) {
                             @Suppress("DEPRECATION", "UNCHECKED_CAST")
                             val specs = args.getSerializable(KEY_SPECS) as? ArrayList<SongSpec>
                             if (specs != null) {
@@ -87,6 +86,9 @@ class MusicPlaybackService : MediaSessionService() {
                                     args.getString(KEY_PIN_MODE, PIN_NEXT) == PIN_LAST,
                                 )
                             }
+                        } else {
+                            // 服务保持 exported：未知命令返回错误码而非 SUCCESS，暴露真实命令边界
+                            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_ERROR_BAD_VALUE))
                         }
                         return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
                     }
@@ -194,8 +196,8 @@ class MusicPlaybackService : MediaSessionService() {
         runCatching { equalizer?.release() }
         equalizer = null
         mediaSession?.run {
+            release() // 先释放 session（解除控制器/通知绑定），再释放底层播放器
             player.release()
-            release()
         }
         mediaSession = null
         super.onDestroy()

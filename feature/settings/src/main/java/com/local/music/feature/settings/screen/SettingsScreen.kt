@@ -15,7 +15,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,7 +33,6 @@ import com.local.music.core.ui.components.ProgressTrack
 import com.local.music.core.ui.components.SectionHeader
 import com.local.music.core.ui.components.SettingRow
 import com.local.music.core.ui.components.SheetAction
-import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.EqPreset
 import com.local.music.core.ui.state.GlassScreen
@@ -42,8 +40,6 @@ import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassIntensity
 import com.local.music.core.ui.theme.MotionIntensity
 import com.local.music.core.ui.theme.LocalGlassColors
-import dev.chrisbanes.haze.hazeSource
-import dev.chrisbanes.haze.rememberHazeState
 
 /** 设置页内底部面板 */
 private enum class SettingsSheet { Glass, Motion, Eq, Folders }
@@ -75,15 +71,13 @@ fun SettingsScreen(
         if (scanning) scanning = false
     }
 
-    val hazeState = rememberHazeState()
-    CompositionLocalProvider(LocalHazeState provides hazeState) {
-        Column(modifier.fillMaxSize().statusBarsPadding()) {
-            Column(
-                Modifier
-                    .weight(1f)
-                    .verticalScroll(rememberScrollState())
-                    .hazeSource(hazeState),
-            ) {
+    // 无自有 haze source：本屏内容与面板均无 hazeEffect 消费（面板挂 app 级），整屏录制纯开销
+    Column(modifier.fillMaxSize().statusBarsPadding()) {
+        Column(
+            Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState()),
+        ) {
                 PageHeader(title = "设置")
 
             SectionHeader("外观")
@@ -165,7 +159,9 @@ fun SettingsScreen(
                     UpdateUiState.Status.ReadyToInstall ->
                         "已下载 v${update.versionName}，点击安装"
                     UpdateUiState.Status.Failed ->
-                        "检查失败（${update.message ?: "网络异常"}），点击重试"
+                        // 下载链路的失败由既态 copy 而来（versionName 已带上新版本），与检查失败区分
+                        if (update.versionName != null) "下载失败（${update.message ?: "网络异常"}），点击重试"
+                        else "检查失败（${update.message ?: "网络异常"}），点击重试"
                 }
                 SettingRow(
                     GlassIcons.Down, "检查更新", updateSubtitle,
@@ -174,6 +170,9 @@ fun SettingsScreen(
                             UpdateUiState.Status.Available, UpdateUiState.Status.Downloading,
                             UpdateUiState.Status.ReadyToInstall,
                             -> showUpdateSheet = true
+                            // 曾进入下载阶段的失败（versionName 已带上新版本）：重试直接重新下载，不再重新检查
+                            UpdateUiState.Status.Failed ->
+                                if (update.versionName != null) onStartUpdate() else onCheckUpdate()
                             else -> onCheckUpdate()
                         }
                     },
@@ -182,7 +181,6 @@ fun SettingsScreen(
             // 底部避让：悬浮 Chrome（迷你条+导航 ≈ 138dp）+ 手势条
             Spacer(Modifier.navigationBarsPadding().height(146.dp))
             }
-        }
     }
 
     // ── 更新面板（changelog + 进度 + 一键更新）──────────────

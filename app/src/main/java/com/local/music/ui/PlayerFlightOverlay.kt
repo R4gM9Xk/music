@@ -73,9 +73,12 @@ fun PlayerFlightOverlay(
         flight.visualMode == PlayerFlight.VisualMode.Lyrics
 
     fun flightRect(fromKey: String, toKey: String): Rect {
-        val a = snap.getValue(fromKey)
-        if (enteringWait) return a
-        val b = snap.getValue(toKey)
+        // 容错读取：snapshot 键集未来若不全（增删键后两端不同步），缺失端退化为
+        // 可用端的静态几何（等待期即 t=0 起点兜底），不再走 getValue 防 NoSuchElementException
+        val a = snap[fromKey]
+        val b = snap[toKey]
+        if (enteringWait || b == null) return a ?: b ?: Rect.Zero
+        if (a == null) return b
         return Rect(
             lerp(a.left, b.left, t), lerp(a.top, b.top, t),
             lerp(a.right, b.right, t), lerp(a.bottom, b.bottom, t),

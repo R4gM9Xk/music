@@ -43,9 +43,11 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -113,6 +115,13 @@ fun GlassApp() {
     // ── 所有文件访问（MANAGE_EXTERNAL_STORAGE）：读取任意公共目录的同名 .lrc 歌词 ──
     var allFilesGranted by remember { mutableStateOf(Environment.isExternalStorageManager()) }
     var jumpedAllFiles by remember { mutableStateOf(false) } // 每进程只自动跳一次，避免拒绝后反复打扰
+    // 音频权限上次授权态：ON_RESUME 对比检测（用户在系统设置手动授权后返回能自动装载真曲库）
+    var audioGranted by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED,
+        )
+    }
     fun openAllFilesAccessPage() {
         jumpedAllFiles = true
         val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${context.packageName}"))
@@ -187,6 +196,15 @@ fun GlassApp() {
                     jumpedAllFiles = false
                     loadRealLibrary() // 授权回来：重扫拾取各目录 .lrc
                 }
+                // 音频权限同款对比：系统设置里手动授权（不经运行时弹窗）返回时也能触发装载
+                val audioNow = ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.READ_MEDIA_AUDIO,
+                ) == PackageManager.PERMISSION_GRANTED
+                val audioBefore = audioGranted
+                audioGranted = audioNow
+                if (audioNow && !audioBefore && !state.realLibraryLoaded) {
+                    loadRealLibrary() // 真曲库未装载才扫：记住上次授权态，普通回前台不重扫
+                }
             }
         }
         activity?.lifecycle?.addObserver(lifecycleObserver)
@@ -198,6 +216,7 @@ fun GlassApp() {
     ) { result ->
         when (result[Manifest.permission.READ_MEDIA_AUDIO]) {
             true -> {
+                audioGranted = true // 同步记忆授权态：随后的 ON_RESUME 对比不再重复触发扫描
                 loadRealLibrary()
                 maybeRequestAllFiles() // 音频权限落定后再引导所有文件访问
             }
@@ -283,7 +302,8 @@ fun GlassApp() {
     }
 
     // 返回键：模态面板优先关闭 → 详情回来源页 → 播放页逆向飞行收起 → 其余回曲库
-    BackHandler(enabled = state.screen != GlassScreen.Library) {
+    // （曲库页面板开着时也要拦截：否则返回直接穿透 finish 掉 Activity）
+    BackHandler(enabled = state.screen != GlassScreen.Library || modalState.isOpen) {
         when {
             modalState.isOpen -> modalState.requestDismiss()
             state.screen == GlassScreen.Detail -> state.backFromDetail()
@@ -300,9 +320,18 @@ fun GlassApp() {
         ) {
             val appHazeState = rememberHazeState()
             CompositionLocalProvider(LocalHazeState provides appHazeState) {
+                // 根尺寸变化失效：configChanges 吞掉旋转/分屏/自由窗口，组合不重建，只能在此感知。
+                // remember 上次尺寸跳过首组合的初值回调，尺寸真变化才取消飞行并清空 rect
+                // 注册表（防 keepOnDispose 冻结的迷你条旧几何把替身带向旧坐标）
+                var lastRootSize by remember { mutableStateOf<IntSize?>(null) }
                 Box(
                     Modifier
                         .fillMaxSize()
+                        .onSizeChanged { size ->
+                            val last = lastRootSize
+                            if (last != null && last != size) flight.onRootSizeChanged()
+                            lastRootSize = size
+                        }
                         .trackFlight(FlightKeys.AppRoot, keepOnDispose = true),
                 ) {
                     AuroraBackground()
@@ -424,7 +453,9 @@ fun GlassApp() {
                                         GlassScreen.Settings -> 2
                                         else -> 0
                                     }
-                                    flight.beginEntry(state.currentSong, navSelected) { state.screen = it }
+                                    // 忙时兜底直切（同 PlaylistDetailScreen）：飞行中不重入共享元素动画
+                                    if (flight.isActive) state.screen = GlassScreen.Player
+                                    else flight.beginEntry(state.currentSong, navSelected) { state.screen = it }
                                 },
                                 onPlayPause = state::togglePlayPause,
                                 onNext = { state.next() },

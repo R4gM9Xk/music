@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- 唤醒锁：播放器 setWakeMode(WAKE_MODE_LOCAL) 息屏连播曲间不断流（normal 权限，无需运行时申请） -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 所有文件访问：读取任意公共目录的同名 .lrc 歌词（Download/QQ 等），特殊权限经系统页授权 -->

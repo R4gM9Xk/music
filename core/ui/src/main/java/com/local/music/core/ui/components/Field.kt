@@ -30,8 +30,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.theme.GlassIcons
-import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.auroraAccentColor
 
 /**
  * 玻璃输入框：GlassSurface 外壳 + BasicTextField（白字 / 强调色光标）。
@@ -47,7 +47,6 @@ fun GlassTextField(
     autoFocus: Boolean = false,
     onSearch: (() -> Unit)? = null,
 ) {
-    val palette = LocalAuroraPalette.current
     val focusRequester = remember { FocusRequester() }
     GlassSurface(
         modifier = modifier.fillMaxWidth().height(44.dp),
@@ -76,7 +75,8 @@ fun GlassTextField(
                     onValueChange = onValueChange,
                     singleLine = true,
                     textStyle = TextStyle(color = LocalGlassColors.current.textPrimary, fontSize = 14.sp),
-                    cursorBrush = SolidColor(palette.seed3),
+                    // 光标强调色用 auroraAccentColor()（浅色回退 seed）：seed3 过浅在浅色下近不可见
+                    cursorBrush = SolidColor(auroraAccentColor()),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                     keyboardActions = KeyboardActions(onSearch = { onSearch?.invoke() }),
                     modifier = Modifier

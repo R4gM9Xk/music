@@ -51,6 +51,8 @@ data class AppStateSnapshot(
     val progressSec: Float,
     val currentSongId: String? = null, // 队列过滤后仍能定位当前曲（失效曲目剔除不改索引语义）
     val songSort: String = SongSort.Title.name, // 歌曲 tab 排序（默认值解码：无版本迁移）
+    val shuffleOn: Boolean = false, // 随机模式（v4 起编码，旧版本解码走默认值）
+    val repeatMode: String = RepeatMode.Off.name, // 循环模式名（同上）
 )
 
 /** 持久化桥接：AppState 只面向它，实现在 app 模块（DataStore） */
@@ -135,8 +137,9 @@ interface PlayerEngine {
     fun hasPreviousMediaItem(): Boolean
 
     /** 增量队列编辑：不重发整条队列、不打断当前播放。索引语义与 UI 队列一致（Kotlin removeAt/add），
-     *  调用方先经 alignQueueWithEngine 保证两侧同源 */
-    fun addQueueItems(index: Int, specs: List<SongSpec>)
+     *  调用方先经 alignQueueWithEngine 保证两侧同源；pinLast = 意图是「最后播放」——shuffle 下
+     *  服务端据此固定队尾/当前曲后（不能按插入位置猜：当前曲在队尾时「下一首播放」会被误判） */
+    fun addQueueItems(index: Int, specs: List<SongSpec>, pinLast: Boolean)
     fun moveQueueItem(fromIndex: Int, toIndex: Int)
     fun removeQueueItems(fromIndex: Int, toIndex: Int)
 
@@ -254,8 +257,17 @@ class AppState {
         scheduleSave()
     }
 
+    /** 排序比较器缓存（键 = songSort）：Collator 实例化较重，切排序才重建（Sort.kt 只读，就地缓存） */
+    private var sortComparatorCache: Pair<SongSort, Comparator<DemoSong>>? = null
+
     /** 歌曲 tab 内容：按当前排序（文本键中文拼音序；最近添加按 MediaStore 入库时间） */
-    fun sortedSongs(): List<DemoSong> = library.sortedWith(songSort.comparator())
+    fun sortedSongs(): List<DemoSong> {
+        val comparator = sortComparatorCache
+            ?.takeIf { it.first == songSort }
+            ?.second
+            ?: songSort.comparator().also { sortComparatorCache = songSort to it }
+        return library.sortedWith(comparator)
+    }
 
     /** 右上角"太阳"按钮：深浅色切换 */
     fun toggleTheme() {
@@ -265,15 +277,27 @@ class AppState {
 
     // ── 搜索 ──────────────────────────────────────────────
     var searchQuery by mutableStateOf("")
-    val searchHistory = mutableStateListOf("林之遥", "深夜巡航", "FLAC", "潮汐信号")
+    val searchHistory = mutableStateListOf<String>() // 演示词已移除：真曲库下预置词只会搜出空结果
 
     // ── 派生 ──────────────────────────────────────────────
 
     /** 当前曲：队列为空（曲库未装载/无曲库）时回落占位曲，防越界 */
     val currentSong: DemoSong
         get() = queue.getOrElse(queueIndex.coerceAtLeast(0)) { DemoData.placeholder }
-    val durationSec: Float get() = currentSong.durationSec.toFloat()
+    val durationSec: Float get() = effectiveDurationSec()
     val progressFraction: Float get() = (progressSec / durationSec).coerceIn(0f, 1f)
+
+    /** 有效时长（秒）：引擎装载着当前曲时以服务端实际时长为准——元数据缺失的扫描值兜底 1s
+     *  不得钳死真实进度（tick 钳制 / 进度条 / seek 统一走这里）；其余场景用扫描值 */
+    private fun effectiveDurationSec(): Float {
+        val eng = engine
+        val live = if (eng != null && engineLoadedUri != null && engineLoadedUri == currentSong.mediaUri) {
+            eng.durationSec().takeIf { it > 0f }
+        } else {
+            null
+        }
+        return live ?: currentSong.durationSec.toFloat()
+    }
 
     /** 极光取色：真封面取色优先 → 无封面回退占位风格 → 取色开关关闭时回退品牌靛紫 */
     val palette: AuroraPalette
@@ -330,15 +354,15 @@ class AppState {
                     if (serviceSongs.isNotEmpty()) queue = serviceSongs
                     queueIndex = queue.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
                     engineLoadedUri = song.mediaUri
-                    progressSec = engine.positionSec().coerceIn(0f, song.durationSec.toFloat())
+                    progressSec = engine.positionSec().coerceIn(0f, effectiveDurationSec())
                     playing = engine.isEnginePlaying()
                     // 服务在播，待恢复现场以服务为准
                     pendingPlayback = null
                     currentSongIdPending = null
                     resumePending = false
                 }
-                realLibraryLoaded -> engine.stopAndClear() // 曲库已装载仍找不到：文件已被删除
-                // 曲库尚未装载：不打断服务播放，等 loadLibrary() 对齐
+                // 解析不到（曲库未装载 / 缓存过期 / 文件刚删）：服务正在播就绝不 stopAndClear 掐断，
+                // 保持服务现状等 loadLibrary() 刷新 library 引用对齐；文件确已删除时服务端播放器自行报错
             }
         }
         syncEngineModes(engine)
@@ -392,6 +416,7 @@ class AppState {
     /** 设置指纹：GlassApp 用 snapshotFlow 监听设置变更触发存盘 */
     fun settingsKey(): String =
         "$followCover|$lyricEnabled|${glassLevel.name}|${motionLevel.name}|${eqPreset.name}|${themeMode.name}|" +
+            "$shuffleOn|${repeatMode.name}|" +
             excludedFolders.joinToString(",")
 
     fun snapshot(): AppStateSnapshot {
@@ -420,6 +445,8 @@ class AppState {
                 progressSec = pending.second.second,
                 currentSongId = currentSongIdPending,
                 songSort = songSort.name,
+                shuffleOn = shuffleOn,
+                repeatMode = repeatMode.name,
             )
         } else {
             AppStateSnapshot(
@@ -443,6 +470,8 @@ class AppState {
                 progressSec = progressSec,
                 currentSongId = currentSong.id,
                 songSort = songSort.name,
+                shuffleOn = shuffleOn,
+                repeatMode = repeatMode.name,
             )
         }
     }
@@ -456,6 +485,8 @@ class AppState {
         eqPreset = runCatching { EqPreset.valueOf(snapshot.eqPreset) }.getOrDefault(EqPreset.Off)
         themeMode = runCatching { ThemeMode.valueOf(snapshot.themeMode) }.getOrDefault(ThemeMode.Dark)
         songSort = runCatching { SongSort.valueOf(snapshot.songSort) }.getOrDefault(SongSort.Title)
+        shuffleOn = snapshot.shuffleOn
+        repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeatMode) }.getOrDefault(RepeatMode.Off)
         excludedFolders.clear()
         excludedFolders.addAll(snapshot.excludedFolders)
         favorites.clear()
@@ -484,6 +515,8 @@ class AppState {
         pendingPlayback = snapshot.queueIds to (snapshot.queueIndex to snapshot.progressSec)
         currentSongIdPending = snapshot.currentSongId
         hydrated = true // 恢复完成：允许存盘
+        // restore 可能晚于 attachPlayer 到达：循环/随机/EQ 就地补同步到服务端（否则引擎停留在默认模式）
+        engine?.let { syncEngineModes(it) }
         // 播放现场不在此处应用：演示 id 不提前解析（防止消费掉真实快照），
         // 统一等 loadLibrary（真曲库装载）后由 applyPendingPlayback 收敛
     }
@@ -537,12 +570,19 @@ class AppState {
 
     /** 扫描为空/失败且无缓存：确认无曲库（演示模式终态），放行启动门面 */
     fun markLibrarySettled() {
+        // 终态再无解析机会：挂起的恢复现场就地放弃（否则 tick 演示分支被冻结 → 播放键假死、快照回写死数据）
+        if (pendingPlayback != null) abandonPendingPlayback()
         librarySettled = true
     }
 
-    /** 装载真曲库：整体切换 library 与队列；服务在播则以服务为准，有待恢复现场则按快照恢复 */
+    /**
+     * 装载真曲库（缓存/扫描共用）：library 整体切换；UI 队列按「服务队列权威」收敛、不偷换语境——
+     * 服务在播按服务实际队列重建引用（保留歌单/搜索语境与进度）；有待恢复现场按快照幂等应用；
+     * 对已装载曲库的重扫只刷新队列引用（剔除失效项）；全新装载才落整库默认值。
+     */
     fun loadLibrary(songs: List<DemoSong>) {
         if (songs.isEmpty()) return
+        val rescan = realLibraryLoaded // 本次装载前曲库已就位（重扫/缓存刷新，区别于全新装载）
         library = songs
         realLibraryLoaded = true
         librarySettled = true
@@ -550,23 +590,53 @@ class AppState {
         val currentId = eng?.currentMediaId()
         val playingSong = currentId?.let { id -> songs.firstOrNull { it.id == id } }
         if (playingSong != null) {
-            // 服务正在播曲库中的歌：重建队列引用，保留当前曲与进度
-            queue = songs
-            queueIndex = songs.indexOf(playingSong)
-            progressSec = eng!!.positionSec().coerceIn(0f, playingSong.durationSec.toFloat())
+            // 服务正在播曲库中的歌：按服务实际队列重建引用（整库替换会偷换歌单/搜索的切歌顺序），
+            // 保留当前曲与进度
+            val serviceSongs = eng!!.mediaIds().mapNotNull { songById(it) }
+            queue = serviceSongs.ifEmpty { songs } // 服务队列引用解析为空才退回整库
+            queueIndex = queue.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
             engineLoadedUri = playingSong.mediaUri
+            progressSec = eng.positionSec().coerceIn(0f, effectiveDurationSec())
+            playing = eng.isEnginePlaying()
             pendingPlayback = null
             currentSongIdPending = null
             resumePending = false
             return
         }
-        queue = songs
-        queueIndex = 0
-        progressSec = 0f
-        resumePending = false
-        if (eng == null || eng.currentMediaId() == null) playing = false
+        when {
+            pendingPlayback != null -> {
+                // 有待恢复现场：先落整库默认值（现场解析全失败时自然退回整库空态），再幂等应用快照
+                queue = songs
+                queueIndex = 0
+                progressSec = 0f
+                resumePending = false
+                applyPendingPlayback()
+            }
+            rescan -> {
+                // 对已装载曲库的重扫：只刷新队列引用（剔除失效项），保留当前语境/进度/待装载恢复现场
+                val refreshed = queue.mapNotNull { songById(it.id) }
+                if (refreshed.isEmpty()) {
+                    queue = songs
+                    queueIndex = 0
+                    progressSec = 0f
+                    resumePending = false
+                } else {
+                    queue = refreshed
+                    queueIndex = queueIndex.coerceIn(0, refreshed.lastIndex)
+                }
+            }
+            else -> {
+                // 全新装载：整库为默认队列
+                queue = songs
+                queueIndex = 0
+                progressSec = 0f
+                resumePending = false
+            }
+        }
+        // playing 与服务实际一致：引擎空 = 未播放；引擎在则如实回读（重发恢复现场后为暂停态，
+        // 服务在播解析不到的曲目时不误置 false）
+        playing = eng?.isEnginePlaying() ?: false
         // 重扫不再清空最近播放（历史中的失效 id 在展示层自然过滤）
-        applyPendingPlayback()
     }
 
     /** 引擎就绪时装载恢复现场（不自动播放）：队列 + 起始位置原子下发，点播放即从原位续播 */
@@ -706,6 +776,7 @@ class AppState {
         queueIndex = (if (queueIndex > 0) queueIndex - 1 else queue.lastIndex).coerceAtLeast(0)
         startCurrent()
         rememberPlayed(currentSong.id)
+        scheduleSave()
     }
 
     fun seekTo(sec: Float) {
@@ -798,6 +869,7 @@ class AppState {
     fun toggleShuffle() {
         shuffleOn = !shuffleOn
         engine?.setShuffleMode(shuffleOn)
+        scheduleSave()
     }
 
     /** 均衡器预设：立即下发服务端（Off = 关闭音效），不等下一首歌装载。
@@ -815,6 +887,7 @@ class AppState {
             RepeatMode.One -> RepeatMode.Off
         }
         engine?.setRepeatMode(repeatMode == RepeatMode.All, repeatMode == RepeatMode.One)
+        scheduleSave()
     }
 
     // ── 队列编辑（下一首播放 / 最后播放 / 重排 / 删项 / 清空接下来）───────────
@@ -842,22 +915,23 @@ class AppState {
     }
 
     /** 下一首播放：插入到当前曲之后（重复添加允许） */
-    fun playNext(song: DemoSong) = insertQueueItems(listOf(song), queueIndex + 1)
+    fun playNext(song: DemoSong) = insertQueueItems(listOf(song), queueIndex + 1, pinLast = false)
 
     /** 最后播放：追加到队列末尾 */
-    fun playLast(song: DemoSong) = insertQueueItems(listOf(song), queue.size)
+    fun playLast(song: DemoSong) = insertQueueItems(listOf(song), queue.size, pinLast = true)
 
     /** 集合版下一首播放（详情页 / 卡片菜单用），保持给定顺序 */
-    fun playNextAll(songs: List<DemoSong>) = insertQueueItems(songs, queueIndex + 1)
+    fun playNextAll(songs: List<DemoSong>) = insertQueueItems(songs, queueIndex + 1, pinLast = false)
 
     /** 集合版最后播放 */
-    fun playLastAll(songs: List<DemoSong>) = insertQueueItems(songs, queue.size)
+    fun playLastAll(songs: List<DemoSong>) = insertQueueItems(songs, queue.size, pinLast = true)
 
-    private fun insertQueueItems(songs: List<DemoSong>, at: Int) {
+    private fun insertQueueItems(songs: List<DemoSong>, at: Int, pinLast: Boolean) {
         if (songs.isEmpty()) return
         val engineActive = engineDriving() && alignQueueWithEngine()
         val index = at.coerceIn(0, queue.size)
-        if (engineActive) engine!!.addQueueItems(index, songs.mapNotNull { it.toSpec() })
+        // 显式下发插入意图（playNext/playLast），shuffle 下服务端据此固定位置，不按 index 猜
+        if (engineActive) engine!!.addQueueItems(index, songs.mapNotNull { it.toSpec() }, pinLast)
         queue = queue.toMutableList().apply { addAll(index, songs) }
         scheduleSave()
     }
@@ -953,9 +1027,11 @@ class AppState {
         scheduleSave()
     }
 
-    /** 可见内建歌单（未被删除的）：歌单墙 / 曲库歌单 tab / 加入歌单面板统一走这里 */
+    /** 可见内建歌单（未被删除的）：歌单墙 / 曲库歌单 tab / 加入歌单面板统一走这里。
+     *  经 resolvePlaylist 实时化计数（加歌后不再恒「0 首」；目录静态 meta 仅兜底） */
     fun visibleBuiltInPlaylists(): List<DemoPlaylist> =
         DemoCatalog.playlists.filter { it.id !in hiddenBuiltInPlaylists }
+            .map { resolvePlaylist(it.id) ?: it }
 
     /** 设置页「恢复内置歌单」：清空隐藏集 */
     fun restoreBuiltInPlaylists() {
@@ -1104,12 +1180,8 @@ class AppState {
         val extra = addedTracks[id].orEmpty()
         val merged = if (extra.isEmpty()) base
         else base.copy(tracks = base.tracks + extra.mapNotNull { songById(it) })
-        // 用户歌单曲目数是真实的；常驻歌单 meta 沿用目录展示文案
-        return if (merged.id.startsWith("user-")) {
-            merged.copy(meta = "${merged.tracks.size} 首")
-        } else {
-            merged
-        }
+        // 用户歌单与常驻歌单的曲目数都实时化（常驻基座 + 加入歌单叠加后的真实数量）
+        return merged.copy(meta = "${merged.tracks.size} 首")
     }
 
     /** 详情页数据：歌单 / 专辑 / 艺术家 / 文件夹 / 流派 共用模板 */

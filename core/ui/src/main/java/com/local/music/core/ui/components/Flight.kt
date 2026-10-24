@@ -80,6 +80,8 @@ class PlayerFlight(private val scope: CoroutineScope) {
     var songSnapshot by mutableStateOf<DemoSong?>(null)
         private set
 
+    /** 飞行进度（0=迷你条态 1=播放页态）。**仅供读取**：外部 snapTo/animateTo 会绕过
+     *  phase/started/snapshot 的协同时序破坏状态机——驱动只发生在 beginEntry/beginExit 内部 */
     val t = Animatable(0f)
 
     /** 实时几何注册表（root 坐标），trackFlight 持续回填 */
@@ -139,7 +141,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
         snapshot = mini
         navigate(GlassScreen.Player)
         scope.launch {
-            val player = awaitRects(FlightKeys.playerKeys) ?: run {
+            if (awaitRects(FlightKeys.playerKeys) == null) {
                 // 对端 rect 超时未到：放弃飞行，播放页已按通用过渡呈现
                 phase = Phase.Idle
                 entryShowCover = false // 中止不得残留封面模式，否则歌词偏好被卡住
@@ -167,7 +169,17 @@ class PlayerFlight(private val scope: CoroutineScope) {
                 snapshot = null
                 return@launch
             }
-            val playerFinal = rectsSnapshot(FlightKeys.playerKeys) ?: player
+            // 起飞前重快照：entryShowCover 清除会触发 modeT 500ms 动画（封面 rect 移动中），
+            // 直接采集会冻结移动中的几何——复用 awaitRects 双帧一致判稳，采稳定后的 rect；
+            // 期间飞行被取消（phase 已非 Entering，如根尺寸变化）或判稳超时 → 走既有中止路径
+            val playerFinal = awaitRects(FlightKeys.playerKeys)
+            if (playerFinal == null || phase != Phase.Entering) {
+                phase = Phase.Idle
+                entryShowCover = false
+                songSnapshot = null
+                snapshot = null
+                return@launch
+            }
             snapshot = mini + playerFinal
             started = true
             t.snapTo(0f)
@@ -215,6 +227,24 @@ class PlayerFlight(private val scope: CoroutineScope) {
         }
     }
 
+    /**
+     * 根尺寸变化失效（旋转/分屏/自由窗口——manifest configChanges 吞掉配置变更，组合不重建）：
+     * - 飞行进行中：立即取消。各 alpha 均从 phase/t 派生，置 Idle 即复原；中止三件套
+     *   snapshot/entryShowCover/songSnapshot 同步清空，不留悬挂瞬态
+     * - 无论是否在飞行都清空 rect 注册表：keepOnDispose 冻结的迷你条 rect 与活动
+     *   snapshot 在新尺寸下全部视为陈旧，下次 trackFlight 重新回填 / awaitRects 重新等待，
+     *   杜绝替身飞向旧坐标
+     */
+    fun onRootSizeChanged() {
+        if (phase != Phase.Idle) {
+            phase = Phase.Idle
+            entryShowCover = false
+            songSnapshot = null
+            snapshot = null
+        }
+        rects.clear()
+    }
+
     private fun rectsSnapshot(keys: List<String>): Map<String, Rect>? =
         keys.mapNotNull { k -> rects[k]?.let { k to it } }.toMap()
             .takeIf { it.size == keys.size }
@@ -224,13 +254,18 @@ class PlayerFlight(private val scope: CoroutineScope) {
     private suspend fun awaitRects(keys: List<String>): Map<String, Rect>? =
         withTimeoutOrNull(600) {
             var last: Map<String, Rect>? = null
-            while (true) {
-                val m = keys.mapNotNull { k -> rects[k]?.let { k to it } }.toMap()
-                if (m.size == keys.size && m == last) return@withTimeoutOrNull m
-                if (m.size == keys.size) last = m else last = null
-                withFrameNanos { }
+            var stable: Map<String, Rect>? = null
+            while (stable == null) {
+                val cur = keys.mapNotNull { k -> rects[k]?.let { k to it } }.toMap()
+                // 全部注册且与上一帧一致（双帧判稳）才采纳；首帧布局可能仍是旧几何
+                if (cur.size == keys.size && cur == last) {
+                    stable = cur
+                } else {
+                    if (cur.size == keys.size) last = cur else last = null
+                    withFrameNanos { }
+                }
             }
-            @Suppress("UNREACHABLE_CODE") last
+            stable
         }
 }
 

@@ -25,7 +25,7 @@ private val Context.appDataStore: androidx.datastore.core.DataStore<Preferences>
 
 /**
  * 持久化实现（DataStore Preferences）：
- * - 快照编码为带版本号的 JSON（v2），歌单名 / 搜索词等用户文本无需转义
+ * - 快照编码为带版本号的 JSON（v4），歌单名 / 搜索词等用户文本无需转义
  * - 旧版控制字符分隔格式（v1）在读取时一次性迁移
  * - schedule 防抖 500ms 写盘；write 失败只记日志（不杀死防抖 collector）；
  *   flush 供退后台 / 关键节点立即落盘
@@ -68,7 +68,7 @@ class SettingsStore(context: Context) : SnapshotStore {
     companion object {
         private const val TAG = "SettingsStore"
         private val KEY_STATE = stringPreferencesKey("app_state_snapshot")
-        private const val VERSION = 3
+        private const val VERSION = 4
 
         private fun JSONArray.strings(): List<String> = List(length()) { getString(it) }
 
@@ -118,6 +118,8 @@ class SettingsStore(context: Context) : SnapshotStore {
             put("progressSec", s.progressSec.toDouble())
             put("currentSongId", s.currentSongId ?: JSONObject.NULL)
             put("songSort", s.songSort)
+            put("shuffleOn", s.shuffleOn)
+            put("repeatMode", s.repeatMode)
         }.toString()
 
         /** JSON 优先；非 JSON（旧格式）走 legacy 解析迁移；损坏数据记日志后返回 null */
@@ -164,6 +166,8 @@ class SettingsStore(context: Context) : SnapshotStore {
             progressSec = o.optDouble("progressSec", 0.0).toFloat(),
             currentSongId = o.optString("currentSongId").takeIf { o.has("currentSongId") && !o.isNull("currentSongId") },
             songSort = o.optString("songSort", "Title"),
+            shuffleOn = o.optBoolean("shuffleOn", false), // 旧版本（≤v3）无此字段：走默认值零迁移
+            repeatMode = o.optString("repeatMode", "Off"),
         )
 
         // ── v1（旧版）：\u001F 分字段 / \u001E 分集合项 / \u001D 分子字段，仅作迁移 ──

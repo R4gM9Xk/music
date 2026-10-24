@@ -23,6 +23,12 @@ android {
             // 与原 APK 调试变体一致：com.local.music.debug
             applicationIdSuffix = ".debug"
         }
+        release {
+            // 分发变体保持与已装基线同 ID 同签名：侧载 release 包 = 「更新」而非另装一个应用
+            applicationIdSuffix = ".debug"
+            signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = false
+        }
     }
 
     compileOptions {

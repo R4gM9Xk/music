@@ -25,6 +25,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -38,6 +39,7 @@ import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassTextField
 import com.local.music.core.ui.components.LocalHazeState
+import com.local.music.core.ui.components.LocalModalState
 import com.local.music.core.ui.components.LocalPlayerFlight
 import com.local.music.core.ui.components.PlaylistCard
 import com.local.music.core.ui.components.SectionHeader
@@ -174,7 +176,12 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
             }
             Spacer(Modifier.height(18.dp))
             }
+        // 单曲面板打开时 Chrome 让位（与 PlayerScreen 控制台同策略）：
+        // graphicsLayer alpha 只隐不卸——keepOnDispose 的迷你条飞行几何保持冻结；
+        // ModalState 注销已延迟到退场动画结束，面板滑出全程 Chrome 保持让位
+        val modal = LocalModalState.current
         GlassChrome(
+            modifier = Modifier.graphicsLayer { alpha = if (modal.isOpen) 0f else 1f },
             song = state.currentSong, playing = state.playing, progress = state.progressFraction,
             navSelected = 0,
             onNavSelect = {
