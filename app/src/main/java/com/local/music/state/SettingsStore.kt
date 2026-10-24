@@ -154,6 +154,8 @@ class SettingsStore(context: Context) : SnapshotStore {
                 "playCounts",
                 JSONObject().apply { s.playCounts.forEach { (id, n) -> put(id, n) } },
             )
+            // 自定义主题色（v7）：null 存 JSONObject.NULL，解码侧 isNull 判断
+            put("customSeedArgb", s.customSeedArgb ?: JSONObject.NULL)
         }.toString()
 
         /** JSON 优先；非 JSON（旧格式）走 legacy 解析迁移；损坏数据记日志后返回 null */
@@ -208,6 +210,8 @@ class SettingsStore(context: Context) : SnapshotStore {
             playCounts = o.optJSONObject("playCounts")?.let { obj -> // 旧版本（≤v6）无此字段：空表零迁移
                 buildMap { obj.keys().forEach { id -> put(id, obj.optInt(id, 0)) } }
             } ?: emptyMap(),
+            customSeedArgb = o.takeIf { it.has("customSeedArgb") && !it.isNull("customSeedArgb") }
+                ?.optInt("customSeedArgb"), // 旧版本（≤v6）无此字段：null 零迁移
         )
 
         // ── v1（旧版）：\u001F 分字段 / \u001E 分集合项 / \u001D 分子字段，仅作迁移 ──

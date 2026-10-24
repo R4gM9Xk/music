@@ -23,8 +23,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.local.music.core.ui.components.AuroraMiniPreview
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassToggle
@@ -35,7 +37,9 @@ import com.local.music.core.ui.components.ProgressTrack
 import com.local.music.core.ui.components.SectionHeader
 import com.local.music.core.ui.components.SettingRow
 import com.local.music.core.ui.components.SheetAction
+import com.local.music.core.ui.components.ThemeColorSwatches
 import com.local.music.core.ui.components.asTime
+import com.local.music.core.ui.theme.AuroraPalette
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.EqPreset
 import com.local.music.core.ui.state.GlassScreen
@@ -116,6 +120,55 @@ fun SettingsScreen(
                 SettingRow(
                     GlassIcons.Wave, "跟随封面取色", "极光背景取自当前专辑封面",
                     trailing = { GlassToggle(state.followCover, onToggle = { state.followCover = it }) },
+                )
+                RowDivider()
+                // F2 自定义主题色：三态（自定义 > 跟随封面 > 品牌靛紫），选中即生效
+                SettingRow(
+                    GlassIcons.Wave, "主题色",
+                    when {
+                        state.customSeedArgb != null -> "自定义颜色（点击更换）"
+                        state.followCover -> "跟随封面 · 可改为自定义"
+                        else -> "品牌靛紫 · 可改为自定义"
+                    },
+                    onClick = {
+                        modal.show {
+                            ModalSheet(modal, "主题色") {
+                                // 实时预览：随选中色变化（取自同一 fromSeed 派生）
+                                val previewSeed = state.customSeedArgb?.let { Color(it) }
+                                AuroraMiniPreview(
+                                    palette = previewSeed?.let { AuroraPalette.fromSeed(it) } ?: state.palette,
+                                )
+                                Spacer(Modifier.height(14.dp))
+                                Text(
+                                    "预设色板",
+                                    color = LocalGlassColors.current.textTertiary,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
+                                )
+                                ThemeColorSwatches(
+                                    seeds = AuroraPalette.PresetSeeds,
+                                    selected = state.customSeedArgb?.let { Color(it) },
+                                    onSelect = { state.setCustomSeed(it.toArgb()) },
+                                )
+                                Spacer(Modifier.height(12.dp))
+                                // 恢复默认：清掉自定义 → 回到「跟随封面 / 品牌」二态
+                                if (state.customSeedArgb != null) {
+                                    SheetAction(
+                                        icon = GlassIcons.Back,
+                                        label = "恢复默认",
+                                        subtitle = "回到跟随封面 / 品牌靛紫",
+                                        onClick = {
+                                            state.setCustomSeed(null)
+                                            modal.requestDismiss()
+                                        },
+                                    )
+                                }
+                                SheetAction(
+                                    icon = GlassIcons.Down, label = "完成", onClick = modal::requestDismiss,
+                                )
+                            }
+                        }
+                    },
                 )
                 RowDivider()
                 SettingRow(

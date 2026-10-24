@@ -15,6 +15,7 @@ import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoData
 import com.local.music.core.ui.components.DemoPlaylist
 import com.local.music.core.ui.components.DemoSong
+import androidx.compose.ui.graphics.Color
 import com.local.music.core.ui.components.DetailData
 import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.LyricLine
@@ -58,6 +59,7 @@ data class AppStateSnapshot(
     val playbackSpeed: Float = 1.0f, // 播放速度（v5 起编码，旧版本解码走默认值）
     val scanFilterShort: Boolean = true, // 扫描过滤短音频（v6 起编码，旧版本解码走默认值）
     val playCounts: Map<String, Int> = emptyMap(), // 播放次数（v7 起编码，旧版本解码走空表）
+    val customSeedArgb: Int? = null, // 自定义主题色（v7 起编码；null = 未自定义）
 )
 
 /** 持久化桥接：AppState 只面向它，实现在 app 模块（DataStore） */
@@ -282,6 +284,15 @@ class AppState {
 
     // ── 设置 ──────────────────────────────────────────────
     var followCover by mutableStateOf(true)
+    /** F2 自定义主题色（ARGB；null = 未自定义，走「跟随封面 / 品牌」二态）；快照 v7 持久化 */
+    var customSeedArgb by mutableStateOf<Int?>(null)
+        private set
+
+    /** 设置自定义主题色（null = 清除自定义，回到跟随封面/品牌） */
+    fun setCustomSeed(argb: Int?) {
+        customSeedArgb = argb
+        scheduleSave()
+    }
     var lyricEnabled by mutableStateOf(true)
     var glassLevel by mutableStateOf(GlassIntensity.Standard)
     var motionLevel by mutableStateOf(MotionIntensity.Standard)
@@ -346,10 +357,14 @@ class AppState {
 
     /** 极光取色：真封面取色优先 → 无封面回退占位风格 → 取色开关关闭时回退品牌靛紫 */
     val palette: AuroraPalette
-        get() = if (followCover) {
-            currentSong.palette ?: currentSong.art.palette
-        } else {
-            GlassPalettes.Purple
+        get() {
+            // F2 主题色三态：自定义（customSeedArgb 非空）优先 → 跟随封面 → 品牌靛紫
+            customSeedArgb?.let { return AuroraPalette.fromSeed(Color(it)) }
+            return if (followCover) {
+                currentSong.palette ?: currentSong.art.palette
+            } else {
+                GlassPalettes.Purple
+            }
         }
 
     /**
@@ -476,7 +491,7 @@ class AppState {
     /** 设置指纹：GlassApp 用 snapshotFlow 监听设置变更触发存盘 */
     fun settingsKey(): String =
         "$followCover|$lyricEnabled|${glassLevel.name}|${motionLevel.name}|${eqPreset.name}|${themeMode.name}|" +
-            "$shuffleOn|${repeatMode.name}|$playbackSpeed|$scanFilterShort|" +
+            "$shuffleOn|${repeatMode.name}|$playbackSpeed|$scanFilterShort|$customSeedArgb|" +
             excludedFolders.joinToString(",")
 
     fun snapshot(): AppStateSnapshot {
@@ -510,6 +525,7 @@ class AppState {
                 playbackSpeed = playbackSpeed,
                 scanFilterShort = scanFilterShort,
                 playCounts = playCounts.toMap(),
+                customSeedArgb = customSeedArgb,
             )
         } else {
             AppStateSnapshot(
@@ -538,6 +554,7 @@ class AppState {
                 playbackSpeed = playbackSpeed,
                 scanFilterShort = scanFilterShort,
                 playCounts = playCounts.toMap(),
+                customSeedArgb = customSeedArgb,
             )
         }
     }
@@ -557,6 +574,7 @@ class AppState {
         scanFilterShort = snapshot.scanFilterShort // 旧版本（≤v5）无此字段：走默认值 true 零迁移
         playCounts.clear()
         playCounts.putAll(snapshot.playCounts) // 旧版本（≤v6）无此字段：空表零迁移
+        customSeedArgb = snapshot.customSeedArgb // 旧版本（≤v6）无此字段：null 零迁移
         excludedFolders.clear()
         excludedFolders.addAll(snapshot.excludedFolders)
         favorites.clear()

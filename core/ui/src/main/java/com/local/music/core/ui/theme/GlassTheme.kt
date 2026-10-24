@@ -11,6 +11,7 @@ import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.toArgb
 
 /**
  * 液态玻璃流 · 设计 token
@@ -31,6 +32,55 @@ data class AuroraPalette(
         deep = lerp(deep, Color.White, 0.86f),
         deep2 = lerp(deep2, Color.White, 0.92f),
     )
+
+    companion object {
+        /**
+         * 自定义主题色（F2）：以用户选的 [seed] 派生整套五色阶梯。
+         *
+         * 派生规律对齐内置调色板（以 Purple 为例：seed #7F77DD → seed2 #AFA9EC → seed3 #CECBF6，
+         * deep #241C4A → deep2 #0E0A20）：
+         * - seed2/seed3 = 同色相提明度、降饱和（强调/浅强调）
+         * - deep/deep2 = 同色相深压 + 高饱和（极光底色，决定整屏氛围）
+         *
+         * 用 HSV 而非 OKLCH：Android 平台原生支持、与既有 paletteFromBitmap 同源，
+         * 且内置调色板正是按这套规律手调的，派生结果与品牌色观感一致。
+         */
+        fun fromSeed(seed: Color): AuroraPalette {
+            val hsv = FloatArray(3)
+            android.graphics.Color.colorToHSV(seed.toArgb(), hsv)
+            val h = hsv[0]
+            val s = hsv[1]
+            val v = hsv[2]
+
+            fun hsvColor(hue: Float, sat: Float, value: Float): Color =
+                Color(android.graphics.Color.HSVToColor(floatArrayOf(hue, sat.coerceIn(0f, 1f), value.coerceIn(0f, 1f))))
+
+            // seed3（最浅）：大幅提亮、明显降饱和；浅色模式下仍要压得住白底，故饱和度不归零
+            val seed3 = hsvColor(h, (s * 0.55f).coerceAtLeast(0.10f), (v + (1f - v) * 0.62f).coerceIn(0f, 1f))
+            // seed2（中）：提亮一档、轻微降饱和
+            val seed2 = hsvColor(h, (s * 0.78f).coerceAtLeast(0.15f), (v + (1f - v) * 0.32f).coerceIn(0f, 1f))
+            // deep（上）：深压到 ~0.22 明度、饱和度拉高（极光氛围感来自高饱和暗色）
+            val deep = hsvColor(h, (s * 1.05f).coerceAtLeast(0.35f), (v * 0.30f).coerceIn(0.08f, 0.45f))
+            // deep2（下）：再暗一档，接近黑但有明显色相
+            val deep2 = hsvColor(h, (s * 1.10f).coerceAtLeast(0.38f), (v * 0.12f).coerceIn(0.03f, 0.20f))
+
+            return AuroraPalette(seed = seed, seed2 = seed2, seed3 = seed3, deep = deep, deep2 = deep2)
+        }
+
+        /** 预设色板（F2 面板的 10 色）：覆盖常见偏好，用户也可用滑杆自定 */
+        val PresetSeeds = listOf(
+            Color(0xFF7F77DD), // 靛紫（品牌色）
+            Color(0xFF378ADD), // 蓝
+            Color(0xFF1D9E75), // 青绿
+            Color(0xFF57A94A), // 草绿
+            Color(0xFFE0A800), // 琥珀
+            Color(0xFFD85A30), // 珊瑚橙
+            Color(0xFFD64570), // 玫红
+            Color(0xFF9B51E0), // 紫罗兰
+            Color(0xFF8D6E63), // 棕
+            Color(0xFF5A6B7C), // 石板灰蓝
+        )
+    }
 }
 
 object GlassPalettes {
