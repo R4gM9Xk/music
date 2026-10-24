@@ -238,6 +238,8 @@ fun CollectionActionsSheet(
     title: String,
     tracks: List<DemoSong>,
     onPlayAll: (shuffle: Boolean) -> Unit,
+    /** D2：导出 M3U（null = 不提供该项，例如未接线 SAF 的场景） */
+    onExportM3u: (() -> Unit)? = null,
 ) {
     var showRename by remember { mutableStateOf(false) }
     var newName by remember { mutableStateOf("") }
@@ -297,6 +299,18 @@ fun CollectionActionsSheet(
                 icon = GlassIcons.Edit,
                 label = "重命名歌单",
                 onClick = { showRename = true },
+            )
+        }
+        // D2：M3U 导出（任何歌单都可导出；动态歌单导出的就是当前解析结果）
+        if (target.kind == DetailTarget.Kind.Playlist && tracks.isNotEmpty()) {
+            SheetAction(
+                icon = GlassIcons.Down,
+                label = "导出 M3U 歌单",
+                subtitle = "${tracks.size} 首 · 可在其他播放器打开",
+                onClick = {
+                    onDismiss()
+                    onExportM3u?.invoke()
+                },
             )
         }
         val isDynamic = target.kind == DetailTarget.Kind.Playlist &&

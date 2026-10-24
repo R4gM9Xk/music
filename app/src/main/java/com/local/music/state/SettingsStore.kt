@@ -98,6 +98,15 @@ class SettingsStore(context: Context) : SnapshotStore {
 
         // ── v2：JSON 编码 ──────────────────────────────────
 
+        /**
+         * 备份导出（D3）：当前快照 → JSON 文本。与快照同 schema（含 v 号），
+         * 恢复时直接走 [decode] 的兼容链，零新增解析逻辑。
+         */
+        fun encodeForBackup(s: AppStateSnapshot): String = encode(s)
+
+        /** 备份恢复（D3）：解析备份文件文本（含旧格式兼容），失败返回 null */
+        fun decodeBackup(raw: String): AppStateSnapshot? = decode(raw)
+
         private fun encode(s: AppStateSnapshot): String = JSONObject().apply {
             put("v", VERSION)
             put("followCover", s.followCover)

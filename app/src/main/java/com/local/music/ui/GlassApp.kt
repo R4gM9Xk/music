@@ -85,6 +85,7 @@ import com.local.music.feature.settings.screen.SettingsScreen
 import com.local.music.player.MediaControllerEngine
 import com.local.music.player.MediaLibrary
 import com.local.music.player.MusicPlaybackService
+import com.local.music.player.M3uPlaylistIO
 import com.local.music.player.QueueStateStore
 import com.local.music.state.SettingsStore
 import com.local.music.update.UpdateManager
@@ -320,6 +321,101 @@ fun GlassApp() {
         updateManager.checkSilently()
     }
 
+    // ── D2/D3 文件 IO：SAF 选择器（导出 M3U / 导入 M3U / 导出备份 / 恢复备份）──
+    // 结果通过一次性回调交给发起方（设置页行 / 歌单详情菜单），避免把 SAF 逻辑散到各屏
+    var pendingM3uExportPlaylist by remember { mutableStateOf<com.local.music.core.ui.components.DemoPlaylist?>(null) }
+    var pendingM3uImport by remember { mutableStateOf(false) }
+    var pendingBackupExport by remember { mutableStateOf(false) }
+    var pendingBackupImport by remember { mutableStateOf(false) }
+    var ioMessage by remember { mutableStateOf<String?>(null) } // 结果提示（成功/失败/未命中汇总）
+
+    val m3uExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("audio/x-mpegurl"),
+    ) { uri ->
+        val playlist = pendingM3uExportPlaylist
+        pendingM3uExportPlaylist = null
+        if (uri == null || playlist == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { M3uPlaylistIO.export(context, uri, playlist) }
+            }
+            ioMessage = result.fold(
+                onSuccess = { "已导出「${playlist.title}」${it.written} 首" },
+                onFailure = { "导出失败：${it.message ?: "无法写入"}" },
+            )
+        }
+    }
+    val m3uImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        pendingM3uImport = false
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { M3uPlaylistIO.import(context, uri, state.library) }
+            }
+            ioMessage = result.fold(
+                onSuccess = { r ->
+                    if (r.matchedIds.isEmpty()) {
+                        "未匹配到任何曲目（共 ${r.unmatched.size} 行未命中）"
+                    } else {
+                        // 新建 user- 歌单承载，复用现有 addToPlaylist 单点提交
+                        val name = r.title?.takeIf { it.isNotBlank() }
+                            ?: M3uPlaylistIO.displayNameOf(context, uri)
+                            ?: M3uPlaylistIO.fallbackNameOf(uri)
+                        val pl = state.createPlaylist(name)
+                        r.matchedIds.forEach { state.addToPlaylist(pl.id, it) }
+                        buildString {
+                            append("已导入「${pl.title}」${r.matchedIds.size} 首")
+                            if (r.unmatched.isNotEmpty()) append("，${r.unmatched.size} 首未匹配")
+                        }
+                    }
+                },
+                onFailure = { "导入失败：${it.message ?: "无法读取"}" },
+            )
+        }
+    }
+    val backupExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        pendingBackupExport = false
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    val json = SettingsStore.encodeForBackup(state.snapshot())
+                    context.contentResolver.openOutputStream(uri)?.use {
+                        it.write(json.toByteArray(Charsets.UTF_8))
+                    } ?: error("无法写入所选位置")
+                }.isSuccess
+            }
+            ioMessage = if (ok) "备份已导出" else "备份导出失败"
+        }
+    }
+    val backupImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        pendingBackupImport = false
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val snapshot = withContext(Dispatchers.IO) {
+                runCatching {
+                    val raw = context.contentResolver.openInputStream(uri)?.use {
+                        it.readBytes().toString(Charsets.UTF_8)
+                    } ?: error("无法读取所选文件")
+                    SettingsStore.decodeBackup(raw) ?: error("备份文件格式无法识别")
+                }
+            }
+            snapshot.onSuccess {
+                state.restore(it) // 与启动恢复同一路径：设置/歌单/收藏立即生效，播放现场走 pending
+                state.scheduleSave()
+                ioMessage = "备份已恢复"
+            }.onFailure {
+                ioMessage = "恢复失败：${it.message ?: "文件无法解析"}"
+            }
+        }
+    }
+
     // 返回键：模态面板优先关闭 → 详情回来源页 → 播放页逆向飞行收起 → 其余回曲库
     // （曲库页面板开着时也要拦截：否则返回直接穿透 finish 掉 Activity）
     BackHandler(enabled = state.screen != GlassScreen.Library || modalState.isOpen) {
@@ -424,7 +520,21 @@ fun GlassApp() {
                                     GlassScreen.Player -> PlayerScreen(state)
                                     GlassScreen.Library -> LibraryScreen(state)
                                     GlassScreen.Playlist -> PlaylistScreen(state)
-                                    GlassScreen.Detail -> PlaylistDetailScreen(state)
+                                    GlassScreen.Detail -> PlaylistDetailScreen(
+                                        state,
+                                        // D2：导出 M3U（选位置 → 写文件）
+                                        onExportM3u = { _, title, tracks ->
+                                            pendingM3uExportPlaylist = com.local.music.core.ui.components.DemoPlaylist(
+                                                id = state.detail.id,
+                                                title = title,
+                                                meta = "${tracks.size} 首",
+                                                art = tracks.firstOrNull()?.art
+                                                    ?: com.local.music.core.ui.components.ArtStyle.Night,
+                                                tracks = tracks,
+                                            )
+                                            m3uExportLauncher.launch("$title.m3u8")
+                                        },
+                                    )
                                     GlassScreen.Search -> SearchScreen(state)
                                     GlassScreen.Settings -> SettingsScreen(
                                         state,
@@ -450,6 +560,21 @@ fun GlassApp() {
                                             } else {
                                                 openAllFilesAccessPage()
                                             }
+                                        },
+                                        // D2 导入 M3U / D3 备份恢复
+                                        onImportM3u = {
+                                            pendingM3uImport = true
+                                            m3uImportLauncher.launch(
+                                                arrayOf("audio/x-mpegurl", "audio/mpegurl", "text/plain", "*/*"),
+                                            )
+                                        },
+                                        onExportBackup = {
+                                            pendingBackupExport = true
+                                            backupExportLauncher.launch("music-backup.json")
+                                        },
+                                        onImportBackup = {
+                                            pendingBackupImport = true
+                                            backupImportLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
                                         },
                                     )
                                 }
@@ -499,6 +624,34 @@ fun GlassApp() {
                         // 飞行期不渲染：结构性保证「飞行期无面板」（旧设计=屏内 sheet 随屏卸载）
                         if (!flight.isActive) {
                             ModalSheetHost(modalState)
+                        }
+                    }
+
+                    // 文件 IO 结果提示（D2/D3：导出/导入/备份恢复）：与错误条同款，4s 自动消退
+                    ioMessage?.let { message ->
+                        LaunchedEffect(message) {
+                            delay(4000)
+                            ioMessage = null
+                        }
+                        GlassSurface(
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .statusBarsPadding()
+                                .padding(top = 8.dp)
+                                .fillMaxWidth()
+                                .padding(horizontal = 20.dp),
+                            level = GlassLevel.Hi,
+                            shape = RoundedCornerShape(16.dp),
+                            onClick = { ioMessage = null },
+                        ) {
+                            Text(
+                                message,
+                                color = LocalGlassColors.current.textPrimary,
+                                fontSize = 12.5.sp,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                            )
                         }
                     }
 

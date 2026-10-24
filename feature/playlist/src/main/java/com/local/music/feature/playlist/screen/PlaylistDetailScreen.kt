@@ -42,6 +42,7 @@ import com.local.music.core.ui.components.AddSongsSheet
 import com.local.music.core.ui.components.ArtThumb
 import com.local.music.core.ui.components.CollectionActionsSheet
 import com.local.music.core.ui.components.DemoCatalog
+import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.GlassChrome
 import com.local.music.core.ui.components.GlassIconButton
@@ -72,7 +73,12 @@ import dev.chrisbanes.haze.rememberHazeState
  * 自绘 Chrome 的让位（modal.isOpen 时 alpha=0，保留组合护 keepOnDispose 几何）维持不变。
  */
 @Composable
-fun PlaylistDetailScreen(state: AppState, modifier: Modifier = Modifier) {
+fun PlaylistDetailScreen(
+    state: AppState,
+    modifier: Modifier = Modifier,
+    /** D2：导出 M3U（id, 标题, 曲目）——SAF 选择器由 app 层持有；null = 不提供入口 */
+    onExportM3u: ((playlistId: String, title: String, tracks: List<DemoSong>) -> Unit)? = null,
+) {
     val palette = LocalAuroraPalette.current
     val data = state.detailData(state.detail)
     // 模态面板宿主（GlassApp 根层）；Chrome 让位同读此状态
@@ -152,6 +158,10 @@ fun PlaylistDetailScreen(state: AppState, modifier: Modifier = Modifier) {
                                 title = data.title,
                                 tracks = data.tracks,
                                 onPlayAll = { shuffle -> playAll(shuffle) },
+                                // D2：导出 M3U（SAF 选择器由 app 层拉起）
+                                onExportM3u = onExportM3u?.let { export ->
+                                    { export(state.detail.id, data.title, data.tracks) }
+                                },
                             )
                         }
                     },

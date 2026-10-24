@@ -67,6 +67,10 @@ fun SettingsScreen(
     onInstallUpdate: () -> Unit = {},
     allFilesGranted: Boolean = false,
     onAllFilesAccess: () -> Unit = {},
+    // D2/D3：文件 IO 入口（SAF 选择器在 app 层持有，屏内只发起）
+    onImportM3u: () -> Unit = {},
+    onExportBackup: () -> Unit = {},
+    onImportBackup: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var scanning by remember { mutableStateOf(false) }
@@ -270,6 +274,28 @@ fun SettingsScreen(
                         onClick = { state.restoreBuiltInPlaylists() },
                     )
                 }
+            }
+
+            // D2/D3：歌单迁移与全量备份（SAF 选择器由 app 层拉起）
+            SectionHeader("数据")
+            SettingsCard {
+                SettingRow(
+                    GlassIcons.Down, "导入 M3U 歌单",
+                    "从 .m3u / .m3u8 文件新建歌单（按文件路径匹配曲库）",
+                    onClick = onImportM3u,
+                )
+                RowDivider()
+                SettingRow(
+                    GlassIcons.Disc, "导出备份",
+                    "歌单 / 收藏 / 设置 / 播放次数 → JSON",
+                    onClick = onExportBackup,
+                )
+                RowDivider()
+                SettingRow(
+                    GlassIcons.Book, "恢复备份",
+                    "从备份文件还原全部数据（覆盖当前）",
+                    onClick = onImportBackup,
+                )
             }
 
             SectionHeader("关于")
