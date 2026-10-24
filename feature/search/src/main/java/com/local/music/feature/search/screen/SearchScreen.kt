@@ -32,7 +32,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.Color
 import com.local.music.core.ui.components.DemoCatalog
-import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.GlassChrome
 import com.local.music.core.ui.components.GlassLevel
@@ -56,6 +55,8 @@ import dev.chrisbanes.haze.rememberHazeState
 /**
  * 搜索：真输入框（实时过滤标题/艺术家/专辑）+ 历史芯片 + 带数据的结果
  * （歌曲行播放入队、专辑卡进专辑详情；歌曲行 ⋯/长按 = 单曲操作面板）。
+ * 面板经 LocalModalState.show 挂 GlassApp 根层宿主（屏内不再渲染 GlassSheet）；
+ * 自绘 Chrome 的让位（modal.isOpen 时 alpha=0，保留组合护 keepOnDispose 几何）维持不变。
  */
 @Composable
 fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
@@ -64,8 +65,9 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
     val albums = state.searchAlbumGroups(query)
     // 展开态跟随查询词重置（remember 以 query 为 key，换词自动收起）
     var showAllAlbums by remember(query) { mutableStateOf(false) }
-    var actionSong by remember { mutableStateOf<DemoSong?>(null) }
     val flight = LocalPlayerFlight.current
+    // 模态面板宿主（GlassApp 根层）；Chrome 让位同读此状态
+    val modal = LocalModalState.current
 
     val hazeState = rememberHazeState()
     CompositionLocalProvider(LocalHazeState provides hazeState) {
@@ -131,8 +133,26 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                             song = song,
                             playing = song.id == state.currentSong.id,
                             wavePlaying = state.playing,
-                            onMoreClick = { actionSong = song },
-                            onLongClick = { actionSong = song },
+                            onMoreClick = {
+                                modal.show {
+                                    SongActionsSheet(
+                                        visible = modal.visible,
+                                        onDismiss = modal::requestDismiss,
+                                        state = state,
+                                        song = song,
+                                    )
+                                }
+                            },
+                            onLongClick = {
+                                modal.show {
+                                    SongActionsSheet(
+                                        visible = modal.visible,
+                                        onDismiss = modal::requestDismiss,
+                                        state = state,
+                                        song = song,
+                                    )
+                                }
+                            },
                             onClick = {
                                 state.addSearchHistory(query)
                                 state.playSong(song, results, "搜索")
@@ -178,8 +198,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
             }
         // 单曲面板打开时 Chrome 让位（与 PlayerScreen 控制台同策略）：
         // graphicsLayer alpha 只隐不卸——keepOnDispose 的迷你条飞行几何保持冻结；
-        // ModalState 注销已延迟到退场动画结束，面板滑出全程 Chrome 保持让位
-        val modal = LocalModalState.current
+        // ModalState 语义保持「退场动画结束（content 清空）后 Chrome 才复位」
         GlassChrome(
             modifier = Modifier.graphicsLayer { alpha = if (modal.isOpen) 0f else 1f },
             song = state.currentSong, playing = state.playing, progress = state.progressFraction,
@@ -203,16 +222,6 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
             onPlayPause = state::togglePlayPause,
             onNext = { state.next() },
         )
-        }
-
-        // 单曲操作面板（搜索结果的 ⋯ / 长按入口）
-        actionSong?.let { song ->
-            SongActionsSheet(
-                visible = true,
-                onDismiss = { actionSong = null },
-                state = state,
-                song = song,
-            )
         }
     }
 }

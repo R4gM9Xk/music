@@ -177,6 +177,35 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
         }
     }
 
+    /** 定时关闭：经自定义命令下发服务端（分钟档协程/播完档播放器监听都在服务端承担） */
+    override fun setSleepTimer(modeMinutes: Int) {
+        runCatching {
+            val future = controller.sendCustomCommand(
+                SessionCommand(MusicPlaybackService.CMD_SET_SLEEP_TIMER, Bundle.EMPTY),
+                Bundle().apply { putInt(MusicPlaybackService.KEY_SLEEP_MODE, modeMinutes) },
+            )
+            // 异步结果留痕：与 EQ 同型（onConnect 漏声明曾静默失效），失败只打日志供诊断
+            future.addListener(
+                {
+                    val result = runCatching { future.get() }.getOrNull()
+                    if (result == null || result.resultCode != SessionResult.RESULT_SUCCESS) {
+                        android.util.Log.w(
+                            "MediaControllerEngine",
+                            "自定义命令下发失败 cmd=${MusicPlaybackService.CMD_SET_SLEEP_TIMER} " +
+                                "resultCode=${result?.resultCode}",
+                        )
+                    }
+                },
+                Runnable::run,
+            )
+        }
+    }
+
+    /** 播放速度：MediaController 原生 setPlaybackSpeed（服务端 ExoPlayer Sonic 变速不变调，无服务端改动） */
+    override fun setPlaybackSpeed(speed: Float) {
+        if (checkConnected()) controller.setPlaybackSpeed(speed)
+    }
+
     override fun play() {
         if (checkConnected()) controller.play()
     }

@@ -33,8 +33,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -71,14 +71,16 @@ import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.FlightKeys
 import com.local.music.core.ui.components.GlassIconButton
 import com.local.music.core.ui.components.GlassLevel
+import com.local.music.core.ui.components.GlassSheet
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.LyricLine
 import com.local.music.core.ui.components.LocalHazeState
+import com.local.music.core.ui.components.LocalModalState
 import com.local.music.core.ui.components.LocalPlayerFlight
 import com.local.music.core.ui.components.PlayerFlight
 import com.local.music.core.ui.components.ProgressTrack
 import com.local.music.core.ui.components.QueueSheet
-import com.local.music.core.ui.components.SongActionsSheet
+import com.local.music.core.ui.components.SheetAction
 import com.local.music.core.ui.components.asTime
 import com.local.music.core.ui.components.glassHaze
 import com.local.music.core.ui.components.pressScale
@@ -86,6 +88,9 @@ import com.local.music.core.ui.components.trackFlight
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.RepeatMode
+import com.local.music.core.ui.state.SleepTimerOptions
+import com.local.music.core.ui.state.sleepTimerLabel
+import com.local.music.core.ui.state.sleepTimerSubtitle
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalAuroraPalette
@@ -93,10 +98,8 @@ import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.auroraAccentColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
+import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
-
-/** 播放页内底部面板 */
-private enum class PlayerSheet { Queue, More }
 
 /**
  * 播放页 · 歌词主角
@@ -111,8 +114,8 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
     val lyrics = state.currentLyrics
     val song = state.currentSong
     val flight = LocalPlayerFlight.current
-
-    var sheet by remember { mutableStateOf<PlayerSheet?>(null) }
+    // 模态面板宿主（GlassApp 根层）：队列/更多面板经 show 挂载，屏内不再渲染 GlassSheet
+    val modal = LocalModalState.current
 
     // 进入飞行落封面模式：entryShowCover 为瞬态，点击封面/手势即清除，不动持久化偏好
     val showLyrics = state.lyricEnabled && lyrics != null && flight?.entryShowCover != true
@@ -156,7 +159,8 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
         state.lyricEnabled = !showLyrics
     }
 
-    // 播放页自持采样状态：顶栏+舞台为 hazeSource，控制台/底部面板为兄弟效果层
+    // 播放页自持采样状态：顶栏+舞台为 hazeSource，控制台为兄弟效果层
+    // （底部面板已挂 GlassApp 根层宿主，消费 app 级源，不在本屏子树内）
     val playerHaze = rememberHazeState()
     CompositionLocalProvider(LocalHazeState provides playerHaze) {
         Column(
@@ -212,7 +216,16 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text("来自「${state.queueSource ?: "本地音乐"}」", color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
                         }
-                        GlassIconButton(onClick = { sheet = PlayerSheet.More }) {
+                        GlassIconButton(onClick = {
+                            // 播放选项面板挂根层宿主（照抄 modal.show 模式；重复打开即整组重建，状态无残留）
+                            modal.show {
+                                PlaybackOptionsSheet(
+                                    visible = modal.visible,
+                                    onDismiss = modal::requestDismiss,
+                                    state = state,
+                                )
+                            }
+                        }) {
                             Icon(GlassIcons.More, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
                         }
                     }
@@ -322,9 +335,9 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
 
             // ── 玻璃控制台（背景真模糊：采样舞台区）。玻璃本体/歌名/副标题/播放/下一首 = 共享真身；
             //    收藏/队列/进度/时间/随机/上一首/循环 = 非共享原地淡入淡出。
-            //    底部面板打开时控制台整体让位（与 GlassApp 对 Chrome 的 ModalState 策略同源——
-            //    面板与控制台都是带 hazeEffect 的兄弟层，重叠时 HWUI 合成顺序会串台）
-            val sheetOpen = sheet != null
+            //    底部面板打开时控制台整体让位：读全局 ModalState（含退场期，与 GlassApp 对
+            //    Chrome 的门控同源）——面板滑出全程保持隐藏，退场时长到 content 清空后才复位
+            val sheetOpen = modal.isOpen
             val sharedAlpha = { (flight?.playerSharedAlpha() ?: 1f) * (if (sheetOpen) 0f else 1f) }
             val softAlpha = { (flight?.softAlpha() ?: 1f) * (if (sheetOpen) 0f else 1f) }
             GlassSurface(
@@ -363,7 +376,24 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             )
                         }
                         ConsoleIcon(
-                            onClick = { sheet = PlayerSheet.Queue },
+                            onClick = {
+                                modal.show {
+                                    QueueSheet(
+                                        visible = modal.visible,
+                                        onDismiss = modal::requestDismiss,
+                                        queue = state.queue,
+                                        currentIndex = state.queueIndex,
+                                        onPick = { index ->
+                                            state.playSong(state.queue[index], state.queue)
+                                            modal.requestDismiss()
+                                        },
+                                        onMove = state::moveQueueItem,
+                                        onRemove = state::removeQueueItem,
+                                        onClearUpNext = state::clearUpNext,
+                                        isPlaying = state.playing,
+                                    )
+                                }
+                            },
                             modifier = Modifier.graphicsLayer { alpha = softAlpha() },
                         ) {
                             Icon(GlassIcons.Queue, null, Modifier.size(21.dp),
@@ -454,28 +484,6 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             )
         }
     }
-
-    // ── 底部面板：队列 / 更多（单曲操作面板统一组件）────────
-    QueueSheet(
-        visible = sheet == PlayerSheet.Queue,
-        onDismiss = { sheet = null },
-        queue = state.queue,
-        currentIndex = state.queueIndex,
-        onPick = { index ->
-            state.playSong(state.queue[index], state.queue)
-            sheet = null
-        },
-        onMove = state::moveQueueItem,
-        onRemove = state::removeQueueItem,
-        onClearUpNext = state::clearUpNext,
-        isPlaying = state.playing,
-    )
-    SongActionsSheet(
-        visible = sheet == PlayerSheet.More,
-        onDismiss = { sheet = null },
-        state = state,
-        song = song,
-    )
 }
 
 /**
@@ -669,4 +677,72 @@ private fun ConsoleIcon(
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
             .padding(6.dp),
     ) { content() }
+}
+
+/** 播放速度档位（Media3 原生 Sonic 变速不变调） */
+private val PlaybackSpeedOptions = listOf(0.75f, 1f, 1.25f, 1.5f, 2f)
+
+/** 速度档位展示名：固定一位小数（1f 显示「1.0×」，与 0.75× 对齐） */
+private fun speedLabel(speed: Float): String =
+    if (speed == speed.toInt().toFloat()) "${speed.toInt()}.0×" else "$speed×"
+
+/**
+ * 播放选项面板：定时关闭 + 播放速度（顶栏 More 打开，经 modal.show 挂根层宿主）。
+ * 当前生效项 emphasized；分钟档剩余时间每秒刷新（deadline 语义在 AppState——
+ * 服务端到点自行暂停且无回执，本地按期限推导结束态）。
+ */
+@Composable
+private fun PlaybackOptionsSheet(
+    visible: Boolean,
+    onDismiss: () -> Unit,
+    state: AppState,
+) {
+    // 秒级倒计时：每秒读一次剩余值驱动本面板重组（高亮/副标题随到点自动归位）
+    var remainingSec by remember { mutableIntStateOf(0) }
+    LaunchedEffect(state.sleepTimerDeadlineMs) {
+        while (true) {
+            remainingSec = state.sleepTimerRemainingSec() ?: 0
+            delay(1000)
+        }
+    }
+    val activeMode = state.effectiveSleepTimerMode()
+    GlassSheet(visible = visible, onDismiss = onDismiss, title = "播放选项") {
+        GroupLabel("定时关闭")
+        SleepTimerOptions.forEach { option ->
+            SheetAction(
+                icon = GlassIcons.Moon,
+                label = sleepTimerLabel(option),
+                subtitle = sleepTimerSubtitle(option, activeMode, remainingSec),
+                emphasized = option == activeMode,
+                onClick = {
+                    state.setSleepTimer(option)
+                    onDismiss()
+                },
+            )
+        }
+        GroupLabel("播放速度")
+        PlaybackSpeedOptions.forEach { speed ->
+            SheetAction(
+                icon = GlassIcons.Wave,
+                label = speedLabel(speed),
+                emphasized = state.playbackSpeed == speed,
+                onClick = {
+                    state.selectPlaybackSpeed(speed)
+                    onDismiss()
+                },
+            )
+        }
+    }
+}
+
+/** 面板分组小标题（Sheet.kt 的 SectionLabel 为私有，就地等价实现；start=6dp 与 SheetAction 文案对齐） */
+@Composable
+private fun GroupLabel(text: String) {
+    Text(
+        text,
+        color = LocalGlassColors.current.textTertiary,
+        fontSize = 11.sp,
+        letterSpacing = 0.3.sp,
+        modifier = Modifier.padding(start = 6.dp, top = 10.dp, bottom = 4.dp),
+    )
 }

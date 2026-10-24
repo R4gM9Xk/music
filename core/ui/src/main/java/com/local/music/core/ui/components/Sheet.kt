@@ -30,16 +30,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -59,40 +57,96 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * 模态面板全局状态：GlassSheet 打开 / 关闭时注册注销，宿主（GlassApp）据此——
- * - 隐藏底部 Chrome（面板画在页面内容区，scrim 盖不住同级后绘制的 Chrome，只能主动让位）
+ * 模态面板全局宿主状态：同一时刻最多一个面板（单 content 槽）。
+ * 面板渲染统一提升到根层宿主（[ModalSheetHost]，由 GlassApp 在内容区 hazeSource
+ * 的兄弟位置调用——铁律①「效果层=源兄弟」，面板玻璃不再位于任何源子树内），据此——
+ * - 隐藏底部 Chrome / 播放页控制台（面板在根层后绘，Chrome 门控与控制台让位读 [isOpen]，
+ *   退场期保持让位直到 [ModalSheetHost] 清空 content 才复位）
  * - 返回键优先关闭面板而不是离开页面
+ *
+ * 生命周期：show(content) → content 即刻组合（GlassSheet 以 visible=true 入场）；
+ * requestDismiss() → visible=false（GlassSheet 播放退场动画，isOpen 仍为 true）；
+ * 退场动画时长后 [ModalSheetHost] 清空 content → 面板卸载、让位解除。
  */
 class ModalState {
-    var openCount by mutableIntStateOf(0)
+    /** 当前面板内容：打开→组合；退场动画结束后清空→卸载（期间保持非 null 维持让位语义） */
+    var content: (@Composable () -> Unit)? by mutableStateOf(null)
         private set
 
-    /** 当前打开面板的关闭回调（同屏同时最多一个可见面板持有） */
-    private var dismiss: (() -> Unit)? = null
+    /** 可见标志：false = 退场中（退场动画由 GlassSheet 的 AnimatedVisibility 播放） */
+    var visible by mutableStateOf(false)
+        private set
 
-    val isOpen: Boolean get() = openCount > 0
+    /** 面板存在（含退场期）：返回键 / Chrome 门控 / 控制台让位统一读这里 */
+    val isOpen: Boolean get() = content != null
 
-    /** 请求关闭当前面板（返回键优先走这里） */
+    /** 打开面板（同刻只保有一个：再 show 即原位替换，与旧单可见面板语义一致） */
+    fun show(content: @Composable () -> Unit) {
+        this.content = content
+        visible = true
+    }
+
+    /** 请求关闭当前面板（返回键 / scrim 点击 / 动作完成统一走这里） */
     fun requestDismiss() {
-        dismiss?.invoke()
+        visible = false
     }
 
-    internal fun register(onDismiss: () -> Unit) {
-        openCount++
-        dismiss = onDismiss
-    }
-
-    internal fun unregister(onDismiss: () -> Unit) {
-        openCount = (openCount - 1).coerceAtLeast(0)
-        if (dismiss === onDismiss) dismiss = null
+    /** 退场动画结束后由 [ModalSheetHost] 清空内容（宿主机制不外泄） */
+    internal fun clearContent() {
+        content = null
     }
 }
 
 val LocalModalState = compositionLocalOf { ModalState() }
 
 /**
+ * 模态面板宿主渲染点（GlassApp 根层、内容区 hazeSource 兄弟位置调用）：
+ * - content 非空即渲染；面板经自身参数接 [ModalState.visible] 驱动 GlassSheet 进出场动画
+ * - 退场动画时长后清空 content（isOpen 归 false，Chrome/控制台让位解除）：
+ *   中途重开（visible 翻回 true）取消本次清理，与旧「退场中途重开撤销待注销注册」逐帧等价
+ */
+@Composable
+fun ModalSheetHost(modal: ModalState) {
+    LaunchedEffect(modal.visible) {
+        if (!modal.visible) {
+            // 退场时长与 GlassSheet 的 AnimatedVisibility exit 同源（tweenPage）
+            delay(GlassMotion.tweenPage<Float>().durationMillis.toLong())
+            modal.clearContent()
+        }
+    }
+    val content = modal.content
+    if (content != null) {
+        content()
+    }
+}
+
+/**
+ * 在 modal.show { } 内挂 GlassSheet 的便捷包装：自动接宿主 visible/dismiss——
+ * 各屏不再直接渲染 GlassSheet（效果层统一在根层宿主）。
+ */
+@Composable
+fun ModalSheet(
+    modal: ModalState,
+    title: String,
+    modifier: Modifier = Modifier,
+    scrollState: ScrollState = rememberScrollState(),
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    GlassSheet(
+        visible = modal.visible,
+        onDismiss = modal::requestDismiss,
+        title = title,
+        modifier = modifier,
+        scrollState = scrollState,
+        content = content,
+    )
+}
+
+/**
  * 底部玻璃动作面板：半透明 scrim + 顶部圆角玻璃卡，360ms 弹性上滑入场。
  * 设置强度选择 / 播放队列 / 更多操作 / 新建歌单 的共用容器。
+ * 可见性由调用方驱动（模态面板经根层宿主 ModalSheetHost 挂载、接 ModalState.visible）；
+ * 面板本体不再向 ModalState 注册（注册/注销职责已上收到宿主）。
  */
 @Composable
 fun GlassSheet(
@@ -103,33 +157,6 @@ fun GlassSheet(
     scrollState: ScrollState = rememberScrollState(),
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    val modal = LocalModalState.current
-    // onDismiss 每次重组都是新实例：经 State 转调，注册的回调始终走最新的 onDismiss
-    val latestDismiss by rememberUpdatedState(onDismiss)
-    // 已注册回调实例（register/unregister 须同一实例：ModalState 按实例比对清空 dismiss）
-    var registeredDismiss by remember { mutableStateOf<(() -> Unit)?>(null) }
-    // 打开即注册；关闭时等退场动画播完再注销——提前注销会让 Chrome/控制台在
-    // 退场 sheet 仍可见时提前复位，与面板滑出重叠。退场中途重开先撤掉待注销的旧注册
-    LaunchedEffect(visible) {
-        if (visible) {
-            registeredDismiss?.let(modal::unregister)
-            val dismiss: () -> Unit = { latestDismiss() }
-            registeredDismiss = dismiss
-            modal.register(dismiss)
-        } else if (registeredDismiss != null) {
-            // 退场时长与 AnimatedVisibility 的 exit 同源（tweenPage）
-            delay(GlassMotion.tweenPage<Float>().durationMillis.toLong())
-            registeredDismiss?.let(modal::unregister)
-            registeredDismiss = null
-        }
-    }
-    // 面板随宿主整体离场（无退场动画，如单曲面板收进 null 态卸载）：立即注销兜底
-    DisposableEffect(Unit) {
-        onDispose {
-            registeredDismiss?.let(modal::unregister)
-            registeredDismiss = null
-        }
-    }
     AnimatedVisibility(
         visible = visible,
         enter = fadeIn(GlassMotion.tweenPage()) +

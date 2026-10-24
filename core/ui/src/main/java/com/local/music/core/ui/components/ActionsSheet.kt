@@ -3,26 +3,32 @@ package com.local.music.core.ui.components
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -318,6 +324,84 @@ fun CollectionActionsSheet(
             subtitle = if (newName.isBlank()) "先输入名称" else "「${newName.trim()}」",
             emphasized = newName.isNotBlank(),
             onClick = { commitRename() },
+        )
+    }
+}
+
+/**
+ * 「添加歌曲」面板（歌单选歌，与 AddToPlaylistSheet 的「歌选歌单」方向相反，不在菜单唯一实现约束内）：
+ * 顶部搜索过滤（纯标题/艺术家包含匹配，同 searchScope 模式）+ 全曲库多选
+ * （LazyColumn 懒加载，key = 稳定歌曲 id）；已在歌单的行置灰不可选；
+ * 底部「添加 N 首」经 [onAdd] 一次性提交——mutator 由调用方单点走 addToPlaylist，本组件不写状态。
+ * 经 modal.show 挂根层宿主：每次打开都是新组合，搜索词与选中集天然重置。
+ */
+@Composable
+fun AddSongsSheet(
+    visible: Boolean,
+    onDismiss: () -> Unit,
+    state: AppState,
+    playlistId: String,
+    existingTracks: List<DemoSong>,
+    onAdd: (List<DemoSong>) -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val selected = remember { mutableStateListOf<String>() }
+    // 已在歌单的曲目 id 集：置灰不可选（id 为 f<路径> 稳定体系，重扫后仍对位）
+    val existingIds = remember(existingTracks) { existingTracks.map { it.id }.toHashSet() }
+    // 排序缓存（键 = library 引用 + 排序档，与曲库页同款）→ 过滤结果二次缓存（避免每次重组整库过滤）
+    val all = remember(state.library, state.songSort) { state.sortedSongs() }
+    val songs = remember(all, query) {
+        val q = query.trim()
+        if (q.isEmpty()) all else all.filter { it.title.contains(q, true) || it.artist.contains(q, true) }
+    }
+    GlassSheet(visible = visible, onDismiss = onDismiss, title = "添加歌曲") {
+        GlassTextField(
+            value = query,
+            onValueChange = { query = it },
+            hint = "搜索歌曲或艺术家",
+        )
+        Spacer(Modifier.height(10.dp))
+        if (songs.isEmpty()) {
+            // 空态：曲库未装载 / 搜索无结果
+            Box(Modifier.fillMaxWidth().height(120.dp), contentAlignment = Alignment.Center) {
+                Text(
+                    if (query.isBlank()) "曲库还没有歌曲" else "没有匹配「${query.trim()}」的歌曲",
+                    color = LocalGlassColors.current.textTertiary, fontSize = 13.sp,
+                )
+            }
+        } else {
+            // 限高列表：GlassSheet 内容列自带 verticalScroll，LazyColumn 须持有界高度才可嵌套
+            LazyColumn(Modifier.fillMaxWidth().heightIn(max = 280.dp)) {
+                items(songs, key = { it.id }) { song ->
+                    val added = song.id in existingIds
+                    SongRow(
+                        song = song,
+                        // 已在歌单：整行降透明度置灰，点击不生效
+                        modifier = if (added) Modifier.graphicsLayer { alpha = 0.38f } else Modifier,
+                        selected = !added && song.id in selected,
+                        trailing = if (added) "已添加" else song.duration,
+                        onClick = {
+                            if (!added) {
+                                if (song.id in selected) selected.remove(song.id) else selected.add(song.id)
+                            }
+                        },
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+        SheetAction(
+            icon = GlassIcons.Plus,
+            label = "添加 ${selected.size} 首",
+            subtitle = if (selected.isEmpty()) "先在上方点选歌曲" else "加入「${state.resolvePlaylist(playlistId)?.title ?: "歌单"}」",
+            emphasized = selected.isNotEmpty(),
+            onClick = {
+                if (selected.isNotEmpty()) {
+                    // 按库序一次性提交（含被当前搜索过滤掉但仍处于选中集的曲目）
+                    onAdd(all.filter { it.id in selected })
+                    onDismiss()
+                }
+            },
         )
     }
 }

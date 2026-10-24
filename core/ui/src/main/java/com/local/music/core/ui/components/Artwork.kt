@@ -187,7 +187,8 @@ fun WaveIndicator(
 /** 曲目：id 供收藏/歌单/队列引用；时长以秒为单源，duration 为显示串。
  *  真曲库文件：mediaUri = MediaStore content uri；coverBitmap = 内嵌封面缩略图；
  *  lyricLines = 同名 .lrc 解析结果（缺省用 DemoCatalog.lyrics 演示歌词）；
- *  格式参数：codec/sampleRateHz/bitDepth/bitrateKbps（0 = 未知，展示时降级）。 */
+ *  格式参数：codec/sampleRateHz/bitDepth/bitrateKbps（0 = 未知，展示时降级）；
+ *  元数据：genre 为扫描真值（空 = 未知流派，分组视图归一展示）；year/trackNo 取 MediaStore（0 = 未知）。 */
 data class DemoSong(
     val id: String,
     val title: String,
@@ -196,7 +197,9 @@ data class DemoSong(
     val durationSec: Int,
     val art: ArtStyle,
     val folder: String = "音乐",
-    val genre: String = "独立",
+    val genre: String = "",
+    val year: Int = 0,
+    val trackNo: Int = 0,
     val inLibrary: Boolean = true,
     val mediaUri: String? = null,
     val coverBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,

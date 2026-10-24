@@ -18,6 +18,13 @@ import androidx.media3.session.SessionResult
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.local.music.core.ui.state.SongSpec
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * 前台播放服务：ExoPlayer + MediaSession 在此托管。
@@ -25,6 +32,7 @@ import com.local.music.core.ui.state.SongSpec
  * - 锁屏媒体控制 / ColorOS 流体云胶囊读取的就是这个系统媒体会话
  * - 整条播放队列在服务端播放器上：退后台、锁屏、界面销毁后完播仍自动切换
  * - 均衡器：android.media.audiofx.Equalizer 挂在播放器音频会话上，预设经自定义命令下发
+ * - 定时关闭：分钟档协程到点暂停；播完当前首/队列由播放器监听承接（服务端权威）
  */
 class MusicPlaybackService : MediaSessionService() {
 
@@ -32,6 +40,12 @@ class MusicPlaybackService : MediaSessionService() {
     private var equalizer: Equalizer? = null
     private var eqSessionId = 0 // 均衡器绑定的音频会话（设备切换会变化，需重建）
     private var lastPreset = "Off" // 最近一次请求的预设（音频会话就绪后重放）
+
+    // 定时关闭（不持久化）：分钟档协程 + 播完档旗标；重复下发新定时先取消旧协程/清旗标
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var sleepJob: Job? = null
+    private var stopAfterCurrent = false // -1 档：切到下一首的瞬间暂停
+    private var stopAtQueueEnd = false // -2 档：队列自然播完（ENDED）暂停
 
     override fun onCreate() {
         super.onCreate()
@@ -49,7 +63,7 @@ class MusicPlaybackService : MediaSessionService() {
         mediaSession = MediaSession.Builder(this, player)
             .setCallback(
                 object : MediaSession.Callback {
-                    // 自定义命令必须在此声明，否则控制器 sendCustomCommand 被拒（EQ 预设 / shuffle 插入修正共用此通道）
+                    // 自定义命令必须在此声明，否则控制器 sendCustomCommand 被拒（EQ 预设 / shuffle 插入修正 / 定时关闭共用此通道）
                     override fun onConnect(
                         session: MediaSession,
                         controller: MediaSession.ControllerInfo,
@@ -57,6 +71,7 @@ class MusicPlaybackService : MediaSessionService() {
                         val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
                             .add(SessionCommand(CMD_SET_EQ, Bundle.EMPTY))
                             .add(SessionCommand(CMD_INSERT_SHUFFLE_FIX, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_SET_SLEEP_TIMER, Bundle.EMPTY))
                             .build()
                         return MediaSession.ConnectionResult.accept(
                             sessionCommands,
@@ -76,6 +91,8 @@ class MusicPlaybackService : MediaSessionService() {
                         }
                         if (customCommand.customAction == CMD_SET_EQ) {
                             applyEqPreset(args.getString(KEY_PRESET))
+                        } else if (customCommand.customAction == CMD_SET_SLEEP_TIMER) {
+                            applySleepTimer(args.getInt(KEY_SLEEP_MODE, 0))
                         } else if (customCommand.customAction == CMD_INSERT_SHUFFLE_FIX) {
                             @Suppress("DEPRECATION", "UNCHECKED_CAST")
                             val specs = args.getSerializable(KEY_SPECS) as? ArrayList<SongSpec>
@@ -95,13 +112,27 @@ class MusicPlaybackService : MediaSessionService() {
                 },
             )
             .build()
-        // 音频会话 id 在解码器首次初始化（首个 READY）才有值：到点补挂均衡器并重放最后预设
+        // 音频会话 id 在解码器首次初始化（首个 READY）才有值：到点补挂均衡器并重放最后预设；
+        // 定时关闭「播完档」的暂停触发也在这个监听（播放器事件只在服务端可见）
         player.addListener(
             object : Player.Listener {
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     if (playbackState == Player.STATE_READY) {
                         runCatching { ensureEqualizer(player.audioSessionId) }
                         applyEqPreset(lastPreset)
+                    } else if (playbackState == Player.STATE_ENDED && stopAtQueueEnd) {
+                        // -2 档「播完整个队列」：自然播完（ENDED）即暂停并清旗标。
+                        // repeatAll 开着时播放器回绕、永不 ENDED，该档等价不触发（符合语义，不管）
+                        stopAtQueueEnd = false
+                        player.pause()
+                    }
+                }
+
+                override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    // -1 档「播完当前首」：切到下一首的瞬间暂停并清旗标（手动切歌同此瞬间，一并承接）
+                    if (stopAfterCurrent) {
+                        stopAfterCurrent = false
+                        player.pause()
                     }
                 }
             },
@@ -183,6 +214,30 @@ class MusicPlaybackService : MediaSessionService() {
         if (equalizer != null) applyEqPreset(lastPreset)
     }
 
+    /**
+     * 定时关闭（服务端权威）：mode > 0 = N 分钟后暂停（协程 delay 到点）；
+     * -1 = 播完当前首（播放器切歌瞬间暂停）；-2 = 播完整个队列（ENDED 暂停）；0 = 取消。
+     * 重复下发新定时先取消旧协程/清旗标；到点执行后引用就地清理，随服务销毁整体取消。
+     */
+    private fun applySleepTimer(modeMinutes: Int) {
+        sleepJob?.cancel()
+        sleepJob = null
+        stopAfterCurrent = false
+        stopAtQueueEnd = false
+        when {
+            modeMinutes > 0 -> {
+                sleepJob = serviceScope.launch {
+                    delay(modeMinutes * 60_000L)
+                    mediaSession?.player?.pause()
+                    sleepJob = null // 到点执行完清理引用（被 cancel 时走不到这里，不会误清新定时）
+                }
+            }
+            modeMinutes == -1 -> stopAfterCurrent = true
+            modeMinutes == -2 -> stopAtQueueEnd = true
+            // 0 = 取消：旧协程与旗标已在上方清理
+        }
+    }
+
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -193,6 +248,7 @@ class MusicPlaybackService : MediaSessionService() {
     }
 
     override fun onDestroy() {
+        serviceScope.cancel() // 定时关闭协程随作用域取消，无泄漏
         runCatching { equalizer?.release() }
         equalizer = null
         mediaSession?.run {
@@ -215,6 +271,10 @@ class MusicPlaybackService : MediaSessionService() {
         const val KEY_PIN_MODE = "pinMode"
         const val PIN_NEXT = "next"
         const val PIN_LAST = "last"
+
+        /** UI → 服务的定时关闭命令：KEY_SLEEP_MODE 分钟数（>0=N 分钟后暂停；-1=播完当前首；-2=播完队列；0=取消） */
+        const val CMD_SET_SLEEP_TIMER = "com.local.music.SET_SLEEP_TIMER"
+        const val KEY_SLEEP_MODE = "sleepMode"
 
         private const val GAIN_STEPS = 5
 

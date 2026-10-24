@@ -17,6 +17,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -25,35 +26,41 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.GlassLevel
-import com.local.music.core.ui.components.GlassSheet
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassToggle
+import com.local.music.core.ui.components.LocalModalState
+import com.local.music.core.ui.components.ModalSheet
 import com.local.music.core.ui.components.PageHeader
 import com.local.music.core.ui.components.ProgressTrack
 import com.local.music.core.ui.components.SectionHeader
 import com.local.music.core.ui.components.SettingRow
 import com.local.music.core.ui.components.SheetAction
+import com.local.music.core.ui.components.asTime
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.EqPreset
 import com.local.music.core.ui.state.GlassScreen
+import com.local.music.core.ui.state.SleepTimerOptions
+import com.local.music.core.ui.state.sleepTimerLabel
+import com.local.music.core.ui.state.sleepTimerSubtitle
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassIntensity
 import com.local.music.core.ui.theme.MotionIntensity
 import com.local.music.core.ui.theme.LocalGlassColors
-
-/** 设置页内底部面板 */
-private enum class SettingsSheet { Glass, Motion, Eq, Folders }
+import kotlinx.coroutines.delay
 
 /**
  * 设置：外观 / 播放 / 曲库 三组玻璃卡。全部接入 AppState——
  * 取色与歌词开关实时生效；玻璃/动效强度改全局 token；均衡器经服务端 Equalizer 生效；
  * 扫描入口真实重扫 MediaStore；文件夹过滤选项从当前曲库派生。
+ * 五个面板（更新/玻璃/动效/均衡器/文件夹）经 LocalModalState.show 挂 GlassApp 根层宿主
+ * （屏内不再渲染 GlassSheet）。
  */
 @Composable
 fun SettingsScreen(
     state: AppState,
     onRescan: (onDone: () -> Unit) -> Unit = { it() },
-    update: UpdateUiState = UpdateUiState(),
+    // getter 形态：更新面板挂根层宿主后，进度/状态须活读 snapshot 态才能持续刷新
+    update: () -> UpdateUiState = { UpdateUiState() },
     currentVersionName: String = "",
     onCheckUpdate: () -> Unit = {},
     onStartUpdate: () -> Unit = {},
@@ -62,13 +69,33 @@ fun SettingsScreen(
     onAllFilesAccess: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    var sheet by remember { mutableStateOf<SettingsSheet?>(null) }
-    var showUpdateSheet by remember { mutableStateOf(false) }
     var scanning by remember { mutableStateOf(false) }
+    // 模态面板宿主（GlassApp 根层）
+    val modal = LocalModalState.current
+    // 更新面板的可见语义组：状态滑出该组（下载失败等）即自动收起（与旧 visible 条件等价）
+    val updateSheetStatuses = setOf(
+        UpdateUiState.Status.Available, UpdateUiState.Status.Downloading, UpdateUiState.Status.ReadyToInstall,
+    )
 
     // 扫描完成（曲库对象被整体替换）后结束扫描态
     LaunchedEffect(state.library) {
         if (scanning) scanning = false
+    }
+
+    // 定时关闭行副标题：每秒读一次剩余秒数做倒计时（分钟档到点后 effectiveSleepTimerMode 按期限归零）
+    var sleepRemainingSec by remember { mutableIntStateOf(0) }
+    LaunchedEffect(state.sleepTimerDeadlineMs) {
+        while (true) {
+            sleepRemainingSec = state.sleepTimerRemainingSec() ?: 0
+            delay(1000)
+        }
+    }
+    val sleepActiveMode = state.effectiveSleepTimerMode()
+    val sleepSubtitle = when {
+        sleepActiveMode > 0 -> "剩余 ${sleepRemainingSec.asTime()}（${sleepTimerLabel(sleepActiveMode)}）"
+        sleepActiveMode == -1 -> "播完当前首后暂停"
+        sleepActiveMode == -2 -> "播完整个队列后暂停"
+        else -> "未开启"
     }
 
     // 无自有 haze source：本屏内容与面板均无 hazeEffect 消费（面板挂 app 级），整屏录制纯开销
@@ -89,12 +116,54 @@ fun SettingsScreen(
                 RowDivider()
                 SettingRow(
                     GlassIcons.Book, "玻璃强度", "${state.glassLevel.label}（可改通透 / 浓郁）",
-                    onClick = { sheet = SettingsSheet.Glass },
+                    onClick = {
+                        modal.show {
+                            ModalSheet(modal, "玻璃强度") {
+                                GlassIntensity.entries.forEach { level ->
+                                    SheetAction(
+                                        icon = GlassIcons.Book,
+                                        label = level.label,
+                                        subtitle = when (level) {
+                                            GlassIntensity.Transparent -> "填充与描边减淡，更通透"
+                                            GlassIntensity.Standard -> "设计稿默认档位"
+                                            GlassIntensity.Rich -> "填充加浓，玻璃感更强"
+                                        },
+                                        emphasized = state.glassLevel == level,
+                                        onClick = {
+                                            state.glassLevel = level
+                                            modal.requestDismiss()
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    },
                 )
                 RowDivider()
                 SettingRow(
                     GlassIcons.Gear, "动效强度", "${state.motionLevel.label}（可改克制 / 增强）",
-                    onClick = { sheet = SettingsSheet.Motion },
+                    onClick = {
+                        modal.show {
+                            ModalSheet(modal, "动效强度") {
+                                MotionIntensity.entries.forEach { level ->
+                                    SheetAction(
+                                        icon = GlassIcons.Gear,
+                                        label = level.label,
+                                        subtitle = when (level) {
+                                            MotionIntensity.Restrained -> "过渡更快（×0.6）"
+                                            MotionIntensity.Standard -> "设计稿默认档位"
+                                            MotionIntensity.Enhanced -> "过渡更绵长（×1.4）"
+                                        },
+                                        emphasized = state.motionLevel == level,
+                                        onClick = {
+                                            state.motionLevel = level
+                                            modal.requestDismiss()
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    },
                 )
             }
 
@@ -102,7 +171,47 @@ fun SettingsScreen(
             SettingsCard {
                 SettingRow(
                     GlassIcons.Wave, "均衡器", state.eqPreset.label,
-                    onClick = { sheet = SettingsSheet.Eq },
+                    onClick = {
+                        modal.show {
+                            ModalSheet(modal, "均衡器") {
+                                EqPreset.entries.forEach { preset ->
+                                    SheetAction(
+                                        icon = GlassIcons.Wave,
+                                        label = preset.label,
+                                        subtitle = if (preset == EqPreset.Off) "不启用音效" else "预设 · 实时生效",
+                                        emphasized = state.eqPreset == preset,
+                                        onClick = {
+                                            state.selectEqPreset(preset) // 立即下发服务端 Equalizer
+                                            modal.requestDismiss()
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    },
+                )
+                RowDivider()
+                SettingRow(
+                    GlassIcons.Moon, "定时关闭", sleepSubtitle,
+                    onClick = {
+                        modal.show {
+                            ModalSheet(modal, "定时关闭") {
+                                val activeMode = state.effectiveSleepTimerMode()
+                                SleepTimerOptions.forEach { option ->
+                                    SheetAction(
+                                        icon = GlassIcons.Moon,
+                                        label = sleepTimerLabel(option),
+                                        subtitle = sleepTimerSubtitle(option, activeMode, sleepRemainingSec),
+                                        emphasized = option == activeMode,
+                                        onClick = {
+                                            state.setSleepTimer(option)
+                                            modal.requestDismiss()
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    },
                 )
                 RowDivider()
                 SettingRow(
@@ -127,7 +236,25 @@ fun SettingsScreen(
                 SettingRow(
                     GlassIcons.Folder, "过滤文件夹",
                     "${state.excludedFolders.size} 个目录已排除",
-                    onClick = { sheet = SettingsSheet.Folders },
+                    onClick = {
+                        modal.show {
+                            ModalSheet(modal, "过滤文件夹") {
+                                state.folderOptions().forEach { (folder, count) ->
+                                    val excluded = folder in state.excludedFolders
+                                    SheetAction(
+                                        icon = GlassIcons.Folder,
+                                        label = folder,
+                                        subtitle = "$count 首",
+                                        emphasized = excluded,
+                                        onClick = {
+                                            if (excluded) state.excludedFolders.remove(folder) else state.excludedFolders.add(folder)
+                                        },
+                                    )
+                                }
+                                SheetAction(icon = GlassIcons.Down, label = "完成", onClick = modal::requestDismiss)
+                            }
+                        }
+                    },
                 )
                 RowDivider()
                 SettingRow(
@@ -147,32 +274,82 @@ fun SettingsScreen(
 
             SectionHeader("关于")
             SettingsCard {
-                val updateSubtitle = when (update.status) {
+                val updateState = update()
+                val updateSubtitle = when (updateState.status) {
                     UpdateUiState.Status.Idle ->
                         if (currentVersionName.isEmpty()) "检查新版本" else "当前 v$currentVersionName · 检查新版本"
                     UpdateUiState.Status.Checking -> "正在检查…"
                     UpdateUiState.Status.UpToDate -> "已是最新版本"
                     UpdateUiState.Status.Available ->
-                        "发现新版本 v${update.versionName}，点击更新"
+                        "发现新版本 v${updateState.versionName}，点击更新"
                     UpdateUiState.Status.Downloading ->
-                        "下载中 ${(update.progress * 100).toInt()}%"
+                        "下载中 ${(updateState.progress * 100).toInt()}%"
                     UpdateUiState.Status.ReadyToInstall ->
-                        "已下载 v${update.versionName}，点击安装"
+                        "已下载 v${updateState.versionName}，点击安装"
                     UpdateUiState.Status.Failed ->
                         // 下载链路的失败由既态 copy 而来（versionName 已带上新版本），与检查失败区分
-                        if (update.versionName != null) "下载失败（${update.message ?: "网络异常"}），点击重试"
-                        else "检查失败（${update.message ?: "网络异常"}），点击重试"
+                        if (updateState.versionName != null) "下载失败（${updateState.message ?: "网络异常"}），点击重试"
+                        else "检查失败（${updateState.message ?: "网络异常"}），点击重试"
                 }
                 SettingRow(
                     GlassIcons.Down, "检查更新", updateSubtitle,
                     onClick = {
-                        when (update.status) {
+                        when (update().status) {
                             UpdateUiState.Status.Available, UpdateUiState.Status.Downloading,
                             UpdateUiState.Status.ReadyToInstall,
-                            -> showUpdateSheet = true
+                            -> modal.show {
+                                val current = update()
+                                // 状态滑出面板语义组（下载失败转 Failed 等）自动收起：
+                                // 与旧「visible 条件出组即关」的时序等价（退场动画照常播放）
+                                LaunchedEffect(current.status) {
+                                    if (current.status !in updateSheetStatuses) modal.requestDismiss()
+                                }
+                                ModalSheet(
+                                    modal,
+                                    if (current.versionName != null) "更新到 v${current.versionName}" else "更新",
+                                ) {
+                                    if (current.changelog != null) {
+                                        Text(
+                                            current.changelog,
+                                            color = LocalGlassColors.current.textSecondary,
+                                            fontSize = 13.sp,
+                                            lineHeight = 20.sp,
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
+                                        )
+                                    }
+                                    Spacer(Modifier.height(6.dp))
+                                    if (current.status == UpdateUiState.Status.Downloading) {
+                                        ProgressTrack(progress = current.progress, onSeek = {})
+                                        Text(
+                                            "下载中 ${(current.progress * 100).toInt()}%，完成后自动打开安装程序",
+                                            color = LocalGlassColors.current.textTertiary, fontSize = 11.5.sp,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
+                                        )
+                                    } else {
+                                        SheetAction(
+                                            icon = GlassIcons.Down,
+                                            label = when (current.status) {
+                                                UpdateUiState.Status.ReadyToInstall -> "安装已下载的更新"
+                                                else -> "立即更新"
+                                            },
+                                            subtitle = when (current.status) {
+                                                UpdateUiState.Status.ReadyToInstall -> "无需重新下载"
+                                                else -> "下载完成后自动打开安装程序"
+                                            },
+                                            onClick = {
+                                                if (current.status == UpdateUiState.Status.ReadyToInstall) {
+                                                    onInstallUpdate()
+                                                } else {
+                                                    onStartUpdate()
+                                                }
+                                            },
+                                        )
+                                    }
+                                }
+                            }
                             // 曾进入下载阶段的失败（versionName 已带上新版本）：重试直接重新下载，不再重新检查
                             UpdateUiState.Status.Failed ->
-                                if (update.versionName != null) onStartUpdate() else onCheckUpdate()
+                                if (update().versionName != null) onStartUpdate() else onCheckUpdate()
                             else -> onCheckUpdate()
                         }
                     },
@@ -181,123 +358,6 @@ fun SettingsScreen(
             // 底部避让：悬浮 Chrome（迷你条+导航 ≈ 138dp）+ 手势条
             Spacer(Modifier.navigationBarsPadding().height(146.dp))
             }
-    }
-
-    // ── 更新面板（changelog + 进度 + 一键更新）──────────────
-    GlassSheet(
-        visible = showUpdateSheet && update.status in setOf(
-            UpdateUiState.Status.Available, UpdateUiState.Status.Downloading, UpdateUiState.Status.ReadyToInstall,
-        ),
-        onDismiss = { showUpdateSheet = false },
-        title = if (update.versionName != null) "更新到 v${update.versionName}" else "更新",
-    ) {
-        if (update.changelog != null) {
-            Text(
-                update.changelog,
-                color = LocalGlassColors.current.textSecondary,
-                fontSize = 13.sp,
-                lineHeight = 20.sp,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
-            )
-        }
-        Spacer(Modifier.height(6.dp))
-        if (update.status == UpdateUiState.Status.Downloading) {
-            ProgressTrack(progress = update.progress, onSeek = {})
-            Text(
-                "下载中 ${(update.progress * 100).toInt()}%，完成后自动打开安装程序",
-                color = LocalGlassColors.current.textTertiary, fontSize = 11.5.sp,
-                modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
-            )
-        } else {
-            SheetAction(
-                icon = GlassIcons.Down,
-                label = when (update.status) {
-                    UpdateUiState.Status.ReadyToInstall -> "安装已下载的更新"
-                    else -> "立即更新"
-                },
-                subtitle = when (update.status) {
-                    UpdateUiState.Status.ReadyToInstall -> "无需重新下载"
-                    else -> "下载完成后自动打开安装程序"
-                },
-                onClick = {
-                    if (update.status == UpdateUiState.Status.ReadyToInstall) {
-                        onInstallUpdate()
-                    } else {
-                        onStartUpdate()
-                    }
-                },
-            )
-        }
-    }
-
-    // ── 玻璃强度（三档，改全局玻璃 token）──────────────────
-    GlassSheet(visible = sheet == SettingsSheet.Glass, onDismiss = { sheet = null }, title = "玻璃强度") {
-        GlassIntensity.entries.forEach { level ->
-            SheetAction(
-                icon = GlassIcons.Book,
-                label = level.label,
-                subtitle = when (level) {
-                    GlassIntensity.Transparent -> "填充与描边减淡，更通透"
-                    GlassIntensity.Standard -> "设计稿默认档位"
-                    GlassIntensity.Rich -> "填充加浓，玻璃感更强"
-                },
-                emphasized = state.glassLevel == level,
-                onClick = {
-                    state.glassLevel = level
-                    sheet = null
-                },
-            )
-        }
-    }
-    // ── 动效强度（三档，缩放全局过渡时长）────────────────────
-    GlassSheet(visible = sheet == SettingsSheet.Motion, onDismiss = { sheet = null }, title = "动效强度") {
-        MotionIntensity.entries.forEach { level ->
-            SheetAction(
-                icon = GlassIcons.Gear,
-                label = level.label,
-                subtitle = when (level) {
-                    MotionIntensity.Restrained -> "过渡更快（×0.6）"
-                    MotionIntensity.Standard -> "设计稿默认档位"
-                    MotionIntensity.Enhanced -> "过渡更绵长（×1.4）"
-                },
-                emphasized = state.motionLevel == level,
-                onClick = {
-                    state.motionLevel = level
-                    sheet = null
-                },
-            )
-        }
-    }
-    // ── 均衡器（预设选择，经服务端 Equalizer 实时生效）───────
-    GlassSheet(visible = sheet == SettingsSheet.Eq, onDismiss = { sheet = null }, title = "均衡器") {
-        EqPreset.entries.forEach { preset ->
-            SheetAction(
-                icon = GlassIcons.Wave,
-                label = preset.label,
-                subtitle = if (preset == EqPreset.Off) "不启用音效" else "预设 · 实时生效",
-                emphasized = state.eqPreset == preset,
-                onClick = {
-                    state.selectEqPreset(preset) // 立即下发服务端 Equalizer
-                    sheet = null
-                },
-            )
-        }
-    }
-    // ── 过滤文件夹（多选，从当前曲库派生；曲库「文件夹」tab 同步隐藏）─────────
-    GlassSheet(visible = sheet == SettingsSheet.Folders, onDismiss = { sheet = null }, title = "过滤文件夹") {
-        state.folderOptions().forEach { (folder, count) ->
-            val excluded = folder in state.excludedFolders
-            SheetAction(
-                icon = GlassIcons.Folder,
-                label = folder,
-                subtitle = "$count 首",
-                emphasized = excluded,
-                onClick = {
-                    if (excluded) state.excludedFolders.remove(folder) else state.excludedFolders.add(folder)
-                },
-            )
-        }
-        SheetAction(icon = GlassIcons.Down, label = "完成", onClick = { sheet = null })
     }
 }
 

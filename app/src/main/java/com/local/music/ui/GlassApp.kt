@@ -64,6 +64,7 @@ import com.local.music.core.ui.components.FlightKeys
 import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.components.LocalModalState
 import com.local.music.core.ui.components.LocalPlayerFlight
+import com.local.music.core.ui.components.ModalSheetHost
 import com.local.music.core.ui.components.ModalState
 import com.local.music.core.ui.components.PlayerFlight
 import com.local.music.core.ui.components.asTime
@@ -312,6 +313,14 @@ fun GlassApp() {
         }
     }
 
+    // 面板不跨屏存活（旧结构面板随屏卸载的等价语义）：切屏即请求关闭。
+    // 覆盖唯一无 scrim 拦截的入口——详情/搜索页 alpha=0 让位的悬浮 Chrome 仍可点击
+    // （graphicsLayer 只隐不挡触摸），其飞行进入播放页时面板由此在幕后收场；
+    // 面板自身动作触发的切屏（如集合面板「全部播放」）已先 requestDismiss，此处为 no-op
+    LaunchedEffect(state.screen) {
+        if (modalState.isOpen) modalState.requestDismiss()
+    }
+
     CompositionLocalProvider(LocalModalState provides modalState, LocalPlayerFlight provides flight) {
         GlassTheme(
             palette = state.palette,
@@ -402,7 +411,9 @@ fun GlassApp() {
                                     GlassScreen.Settings -> SettingsScreen(
                                         state,
                                         onRescan = { onDone -> loadRealLibrary(onDone) },
-                                        update = updateManager.state,
+                                        // getter 形态：更新面板经 modal.show 挂根层宿主后，
+                                        // 只有活读 snapshot 态才能在宿主作用域持续收到下载进度
+                                        update = { updateManager.state },
                                         currentVersionName = remember {
                                             try {
                                                 context.packageManager
@@ -461,6 +472,15 @@ fun GlassApp() {
                                 onNext = { state.next() },
                                 modifier = Modifier.align(Alignment.BottomCenter),
                             )
+                        }
+
+                        // ── 模态面板宿主：全 App GlassSheet 的唯一挂载点 ──
+                        // 内容区 hazeSource 的兄弟层（z 序在 Chrome 之后）：面板玻璃不再位于
+                        // app 级源子树内（铁律①），scrim 全屏盖住内容与各屏自绘 Chrome，
+                        // 消费的模糊源统一为 app 级（appHazeState）。
+                        // 飞行期不渲染：结构性保证「飞行期无面板」（旧设计=屏内 sheet 随屏卸载）
+                        if (!flight.isActive) {
+                            ModalSheetHost(modalState)
                         }
                     }
 

@@ -186,7 +186,8 @@ fun GlassTabs(
 
 /** 歌曲行：48dp 圆角12 缩略图 + 标题/副标题 + 时长或播放波形（.row）
  *  onMoreClick 提供时"更多"是独立按钮；onRemoveClick（队列行）与 onLongClick（操作菜单）同理。
- *  onRemoveClick 优先级高于 onMoreClick（队列行不需要菜单，只要移除）。 */
+ *  onRemoveClick 优先级高于 onMoreClick（队列行不需要菜单，只要移除）。
+ *  selected = 多选选中态（添加歌曲面板）：标题走强调色、尾部「已选」标记替换时长。 */
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun SongRow(
@@ -200,6 +201,7 @@ fun SongRow(
     onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit = {},
     wavePlaying: Boolean = true,
+    selected: Boolean = false,
 ) {
     val palette = LocalAuroraPalette.current
     val interactionSource = remember { MutableInteractionSource() }
@@ -235,8 +237,8 @@ fun SongRow(
             Text(
                 song.title, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                // 播放态强调色用 auroraAccentColor()（浅色回退 seed）：seed3 过浅压不住浅色背景
-                color = if (playing) auroraAccentColor() else LocalGlassColors.current.textPrimary,
+                // 播放/选中态强调色用 auroraAccentColor()（浅色回退 seed）：seed3 过浅压不住浅色背景
+                color = if (playing || selected) auroraAccentColor() else LocalGlassColors.current.textPrimary,
             )
             Spacer(Modifier.height(2.dp))
             Text(song.subtitle, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary,
@@ -244,6 +246,8 @@ fun SongRow(
         }
         if (playing) {
             WaveIndicator(barCount = 4, playing = wavePlaying)
+        } else if (selected) {
+            Text("已选", fontSize = 12.sp, color = auroraAccentColor(), fontWeight = FontWeight.Medium)
         } else if (onMoreClick != null) {
             // "更多"是独立触点：不再吞进整行的播放点击
             Box(

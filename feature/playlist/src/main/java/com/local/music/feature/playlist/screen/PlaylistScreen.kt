@@ -37,10 +37,11 @@ import com.local.music.core.ui.components.CollectionActionsSheet
 import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.DetailTarget
-import com.local.music.core.ui.components.GlassSheet
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassTextField
+import com.local.music.core.ui.components.LocalModalState
+import com.local.music.core.ui.components.ModalSheet
 import com.local.music.core.ui.components.PageHeader
 import com.local.music.core.ui.components.PlaylistCard
 import com.local.music.core.ui.components.SectionHeader
@@ -54,12 +55,32 @@ import com.local.music.core.ui.theme.LocalGlassColors
 /**
  * 歌单库：2×2 玻璃封面墙（常驻 + 用户自建，各自带参进详情，长按 = 集合操作面板）
  * + 「我喜欢的 / 最近播放」动态卡；＋ 新建歌单（命名面板）。
+ * 全部面板经 LocalModalState.show 挂 GlassApp 根层宿主（屏内不再渲染 GlassSheet）。
  */
 @Composable
 fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
-    var showCreate by remember { mutableStateOf(false) }
+    // 命名草稿：remember 于本屏，面板 show 后经闭包活读写（重开保留上次草稿，同旧行为）
     var newName by remember { mutableStateOf("") }
-    var collectionMenu by remember { mutableStateOf<CollectionMenuData?>(null) }
+    // 模态面板宿主（GlassApp 根层）：新建歌单/集合面板经 show 挂载
+    val modal = LocalModalState.current
+
+    // 集合操作面板（目标/标题/曲目锁定长按时刻值，播放行为与旧实现一致：入队后进播放页）
+    fun collectionActions(target: DetailTarget, title: String, tracks: List<DemoSong>) {
+        modal.show {
+            CollectionActionsSheet(
+                visible = modal.visible,
+                onDismiss = modal::requestDismiss,
+                state = state,
+                target = target,
+                title = title,
+                tracks = tracks,
+                onPlayAll = { shuffle ->
+                    state.playCollection(tracks, title, shuffle)
+                    state.screen = GlassScreen.Player
+                },
+            )
+        }
+    }
 
     // 无自有 haze source：本屏内容与面板均无 hazeEffect 消费（面板挂 app 级），整屏录制纯开销
     Column(modifier.fillMaxSize().statusBarsPadding()) {
@@ -68,7 +89,40 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                 .weight(1f)
                 .verticalScroll(rememberScrollState()),
         ) {
-            PageHeader(title = "歌单", actionIcon = GlassIcons.Plus, onAction = { showCreate = true })
+            PageHeader(title = "歌单", actionIcon = GlassIcons.Plus, onAction = {
+                // 新建歌单面板（含输入框：GlassSheet 的 imePadding 让其浮在键盘之上，机制不动）
+                modal.show {
+                    ModalSheet(modal, "新建歌单") {
+                        GlassTextField(
+                            value = newName,
+                            onValueChange = { newName = it },
+                            hint = "歌单名称",
+                            leading = null,
+                            onSearch = {
+                                if (newName.isNotBlank()) {
+                                    state.createPlaylist(newName)
+                                    newName = ""
+                                    modal.requestDismiss()
+                                }
+                            },
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        SheetAction(
+                            icon = GlassIcons.Plus,
+                            label = "创建歌单",
+                            subtitle = if (newName.isBlank()) "先输入名称" else "「${newName.trim()}」",
+                            emphasized = newName.isNotBlank(),
+                            onClick = {
+                                if (newName.isNotBlank()) {
+                                    state.createPlaylist(newName)
+                                    newName = ""
+                                    modal.requestDismiss()
+                                }
+                            },
+                        )
+                    }
+                }
+            })
             // 玻璃封面墙（内建歌单已被删除的不再显示）
             (state.visibleBuiltInPlaylists() + state.userPlaylists).chunked(2).forEach { pair ->
                 Row(
@@ -82,7 +136,7 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                                 state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, playlist.id))
                             },
                             onLongClick = {
-                                collectionMenu = CollectionMenuData(
+                                collectionActions(
                                     DetailTarget(DetailTarget.Kind.Playlist, playlist.id),
                                     playlist.title,
                                     state.resolvePlaylist(playlist.id)?.tracks.orEmpty(),
@@ -105,7 +159,7 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                         "我喜欢的音乐", "${state.resolvedFavorites.size} 首", ArtStyle.Room,
                         onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.FavoritesId)) },
                         onLongClick = {
-                            collectionMenu = CollectionMenuData(
+                            collectionActions(
                                 DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.FavoritesId),
                                 "我喜欢的音乐",
                                 state.resolvedFavorites,
@@ -117,7 +171,7 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                         "最近播放", "${state.resolvePlaylist(DemoCatalog.RecentId)?.tracks?.size ?: 0} 首", ArtStyle.Afternoon,
                         onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.RecentId)) },
                         onLongClick = {
-                            collectionMenu = CollectionMenuData(
+                            collectionActions(
                                 DetailTarget(DetailTarget.Kind.Playlist, DemoCatalog.RecentId),
                                 "最近播放",
                                 state.resolvePlaylist(DemoCatalog.RecentId)?.tracks.orEmpty(),
@@ -129,61 +183,7 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
             Spacer(Modifier.navigationBarsPadding().height(146.dp))
             }
     }
-
-    // 新建歌单面板
-    GlassSheet(visible = showCreate, onDismiss = { showCreate = false }, title = "新建歌单") {
-        GlassTextField(
-            value = newName,
-            onValueChange = { newName = it },
-            hint = "歌单名称",
-            leading = null,
-            onSearch = {
-                if (newName.isNotBlank()) {
-                    state.createPlaylist(newName)
-                    newName = ""
-                    showCreate = false
-                }
-            },
-        )
-        Spacer(Modifier.height(8.dp))
-        SheetAction(
-            icon = GlassIcons.Plus,
-            label = "创建歌单",
-            subtitle = if (newName.isBlank()) "先输入名称" else "「${newName.trim()}」",
-            emphasized = newName.isNotBlank(),
-            onClick = {
-                if (newName.isNotBlank()) {
-                    state.createPlaylist(newName)
-                    newName = ""
-                    showCreate = false
-                }
-            },
-        )
-    }
-
-    // 集合操作面板（歌单卡 / 动态卡的长按入口）
-    collectionMenu?.let { menu ->
-        CollectionActionsSheet(
-            visible = true,
-            onDismiss = { collectionMenu = null },
-            state = state,
-            target = menu.target,
-            title = menu.title,
-            tracks = menu.tracks,
-            onPlayAll = { shuffle ->
-                state.playCollection(menu.tracks, menu.title, shuffle)
-                state.screen = GlassScreen.Player
-            },
-        )
-    }
 }
-
-/** 卡片长按的集合菜单数据（同 LibraryScreen 的局部形态，歌单墙独立持有） */
-private data class CollectionMenuData(
-    val target: DetailTarget,
-    val title: String,
-    val tracks: List<DemoSong>,
-)
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable

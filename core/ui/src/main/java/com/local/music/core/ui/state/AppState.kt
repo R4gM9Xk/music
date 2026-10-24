@@ -3,6 +3,7 @@ package com.local.music.core.ui.state
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -17,6 +18,7 @@ import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.DetailData
 import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.LyricLine
+import com.local.music.core.ui.components.asTime
 import com.local.music.core.ui.theme.AuroraPalette
 import com.local.music.core.ui.theme.GlassIntensity
 import com.local.music.core.ui.theme.GlassPalettes
@@ -53,6 +55,8 @@ data class AppStateSnapshot(
     val songSort: String = SongSort.Title.name, // 歌曲 tab 排序（默认值解码：无版本迁移）
     val shuffleOn: Boolean = false, // 随机模式（v4 起编码，旧版本解码走默认值）
     val repeatMode: String = RepeatMode.Off.name, // 循环模式名（同上）
+    val playbackSpeed: Float = 1.0f, // 播放速度（v5 起编码，旧版本解码走默认值）
+    val scanFilterShort: Boolean = true, // 扫描过滤短音频（v6 起编码，旧版本解码走默认值）
 )
 
 /** 持久化桥接：AppState 只面向它，实现在 app 模块（DataStore） */
@@ -63,6 +67,26 @@ fun interface SnapshotStore {
 /** 均衡器预设：经 MediaSession 自定义命令下发服务端 Equalizer（Off = 关闭音效） */
 enum class EqPreset(val label: String) {
     Off("关闭"), Pop("流行"), Rock("摇滚"), Classic("古典"), Vocal("人声"),
+}
+
+/** 定时关闭档位：分钟数（-1=播完当前首，-2=播完整个队列，0=取消）；顺序即面板展示顺序 */
+val SleepTimerOptions = listOf(15, 30, 60, 90, -1, -2, 0)
+
+/** 定时关闭档位展示名（播放页/设置页两个面板共用） */
+fun sleepTimerLabel(option: Int): String = when {
+    option > 0 -> "$option 分钟"
+    option == -1 -> "播完当前首"
+    option == -2 -> "播完整个队列"
+    else -> "取消定时"
+}
+
+/** 定时关闭选项副标题：生效中项显示进行中语义（分钟档带秒级倒计时），其余无副标题 */
+fun sleepTimerSubtitle(option: Int, activeMode: Int, remainingSec: Int): String? = when {
+    option != activeMode -> null
+    option > 0 -> "剩余 ${remainingSec.asTime()}"
+    option == -1 -> "当前曲播完后暂停"
+    option == -2 -> "整个队列播完后暂停"
+    else -> "未开启"
 }
 
 /** 深浅色模式 */
@@ -127,6 +151,8 @@ interface PlayerEngine {
     fun setRepeatMode(repeatAll: Boolean, repeatOne: Boolean)
     fun setShuffleMode(enabled: Boolean)
     fun setEqPreset(presetName: String)
+    fun setSleepTimer(modeMinutes: Int)
+    fun setPlaybackSpeed(speed: Float)
     fun play()
     fun pause()
     fun seekTo(sec: Float)
@@ -230,6 +256,15 @@ class AppState {
     var playbackError by mutableStateOf<String?>(null)
         private set
 
+    // ── 定时关闭（服务端权威倒计时；本地只留回显状态，不持久化——重启失效合理）──
+    /** 当前定时模式：0=无；>0=N 分钟；-1=播完当前首；-2=播完整个队列 */
+    var sleepTimerMode by mutableIntStateOf(0)
+        private set
+
+    /** 分钟档到期时间戳（epoch ms；0=无分钟级定时）：UI 据此每秒刷新剩余时间 */
+    var sleepTimerDeadlineMs by mutableLongStateOf(0L)
+        private set
+
     // ── 收藏 / 歌单 ───────────────────────────────────────
     val favorites = mutableStateSetOf<String>()
     val userPlaylists = mutableStateListOf<DemoPlaylist>()
@@ -246,10 +281,15 @@ class AppState {
     var glassLevel by mutableStateOf(GlassIntensity.Standard)
     var motionLevel by mutableStateOf(MotionIntensity.Standard)
     var eqPreset by mutableStateOf(EqPreset.Off)
+    var playbackSpeed by mutableFloatStateOf(1f) // 播放速度档（快照 v5 持久化；服务端 Sonic 变速不变调）
+        private set
     var themeMode by mutableStateOf(ThemeMode.Dark)
     var songSort by mutableStateOf(SongSort.Title)
         private set
     val excludedFolders = mutableStateSetOf<String>()
+
+    /** 扫描过滤：默认滤除短于 30 秒的音频（通知音/录音碎片）；切换后需在设置页手动重扫生效（快照 v6 持久化） */
+    var scanFilterShort by mutableStateOf(true)
 
     /** 曲库页排序面板：歌曲 tab 排序（快照持久化） */
     fun selectSongSort(sort: SongSort) {
@@ -394,11 +434,13 @@ class AppState {
         }
     }
 
-    /** 循环 / 随机 / 均衡器 → 服务端播放器（切换即时下发） */
+    /** 循环 / 随机 / 均衡器 / 播放速度 → 服务端播放器（切换即时下发；
+     *  attachPlayer / prepareResume / startCurrent / restore 都经此补同步，速度随队列装载重下发） */
     private fun syncEngineModes(eng: PlayerEngine) {
         eng.setRepeatMode(repeatMode == RepeatMode.All, repeatMode == RepeatMode.One)
         eng.setShuffleMode(shuffleOn)
         eng.setEqPreset(eqPreset.name)
+        eng.setPlaybackSpeed(playbackSpeed)
     }
 
     // ── 持久化：快照 / 恢复 / 存盘调度 ────────────────────
@@ -416,7 +458,7 @@ class AppState {
     /** 设置指纹：GlassApp 用 snapshotFlow 监听设置变更触发存盘 */
     fun settingsKey(): String =
         "$followCover|$lyricEnabled|${glassLevel.name}|${motionLevel.name}|${eqPreset.name}|${themeMode.name}|" +
-            "$shuffleOn|${repeatMode.name}|" +
+            "$shuffleOn|${repeatMode.name}|$playbackSpeed|$scanFilterShort|" +
             excludedFolders.joinToString(",")
 
     fun snapshot(): AppStateSnapshot {
@@ -447,6 +489,8 @@ class AppState {
                 songSort = songSort.name,
                 shuffleOn = shuffleOn,
                 repeatMode = repeatMode.name,
+                playbackSpeed = playbackSpeed,
+                scanFilterShort = scanFilterShort,
             )
         } else {
             AppStateSnapshot(
@@ -472,6 +516,8 @@ class AppState {
                 songSort = songSort.name,
                 shuffleOn = shuffleOn,
                 repeatMode = repeatMode.name,
+                playbackSpeed = playbackSpeed,
+                scanFilterShort = scanFilterShort,
             )
         }
     }
@@ -487,6 +533,8 @@ class AppState {
         songSort = runCatching { SongSort.valueOf(snapshot.songSort) }.getOrDefault(SongSort.Title)
         shuffleOn = snapshot.shuffleOn
         repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeatMode) }.getOrDefault(RepeatMode.Off)
+        playbackSpeed = if (snapshot.playbackSpeed > 0f) snapshot.playbackSpeed else 1f
+        scanFilterShort = snapshot.scanFilterShort // 旧版本（≤v5）无此字段：走默认值 true 零迁移
         excludedFolders.clear()
         excludedFolders.addAll(snapshot.excludedFolders)
         favorites.clear()
@@ -515,7 +563,7 @@ class AppState {
         pendingPlayback = snapshot.queueIds to (snapshot.queueIndex to snapshot.progressSec)
         currentSongIdPending = snapshot.currentSongId
         hydrated = true // 恢复完成：允许存盘
-        // restore 可能晚于 attachPlayer 到达：循环/随机/EQ 就地补同步到服务端（否则引擎停留在默认模式）
+        // restore 可能晚于 attachPlayer 到达：循环/随机/EQ/速度就地补同步到服务端（否则引擎停留在默认模式）
         engine?.let { syncEngineModes(it) }
         // 播放现场不在此处应用：演示 id 不提前解析（防止消费掉真实快照），
         // 统一等 loadLibrary（真曲库装载）后由 applyPendingPlayback 收敛
@@ -880,6 +928,35 @@ class AppState {
         scheduleSave()
     }
 
+    /** 播放速度：立即下发服务端（Media3 原生 Sonic 变速不变调）。
+     *  命名避开 var playbackSpeed 的 JVM setter（setPlaybackSpeed）签名冲突 */
+    fun selectPlaybackSpeed(speed: Float) {
+        playbackSpeed = speed
+        engine?.setPlaybackSpeed(speed)
+        scheduleSave()
+    }
+
+    /** 定时关闭：下发服务端（服务端权威到点暂停）+ 记录本地回显状态。不持久化（重启失效合理） */
+    fun setSleepTimer(modeMinutes: Int) {
+        engine?.setSleepTimer(modeMinutes)
+        sleepTimerMode = modeMinutes
+        sleepTimerDeadlineMs = if (modeMinutes > 0) System.currentTimeMillis() + modeMinutes * 60_000L else 0L
+    }
+
+    /** 生效中的定时模式（面板高亮 / 设置副标题用）：分钟档过了期限视为结束——
+     *  服务端到点自行暂停且无回执，本地按期限推导归零 */
+    fun effectiveSleepTimerMode(): Int {
+        val mode = sleepTimerMode
+        if (mode > 0 && System.currentTimeMillis() >= sleepTimerDeadlineMs) return 0
+        return mode
+    }
+
+    /** 分钟级定时的剩余秒数（非分钟档 = null；已到期钳 0）：UI 每秒读一次驱动倒计时刷新 */
+    fun sleepTimerRemainingSec(): Int? {
+        if (sleepTimerMode <= 0 || sleepTimerDeadlineMs <= 0L) return null
+        return ((sleepTimerDeadlineMs - System.currentTimeMillis()) / 1000L).toInt().coerceAtLeast(0)
+    }
+
     fun cycleRepeat() {
         repeatMode = when (repeatMode) {
             RepeatMode.Off -> RepeatMode.All
@@ -1132,8 +1209,11 @@ class AppState {
         library.filter { it.folder !in excluded }.groupBy { it.folder }
             .map { LibraryGroup(it.key, it.value) }.sortedBy { it.key }
 
+    /** 流派分组：空值归一为「未知流派」（扫描真值为空的歌不落「独立」，统一在此展示归一，
+     *  详情入口 target.id 与分组键同源） */
     fun genreGroups(): List<LibraryGroup> =
-        library.groupBy { it.genre }.map { LibraryGroup(it.key, it.value) }.sortedBy { it.key }
+        library.groupBy { if (it.genre.isBlank()) "未知流派" else it.genre }
+            .map { LibraryGroup(it.key, it.value) }.sortedBy { it.key }
 
     /** 搜索范围：真曲库装载后只搜真曲库；演示模式搜全量演示曲（含「仅搜索可见」的单曲/伴奏） */
     private fun searchScope(): List<DemoSong> = if (realLibraryLoaded) library else DemoData.songs

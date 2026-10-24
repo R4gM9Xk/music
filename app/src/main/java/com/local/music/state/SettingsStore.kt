@@ -3,6 +3,7 @@ package com.local.music.state
 import android.content.Context
 import android.util.Log
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -17,6 +18,7 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -25,10 +27,11 @@ private val Context.appDataStore: androidx.datastore.core.DataStore<Preferences>
 
 /**
  * 持久化实现（DataStore Preferences）：
- * - 快照编码为带版本号的 JSON（v4），歌单名 / 搜索词等用户文本无需转义
+ * - 快照编码为带版本号的 JSON（v6），歌单名 / 搜索词等用户文本无需转义
  * - 旧版控制字符分隔格式（v1）在读取时一次性迁移
  * - schedule 防抖 500ms 写盘；write 失败只记日志（不杀死防抖 collector）；
  *   flush 供退后台 / 关键节点立即落盘
+ * - scanFilterShort 另存独立 Preferences 键：MediaLibrary 扫描不经 AppState 就能读到当前开关（见 readScanFilterShort）
  */
 class SettingsStore(context: Context) : SnapshotStore {
 
@@ -58,7 +61,10 @@ class SettingsStore(context: Context) : SnapshotStore {
 
     private suspend fun write(snapshot: AppStateSnapshot) {
         try {
-            appContext.appDataStore.edit { it[KEY_STATE] = encode(snapshot) }
+            appContext.appDataStore.edit {
+                it[KEY_STATE] = encode(snapshot)
+                it[KEY_SCAN_FILTER_SHORT] = snapshot.scanFilterShort // 与快照原子同写：扫描侧同步读取的单一事实源
+            }
         } catch (e: Exception) {
             // 写失败不能让 collector 协程死亡（否则之后所有 schedule 都不再落盘）
             Log.e(TAG, "snapshot write failed", e)
@@ -68,7 +74,19 @@ class SettingsStore(context: Context) : SnapshotStore {
     companion object {
         private const val TAG = "SettingsStore"
         private val KEY_STATE = stringPreferencesKey("app_state_snapshot")
-        private const val VERSION = 4
+        private val KEY_SCAN_FILTER_SHORT = booleanPreferencesKey("scan_filter_short")
+        private const val VERSION = 6
+
+        /**
+         * 扫描过滤开关的同步读取（MediaLibrary.load 扫描线程专用；GlassApp 调用点无需感知该设置）：
+         * 独立键随快照防抖落盘，切换后到下一次手动重扫之间可能有 ≤500ms 窗口读到旧值。
+         * 必须在后台线程调用；读失败回退默认 true（默认过滤短音频）。
+         */
+        fun readScanFilterShort(context: Context): Boolean = runBlocking {
+            runCatching {
+                context.applicationContext.appDataStore.data.first()[KEY_SCAN_FILTER_SHORT] ?: true
+            }.getOrDefault(true)
+        }
 
         private fun JSONArray.strings(): List<String> = List(length()) { getString(it) }
 
@@ -120,6 +138,8 @@ class SettingsStore(context: Context) : SnapshotStore {
             put("songSort", s.songSort)
             put("shuffleOn", s.shuffleOn)
             put("repeatMode", s.repeatMode)
+            put("playbackSpeed", s.playbackSpeed.toDouble())
+            put("scanFilterShort", s.scanFilterShort)
         }.toString()
 
         /** JSON 优先；非 JSON（旧格式）走 legacy 解析迁移；损坏数据记日志后返回 null */
@@ -168,6 +188,9 @@ class SettingsStore(context: Context) : SnapshotStore {
             songSort = o.optString("songSort", "Title"),
             shuffleOn = o.optBoolean("shuffleOn", false), // 旧版本（≤v3）无此字段：走默认值零迁移
             repeatMode = o.optString("repeatMode", "Off"),
+            playbackSpeed = o.optDouble("playbackSpeed", 1.0) // 旧版本（≤v4）无此字段：走默认值零迁移
+                .toFloat().takeIf { it > 0f } ?: 1f,
+            scanFilterShort = o.optBoolean("scanFilterShort", true), // 旧版本（≤v5）无此字段：走默认值零迁移
         )
 
         // ── v1（旧版）：\u001F 分字段 / \u001E 分集合项 / \u001D 分子字段，仅作迁移 ──
