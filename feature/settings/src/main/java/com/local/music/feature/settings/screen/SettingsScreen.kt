@@ -75,6 +75,9 @@ fun SettingsScreen(
     onImportM3u: () -> Unit = {},
     onExportBackup: () -> Unit = {},
     onImportBackup: () -> Unit = {},
+    // E2：自启动引导（仅国产省电 ROM 显示该行）
+    autoStartGuideSubtitle: String? = null,
+    onAutoStartGuide: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var scanning by remember { mutableStateOf(false) }
@@ -226,6 +229,14 @@ fun SettingsScreen(
 
             SectionHeader("播放")
             SettingsCard {
+                // E2：自启动引导（仅国产激进省电 ROM 提供，subtitle 为 null 即不显示）
+                if (autoStartGuideSubtitle != null) {
+                    SettingRow(
+                        GlassIcons.Wave, "自启动与后台运行", autoStartGuideSubtitle,
+                        onClick = onAutoStartGuide,
+                    )
+                    RowDivider()
+                }
                 SettingRow(
                     GlassIcons.Wave, "均衡器", state.eqPreset.label,
                     onClick = {

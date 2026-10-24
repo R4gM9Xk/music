@@ -82,6 +82,7 @@ import com.local.music.feature.playlist.screen.PlaylistDetailScreen
 import com.local.music.feature.playlist.screen.PlaylistScreen
 import com.local.music.feature.search.screen.SearchScreen
 import com.local.music.feature.settings.screen.SettingsScreen
+import com.local.music.player.AutoStartGuide
 import com.local.music.player.MediaControllerEngine
 import com.local.music.player.MediaLibrary
 import com.local.music.player.MusicPlaybackService
@@ -153,7 +154,12 @@ fun GlassApp() {
     fun loadRealLibrary(onDone: () -> Unit = {}) {
         scope.launch {
             // 扫描可能因权限被撤销抛 SecurityException：容错并上报，不让协程崩溃
-            val result = withContext(Dispatchers.IO) { runCatching { MediaLibrary.load(context) } }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    // B3：扫描过滤开关随扫描传入（默认滤除 <30s 的通知音/录音碎片）
+                    MediaLibrary.load(context, filterShort = SettingsStore.readScanFilterShort(context))
+                }
+            }
             result.exceptionOrNull()?.let {
                 android.util.Log.e("MediaLibrary", "scan failed", it)
                 state.reportEngineFailure("读取媒体库失败，请检查存储权限")
@@ -575,6 +581,17 @@ fun GlassApp() {
                                         onImportBackup = {
                                             pendingBackupImport = true
                                             backupImportLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                                        },
+                                        // E2：自启动引导（仅国产省电 ROM 显示）
+                                        autoStartGuideSubtitle = if (AutoStartGuide.shouldSuggest()) {
+                                            AutoStartGuide.subtitle()
+                                        } else {
+                                            null
+                                        },
+                                        onAutoStartGuide = {
+                                            if (!AutoStartGuide.open(context)) {
+                                                ioMessage = "未能打开系统设置，请手动前往「设置 → 电池 → 应用启动管理」"
+                                            }
                                         },
                                     )
                                 }

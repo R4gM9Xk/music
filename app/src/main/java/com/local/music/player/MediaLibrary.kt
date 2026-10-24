@@ -37,8 +37,10 @@ object MediaLibrary {
      * 全量/增量扫描。已有缓存时走增量：只对「新增 / 指纹变化」的条目做元数据提取，
      * 其余直接复用缓存项（大曲库从分钟级降到秒级）。
      * 指纹 = dataPath + DATE_MODIFIED + SIZE（同名同大小但被改写也能识别）。
+     *
+     * @param filterShort 过滤短音频（B3：默认 <30s 的通知音/录音碎片不入库；调用方传设置开关）
      */
-    fun load(context: Context): List<DemoSong> {
+    fun load(context: Context, filterShort: Boolean = true): List<DemoSong> {
         // 互斥：已有扫描在跑就等它，拿它的结果（避免两路并发写同一缓存文件）
         if (!scanning.compareAndSet(false, true)) {
             synchronized(scanLock) {
@@ -49,7 +51,7 @@ object MediaLibrary {
             return lastScan?.songs ?: emptyList()
         }
         try {
-            val result = loadInternal(context)
+            val result = loadInternal(context, filterShort)
             lastScan = result
             return result.songs
         } finally {
@@ -64,7 +66,10 @@ object MediaLibrary {
     /** 缓存指纹：扫描前先按 dataPath 建索引，命中且指纹一致则复用整条记录 */
     private data class CachedEntry(val song: DemoSong, val lastModifiedSec: Long, val size: Long)
 
-    private fun loadInternal(context: Context): ScanResult {
+    /** 短音频阈值（B3）：小于该秒数视为通知音/录音碎片，默认过滤掉 */
+    private const val MIN_TRACK_SEC = 30
+
+    private fun loadInternal(context: Context, filterShort: Boolean): ScanResult {
         // 先读旧缓存建指纹索引（v3 才有 lastModified/size；旧缓存缺省 0 视为不命中 → 该条重扫）。
         // light 模式：只读 JSON 字段，不解码封面、不读歌词（那是命中后才需要补的）
         val cachedByPath: Map<String, CachedEntry> = runCatching {
@@ -129,6 +134,9 @@ object MediaLibrary {
                     cached.lastModifiedSec == lastModified && cached.size == size
                 ) {
                     val c = cached.song
+                    // B3：复用项同样要过短音频过滤（用户可能刚打开过滤开关，
+                    // 缓存里仍留着上次未过滤时入库的短音频）
+                    if (filterShort && c.durationSec < MIN_TRACK_SEC) continue
                     // 封面还原：优先单曲内嵌封面缓存，其次文件夹兜底封面缓存（d<hash>.png）。
                     // 两者都要计入保留集，否则收尾清扫会误删
                     val coverFile = coverFileFor(context, dataPath)
@@ -169,6 +177,11 @@ object MediaLibrary {
                     dir.startsWith("Music/", ignoreCase = true) -> dir.substring(6).ifEmpty { "Music" }
                     else -> dir.ifEmpty { "Music" }
                 }
+
+                // B3 扫描过滤：短音频（通知音/录音碎片）默认不入库。
+                // 放在提取元数据之后判断（时长可能只有 retriever 能给出）；
+                // 被过滤的条目不写指纹——下次扫描会重新判断（用户关掉过滤后能立刻出现）
+                if (filterShort && durationSec < MIN_TRACK_SEC) continue
 
                 val persistedUri = coverBitmap?.let { persistCover(context, dataPath, it) }
                 if (persistedUri != null) coverDataPaths += dataPath
