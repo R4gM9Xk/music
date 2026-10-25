@@ -232,9 +232,6 @@ object DemoData {
 
     /** 演示曲库已移除：曲库内容唯一来源 = MediaStore 真实扫描（含曲库缓存） */
     val songs: List<DemoSong> get() = emptyList()
-
-    /** 曲库列表（tab「歌曲」与扫描计数口径） */
-    val librarySongs: List<DemoSong> get() = emptyList()
 }
 
 fun Int.asTime(): String = "%02d:%02d".format(this / 60, this % 60)

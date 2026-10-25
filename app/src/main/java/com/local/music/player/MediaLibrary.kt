@@ -38,7 +38,11 @@ object MediaLibrary {
      * 其余直接复用缓存项（大曲库从分钟级降到秒级）。
      * 指纹 = dataPath + DATE_MODIFIED + SIZE（同名同大小但被改写也能识别）。
      *
-     * @param filterShort 过滤短音频（B3：默认 <30s 的通知音/录音碎片不入库；调用方传设置开关）
+     * B3 两层分离：扫描与缓存始终**全量**（短音频也提取一次、照常记指纹），
+     * 「短于 [MIN_TRACK_SEC]」的过滤只在返回组装阶段做——开过滤=输出滤掉但指纹
+     * 留在缓存里；关过滤=直接从缓存出，零重解码（大曲库通知音不再每次冷启动白解码）。
+     *
+     * @param filterShort 过滤短音频（B3：默认 <30s 的通知音/录音碎片不进返回列表；调用方传设置开关）
      */
     fun load(context: Context, filterShort: Boolean = true): List<DemoSong> {
         // 互斥：已有扫描在跑就等它，拿它的结果（避免两路并发写同一缓存文件）
@@ -48,17 +52,22 @@ object MediaLibrary {
                     runCatching { scanLock.wait(200L) }
                 }
             }
-            return lastScan?.songs ?: emptyList()
+            // 重入方拿到的是上次全量结果，同样只做输出层过滤（按本次开关）
+            return lastScan?.songs?.let { outputFiltered(it, filterShort) } ?: emptyList()
         }
         try {
-            val result = loadInternal(context, filterShort)
+            val result = loadInternal(context)
             lastScan = result
-            return result.songs
+            return outputFiltered(result.songs, filterShort)
         } finally {
             scanning.set(false)
             synchronized(scanLock) { scanLock.notifyAll() }
         }
     }
+
+    /** B3 输出层过滤：短于 [MIN_TRACK_SEC] 的条目不进返回列表；指纹与缓存不受影响（见 [load]） */
+    private fun outputFiltered(songs: List<DemoSong>, filterShort: Boolean): List<DemoSong> =
+        if (filterShort) songs.filter { it.durationSec >= MIN_TRACK_SEC } else songs
 
     /** 最近一次扫描结果（含指纹）：writeCache 需要它写回指纹表 */
     fun lastScanResult(): ScanResult? = lastScan
@@ -69,7 +78,7 @@ object MediaLibrary {
     /** 短音频阈值（B3）：小于该秒数视为通知音/录音碎片，默认过滤掉 */
     private const val MIN_TRACK_SEC = 30
 
-    private fun loadInternal(context: Context, filterShort: Boolean): ScanResult {
+    private fun loadInternal(context: Context): ScanResult {
         // 先读旧缓存建指纹索引（v3 才有 lastModified/size；旧缓存缺省 0 视为不命中 → 该条重扫）。
         // light 模式：只读 JSON 字段，不解码封面、不读歌词（那是命中后才需要补的）
         val cachedByPath: Map<String, CachedEntry> = runCatching {
@@ -134,9 +143,9 @@ object MediaLibrary {
                     cached.lastModifiedSec == lastModified && cached.size == size
                 ) {
                     val c = cached.song
-                    // B3：复用项同样要过短音频过滤（用户可能刚打开过滤开关，
-                    // 缓存里仍留着上次未过滤时入库的短音频）
-                    if (filterShort && c.durationSec < MIN_TRACK_SEC) continue
+                    // B3：短音频不再在此拦截——指纹/缓存是全量语义，过滤统一移到
+                    // load() 的输出组装层（若在此 continue，短音频进不了 reused →
+                    // 指纹写回丢失，关掉过滤后每次扫描都要重新解码它）
                     // 封面还原：优先单曲内嵌封面缓存，其次文件夹兜底封面缓存（d<hash>.png）。
                     // 两者都要计入保留集，否则收尾清扫会误删
                     val coverFile = coverFileFor(context, dataPath)
@@ -178,10 +187,10 @@ object MediaLibrary {
                     else -> dir.ifEmpty { "Music" }
                 }
 
-                // B3 扫描过滤：短音频（通知音/录音碎片）默认不入库。
-                // 放在提取元数据之后判断（时长可能只有 retriever 能给出）；
-                // 被过滤的条目不写指纹——下次扫描会重新判断（用户关掉过滤后能立刻出现）
-                if (filterShort && durationSec < MIN_TRACK_SEC) continue
+                // B3：短音频（通知音/录音碎片）不再在此 continue——照常入库+记指纹，
+                // 只提取这一次（时长必须在元数据提取之后才有：cursor 时长常为 NULL，
+                // retriever 才可靠）；是否展示给用户由 load() 输出层按 filterShort
+                // 决定，开关切换零重解码
 
                 val persistedUri = coverBitmap?.let { persistCover(context, dataPath, it) }
                 if (persistedUri != null) coverDataPaths += dataPath
@@ -635,12 +644,19 @@ object MediaLibrary {
 
     /** 扫描成功后写缓存（IO 线程调用）；失败静默（下次重扫再写）。
      *  指纹取自 [lastScanResult]：新扫条目用本次 cursor 值、复用条目沿用旧指纹，
-     *  保证下一次增量扫描仍能命中（否则退化成每次全量重扫）。 */
+     *  保证下一次增量扫描仍能命中（否则退化成每次全量重扫）。
+     *  B3 缓存全量：调用方（GlassApp）传入的是 load() **输出层过滤后**的列表，
+     *  被滤掉的短音频须从本次全量扫描结果（lastScan.songs）补回再落盘——
+     *  否则缓存文件缺了它们的条目与指纹，关掉过滤后的下一次扫描只能对短音频
+     *  重新跑 MediaExtractor/MediaMetadataRetriever（正是两层分离要消除的浪费）。 */
     fun writeCache(context: Context, songs: List<DemoSong>) {
-        val fingerprints = lastScan?.fingerprints.orEmpty()
+        val scan = lastScan
+        val fingerprints = scan?.fingerprints.orEmpty()
+        val presentIds = songs.asSequence().map { it.id }.toHashSet()
+        val allSongs = if (scan != null) songs + scan.songs.filter { it.id !in presentIds } else songs
         runCatching {
             val arr = org.json.JSONArray()
-            songs.forEach { s ->
+            allSongs.forEach { s ->
                 arr.put(org.json.JSONObject().apply {
                     put("id", s.id)
                     put("title", s.title)

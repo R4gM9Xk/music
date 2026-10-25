@@ -332,9 +332,6 @@ fun GlassApp() {
     // ── D2/D3 文件 IO：SAF 选择器（导出 M3U / 导入 M3U / 导出备份 / 恢复备份）──
     // 结果通过一次性回调交给发起方（设置页行 / 歌单详情菜单），避免把 SAF 逻辑散到各屏
     var pendingM3uExportPlaylist by remember { mutableStateOf<com.local.music.core.ui.components.DemoPlaylist?>(null) }
-    var pendingM3uImport by remember { mutableStateOf(false) }
-    var pendingBackupExport by remember { mutableStateOf(false) }
-    var pendingBackupImport by remember { mutableStateOf(false) }
     var ioMessage by remember { mutableStateOf<String?>(null) } // 结果提示（成功/失败/未命中汇总）
 
     val m3uExportLauncher = rememberLauncherForActivityResult(
@@ -356,7 +353,6 @@ fun GlassApp() {
     val m3uImportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
-        pendingM3uImport = false
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
             val result = withContext(Dispatchers.IO) {
@@ -386,7 +382,6 @@ fun GlassApp() {
     val backupExportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json"),
     ) { uri ->
-        pendingBackupExport = false
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
             val ok = withContext(Dispatchers.IO) {
@@ -403,7 +398,6 @@ fun GlassApp() {
     val backupImportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
-        pendingBackupImport = false
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
             val snapshot = withContext(Dispatchers.IO) {
@@ -416,6 +410,9 @@ fun GlassApp() {
             }
             snapshot.onSuccess {
                 state.restore(it) // 与启动恢复同一路径：设置/歌单/收藏立即生效，播放现场走 pending
+                // 运行时曲库已装载，loadLibrary 不会再调来消费 pending：就地应用恢复的播放现场
+                // （否则界面不切到备份现场，scheduleSave 还会把 pending 原样回写）
+                state.applyRestoredPlayback()
                 state.scheduleSave()
                 ioMessage = "备份已恢复"
             }.onFailure {
@@ -583,17 +580,14 @@ fun GlassApp() {
                                         },
                                         // D2 导入 M3U / D3 备份恢复
                                         onImportM3u = {
-                                            pendingM3uImport = true
                                             m3uImportLauncher.launch(
                                                 arrayOf("audio/x-mpegurl", "audio/mpegurl", "text/plain", "*/*"),
                                             )
                                         },
                                         onExportBackup = {
-                                            pendingBackupExport = true
                                             backupExportLauncher.launch("music-backup.json")
                                         },
                                         onImportBackup = {
-                                            pendingBackupImport = true
                                             backupImportLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
                                         },
                                         // E2：自启动引导（仅国产省电 ROM 显示）

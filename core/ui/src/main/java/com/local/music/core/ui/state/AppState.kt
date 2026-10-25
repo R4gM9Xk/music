@@ -58,7 +58,7 @@ data class AppStateSnapshot(
     val repeatMode: String = RepeatMode.Off.name, // 循环模式名（同上）
     val playbackSpeed: Float = 1.0f, // 播放速度（v5 起编码，旧版本解码走默认值）
     val scanFilterShort: Boolean = true, // 扫描过滤短音频（v6 起编码，旧版本解码走默认值）
-    val playCounts: Map<String, Int> = emptyMap(), // 播放次数（v7 起编码，旧版本解码走空表）
+    val playCounts: Map<String, Int>? = null, // 播放次数（v7 起编码）；null = 备份缺该字段（≤v6 旧备份），恢复时保留现有不清零
     val customSeedArgb: Int? = null, // 自定义主题色（v7 起编码；null = 未自定义）
     val queueSource: String? = null, // 队列语境标签（v8 起编码；null = 整库/未知，播放页「来自『…』」展示用）
 )
@@ -398,6 +398,10 @@ class AppState {
             // 仅在引擎驱动真实播放时回流；演示模式（stopAndClear 之后）的 false 回调不打断定时器
             if (engineLoadedUri != null) {
                 playing = isPlaying
+                // 定时关闭播完档（-1/-2）以「播放停止」为使命完成信号：服务端到点暂停会走到这里，
+                // 就地归零回显状态（服务端无回执，UI 侧自行推断）；用户手动暂停视为放弃定时
+                // （重新设置即可）；分钟档（>0）不受影响，仍按 deadline 期限推导
+                if (!isPlaying && sleepTimerMode < 0) sleepTimerMode = 0
                 scheduleSave()
             }
         }
@@ -581,8 +585,11 @@ class AppState {
         repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeatMode) }.getOrDefault(RepeatMode.Off)
         playbackSpeed = if (snapshot.playbackSpeed > 0f) snapshot.playbackSpeed else 1f
         scanFilterShort = snapshot.scanFilterShort // 旧版本（≤v5）无此字段：走默认值 true 零迁移
-        playCounts.clear()
-        playCounts.putAll(snapshot.playCounts) // 旧版本（≤v6）无此字段：空表零迁移
+        // 旧备份（≤v6）缺 playCounts 字段（null）：保留用户现有播放次数，不用空表覆盖清零
+        if (snapshot.playCounts != null) {
+            playCounts.clear()
+            playCounts.putAll(snapshot.playCounts)
+        }
         customSeedArgb = snapshot.customSeedArgb // 旧版本（≤v6）无此字段：null 零迁移
         queueSource = snapshot.queueSource // 旧版本（≤v7）无此字段：null 零迁移（「来自『…』」语境标签）
         excludedFolders.clear()
@@ -653,6 +660,11 @@ class AppState {
         resumePending = true
         prepareResume()
     }
+
+    /** 应用刚恢复的播放现场（备份恢复入口专用）：运行时曲库已装载时 loadLibrary 不会再调，
+     *  pending 现场无人消费——主动触发 applyPendingPlayback 就地收敛（保持其幂等 /
+     *  realLibraryLoaded 门控语义；引擎未连接时经 resumePending / pendingStart 既有补发机制闭环） */
+    fun applyRestoredPlayback() = applyPendingPlayback()
 
     /** 曲库不可用（权限拒绝/扫描失败）时放弃待恢复现场：此后按当前（演示）状态如实存盘 */
     fun abandonPendingPlayback() {
@@ -886,10 +898,6 @@ class AppState {
 
     fun seekToFraction(fraction: Float) = seekTo(fraction * durationSec)
 
-    fun releasePlayer() {
-        engine?.release()
-    }
-
     /** 演示模式完播（引擎路径的完播 / 单曲循环由服务端播放器承担） */
     private fun handleTrackEnd() {
         // 完播计数（D1）：只在真正播到结尾时 +1，手动切歌/拖动进度不计
@@ -996,7 +1004,8 @@ class AppState {
     }
 
     /** 生效中的定时模式（面板高亮 / 设置副标题用）：分钟档过了期限视为结束——
-     *  服务端到点自行暂停且无回执，本地按期限推导归零 */
+     *  服务端到点自行暂停且无回执，本地按期限推导归零；播完档（-1/-2）同样无回执，
+     *  由 onPlayingChanged 收到播放停止时就地归零（用户手动暂停视为放弃定时） */
     fun effectiveSleepTimerMode(): Int {
         val mode = sleepTimerMode
         if (mode > 0 && System.currentTimeMillis() >= sleepTimerDeadlineMs) return 0
@@ -1134,9 +1143,14 @@ class AppState {
     }
 
     fun createPlaylist(title: String): DemoPlaylist {
+        val finalTitle = title.trim().ifEmpty { "新建歌单" }
+        // 已存在同名 user- 歌单：返回现有歌单（M3U 导入合并语义——调用方随后 addToPlaylist
+        // 按 id 去重，同名重复导入不再堆出重复歌单）
+        userPlaylists.firstOrNull { it.title.trim().equals(finalTitle, ignoreCase = true) }
+            ?.let { return it }
         val playlist = DemoPlaylist(
             id = "user-${System.currentTimeMillis()}",
-            title = title.trim().ifEmpty { "新建歌单" },
+            title = finalTitle,
             meta = "0 首",
             art = ArtStyle.Room,
             tracks = emptyList(),
@@ -1144,6 +1158,15 @@ class AppState {
         userPlaylists.add(playlist)
         scheduleSave()
         return playlist
+    }
+
+    /** 歌单名是否已被占用（新建歌单 UI 重名提示用）：user- 歌单与内建歌单标题都算冲突
+     *  （trim 后忽略大小写比对；空名不算冲突——由调用方先行拦截） */
+    fun playlistTitleExists(title: String): Boolean {
+        val t = title.trim()
+        if (t.isEmpty()) return false
+        return userPlaylists.any { it.title.trim().equals(t, ignoreCase = true) } ||
+            DemoCatalog.playlists.any { it.title.trim().equals(t, ignoreCase = true) }
     }
 
     fun deletePlaylist(id: String) {

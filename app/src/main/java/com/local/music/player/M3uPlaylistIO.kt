@@ -28,12 +28,13 @@ object M3uPlaylistIO {
         val songs = playlist.tracks
         val sb = StringBuilder()
         sb.append("#EXTM3U\n")
-        sb.append("#PLAYLIST:").append(playlist.title).append('\n')
+        sb.append("#PLAYLIST:").append(oneLine(playlist.title)).append('\n')
         songs.forEach { s ->
-            // #EXTINF:<duration>,<title>；艺术家信息放进标题便于其他播放器展示
+            // #EXTINF:<duration>,<title>；艺术家信息放进标题便于其他播放器展示。
+            // 显示文本/路径含换行会破坏 M3U 行结构：写出前压成空格并 trim（标题中的逗号无碍——导入按首个逗号取显示文本）
             sb.append("#EXTINF:").append(s.durationSec).append(',')
-                .append(s.artist).append(" - ").append(s.title).append('\n')
-            sb.append(pathOf(s)).append('\n')
+                .append(oneLine(s.artist)).append(" - ").append(oneLine(s.title)).append('\n')
+            sb.append(oneLine(pathOf(s))).append('\n')
         }
         context.contentResolver.openOutputStream(uri)?.use { out ->
             out.write(sb.toString().toByteArray(Charsets.UTF_8))
@@ -72,7 +73,7 @@ object M3uPlaylistIO {
                 line.isEmpty() -> Unit
                 line.startsWith("#EXTM3U", ignoreCase = true) -> Unit
                 line.startsWith("#PLAYLIST:", ignoreCase = true) -> title = line.substringAfter(':').trim()
-                line.startsWith("#EXTINF", ignoreCase = true) -> Unit // 时长/标题仅展示用，匹配靠下一行路径
+                line.startsWith("#EXTINF", ignoreCase = true) -> Unit // 时长/标题仅展示用，匹配靠下一行路径；若日后取显示文本，须按「首个逗号」分隔（其后全部归显示文本），含逗号标题才不会截断
                 line.startsWith("#") -> Unit // 其他注释
                 else -> {
                     val song = byPath[line]
@@ -87,9 +88,8 @@ object M3uPlaylistIO {
     private fun pathOf(song: DemoSong): String =
         song.id.removePrefix("f").ifEmpty { song.mediaUri ?: "" }
 
-    /** 是否为可识别的 M3U 文件（供 UI 预检，减少无效选择） */
-    fun looksLikeM3u(fileName: String): Boolean =
-        fileName.endsWith(".m3u", true) || fileName.endsWith(".m3u8", true)
+    /** 单行化：\n/\r 压成空格并 trim——M3U 行结构不容忍换行（#EXTINF 显示文本与路径行写出前统一走这里） */
+    private fun oneLine(s: String): String = s.replace(Regex("[\\r\\n]+"), " ").trim()
 
     /** 从 content uri 猜文件名（导入时给新歌单取名用） */
     fun displayNameOf(context: Context, uri: Uri): String? = runCatching {

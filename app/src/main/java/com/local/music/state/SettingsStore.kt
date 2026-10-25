@@ -149,10 +149,11 @@ class SettingsStore(context: Context) : SnapshotStore {
             put("repeatMode", s.repeatMode)
             put("playbackSpeed", s.playbackSpeed.toDouble())
             put("scanFilterShort", s.scanFilterShort)
-            // 播放次数（v7）：id → 次数；空表也写（结构稳定，解码侧统一 optJSONObject 兜底）
+            // 播放次数（v7）：id → 次数；类型 nullable 但 encode 侧来源恒为 state 的非空快照值，
+            // 空表也写（结构稳定，解码侧 has() 区分「字段缺失=保留现有」与「显式空=如实清零」）
             put(
                 "playCounts",
-                JSONObject().apply { s.playCounts.forEach { (id, n) -> put(id, n) } },
+                JSONObject().apply { s.playCounts.orEmpty().forEach { (id, n) -> put(id, n) } },
             )
             // 自定义主题色（v7）：null 存 JSONObject.NULL，解码侧 isNull 判断
             put("customSeedArgb", s.customSeedArgb ?: JSONObject.NULL)
@@ -209,9 +210,13 @@ class SettingsStore(context: Context) : SnapshotStore {
             playbackSpeed = o.optDouble("playbackSpeed", 1.0) // 旧版本（≤v4）无此字段：走默认值零迁移
                 .toFloat().takeIf { it > 0f } ?: 1f,
             scanFilterShort = o.optBoolean("scanFilterShort", true), // 旧版本（≤v5）无此字段：走默认值零迁移
-            playCounts = o.optJSONObject("playCounts")?.let { obj -> // 旧版本（≤v6）无此字段：空表零迁移
-                buildMap { obj.keys().forEach { id -> put(id, obj.optInt(id, 0)) } }
-            } ?: emptyMap(),
+            // 播放次数三态：键缺失（≤v6 旧备份）→ null（恢复时保留现有计数不清零）；
+            // 键存在（含显式空对象）→ 解析出 Map（空表 = 如实清零）
+            playCounts = if (o.has("playCounts")) {
+                o.optJSONObject("playCounts")?.let { obj ->
+                    buildMap { obj.keys().forEach { id -> put(id, obj.optInt(id, 0)) } }
+                } ?: emptyMap()
+            } else null,
             customSeedArgb = o.takeIf { it.has("customSeedArgb") && !it.isNull("customSeedArgb") }
                 ?.optInt("customSeedArgb"), // 旧版本（≤v6）无此字段：null 零迁移
             queueSource = o.takeIf { it.has("queueSource") && !it.isNull("queueSource") }

@@ -12,6 +12,21 @@
     <!-- 所有文件访问：读取任意公共目录的同名 .lrc 歌词（Download/QQ 等），特殊权限经系统页授权 -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
+    <!-- E2 包可见性（Android 11+ / targetSdk 30+）：AutoStartGuide 用 resolveActivity 探测
+         厂商自启动/电池页，未声明 <queries> 时这些包全部不可见 → 只能落到应用详情页兜底。
+         按候选组件逐包精确声明（与 AutoStartGuide.CANDIDATES 一一对应，比 intent-filter
+         queries 精确）；Settings.ACTION_* 系统 action 自身可见，无需在此声明 -->
+    <queries>
+        <!-- ColorOS 自启动管理（多版本入口同包） -->
+        <package android:name="com.coloros.safecenter" />
+        <package android:name="com.oplus.safecenter" />
+        <!-- 电池 / 耗电管理 -->
+        <package android:name="com.coloros.oppoguardelf" />
+        <package android:name="com.oplus.battery" />
+        <!-- 通用兜底候选：应用详情页（InstalledAppDetails 组件型候选也走 resolveActivity） -->
+        <package android:name="com.android.settings" />
+    </queries>
+
     <application
         android:label="音乐"
         android:icon="@mipmap/ic_launcher"

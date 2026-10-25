@@ -35,6 +35,11 @@ object AutoStartGuide {
     /**
      * 候选设置页（按优先级）。每项 = 组件全名，逐个尝试解析。
      * 覆盖 ColorOS 各版本已知入口 + 通用电池优化页。
+     *
+     * E2 包可见性：Android 11+（targetSdk 30+）下 resolveActivity 只能解析
+     * manifest <queries> 声明过的包——新增候选包名时必须同步在 AndroidManifest.xml
+     * 的 <queries> 里补对应 <package> 声明，否则探测永远为 null（只落兜底页）。
+     * Settings.ACTION_* 系统页（电池优化/应用详情）自身可见，无需声明。
      */
     private val CANDIDATES: List<ComponentName> = listOf(
         // ColorOS 自启动管理（多版本）

@@ -93,13 +93,15 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                 // 新建歌单面板（含输入框：GlassSheet 的 imePadding 让其浮在键盘之上，机制不动）
                 modal.show {
                     ModalSheet(modal, "新建歌单") {
+                        // 重名预检（trim 忽略大小写，含内建歌单标题）：重名时副标题提示且不可提交
+                        val duplicate = newName.trim().isNotEmpty() && state.playlistTitleExists(newName)
                         GlassTextField(
                             value = newName,
                             onValueChange = { newName = it },
                             hint = "歌单名称",
                             leading = null,
                             onSearch = {
-                                if (newName.isNotBlank()) {
+                                if (newName.isNotBlank() && !duplicate) {
                                     state.createPlaylist(newName)
                                     newName = ""
                                     modal.requestDismiss()
@@ -110,10 +112,14 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                         SheetAction(
                             icon = GlassIcons.Plus,
                             label = "创建歌单",
-                            subtitle = if (newName.isBlank()) "先输入名称" else "「${newName.trim()}」",
-                            emphasized = newName.isNotBlank(),
+                            subtitle = when {
+                                newName.isBlank() -> "先输入名称"
+                                duplicate -> "已有同名歌单"
+                                else -> "「${newName.trim()}」"
+                            },
+                            emphasized = newName.isNotBlank() && !duplicate,
                             onClick = {
-                                if (newName.isNotBlank()) {
+                                if (newName.isNotBlank() && !duplicate) {
                                     state.createPlaylist(newName)
                                     newName = ""
                                     modal.requestDismiss()

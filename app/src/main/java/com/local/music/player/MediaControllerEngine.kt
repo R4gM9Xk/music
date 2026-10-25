@@ -27,8 +27,11 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
     override var onMediaItemChanged: ((String?) -> Unit)? = null
     override var onAutoAdvanced: ((String?) -> Unit)? = null
 
-    /** 上一曲 mediaId：用于在自动切歌时报告「哪首播完了」（D1 完播计数） */
-    private var lastMediaId: String? = null
+    /** 上一曲 mediaId：用于在自动切歌时报告「哪首播完了」（D1 完播计数）。
+     *  构造时用服务端当前曲初始化——attach 后第一次自动切歌 previous 不再是 null
+     *  （服务在播重连/每次冷启动场景不再丢一次计数）；服务空闲时初值为 null 亦无碍
+     *  （首次 setMediaItems 走 PLAYLIST_CHANGED，不计数） */
+    private var lastMediaId: String? = controller.currentMediaItem?.mediaId
     override var onError: ((String) -> Unit)? = null
 
     /** 断连已上报标记（重连后清位，避免每个调用都重复刷错误横幅） */

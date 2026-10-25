@@ -79,18 +79,9 @@ object DemoCatalog {
         DemoPlaylist("pl-lossless", "无损试音", "0 首", ArtStyle.Tape, listOf("old-tape", "night-flight", "galaxy").mapById()),
     )
 
-    val artists: List<String> get() = DemoData.songs.map { it.artist }.distinct()
-    val folders: List<String> get() = DemoData.songs.map { it.folder }.distinct()
-    val genres: List<String> get() = DemoData.songs.map { it.genre }.distinct()
-
     fun songById(id: String): DemoSong? = DemoData.songs.firstOrNull { it.id == id }
     fun album(id: String): DemoAlbum? = albums.firstOrNull { it.id == id }
     fun playlist(id: String): DemoPlaylist? = playlists.firstOrNull { it.id == id }
-
-    fun artistSongs(name: String): List<DemoSong> = DemoData.songs.filter { it.artist == name }
-    fun genreSongs(name: String): List<DemoSong> = DemoData.songs.filter { it.genre == name }
-    fun folderSongs(name: String, excluded: Set<String>): List<DemoSong> =
-        DemoData.songs.filter { it.folder == name && name !in excluded }
 
     /** 搜索：标题/艺术家/专辑 contains，忽略大小写，命中全部演示曲库（含伴奏/单曲） */
     fun searchSongs(query: String): List<DemoSong> {
@@ -98,16 +89,6 @@ object DemoCatalog {
         if (q.isEmpty()) return emptyList()
         return DemoData.songs.filter {
             it.title.contains(q, true) || it.artist.contains(q, true) || it.album.contains(q, true)
-        }
-    }
-
-    /** 专辑命中：名称/艺术家，或任一曲目/其艺术家命中 */
-    fun searchAlbums(query: String): List<DemoAlbum> {
-        val q = query.trim()
-        if (q.isEmpty()) return emptyList()
-        return albums.filter { a ->
-            a.title.contains(q, true) || a.artist.contains(q, true) ||
-                a.tracks.any { it.title.contains(q, true) || it.artist.contains(q, true) }
         }
     }
 
