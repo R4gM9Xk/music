@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -203,10 +204,15 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     },
                 ),
         ) {
-            Box(Modifier.weight(1f).hazeSource(playerHaze)) {
-                Column(Modifier.fillMaxSize()) {
-                    // ── 顶栏：收起 / 正在播放 / 更多（非共享：原地由虚到实）──
-                    // P2-⑤：横屏纵向极度紧张，顶栏收紧内边距（6dp → 0dp），把高度让给舞台
+            // ── P2-⑤ 横屏布局：双栏 ──
+            // 竖屏保持原单列（顶栏 / 舞台 / 控制台 / 提示）。
+            // 横屏（高度仅 360dp）改「顶栏通栏 + 下方左舞台 / 右控制台」：
+            // 单列时顶栏+控制台+提示把舞台压到 ~76dp，封面按任何公式都放不大——
+            // 这正是 P2-⑤「封面塌缩成小圆 + 下半屏留白」的病灶，改尺寸公式治不了，
+            // 必须让舞台拿到**整列高度**。四个内容块抽成局部 composable 共用，
+            // 避免两套布局重复维护（共享元素 flight 的 key 也天然一致）。
+
+            val topBarBlock: @Composable () -> Unit = {
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -243,6 +249,8 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             Icon(GlassIcons.More, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
                         }
                     }
+            }
+
 
                     // ── 统一舞台：modeT(0=封面端 1=歌词端) 插值，封面中心+尺寸同帧直线过渡 ──
                     val modeT by updateTransition(showLyrics, label = "playerMode").animateFloat(
@@ -250,6 +258,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         label = "modeT",
                     ) { if (it) 1f else 0f }
 
+            val stageBlock: @Composable () -> Unit = {
                     BoxWithConstraints(
                         Modifier
                             .weight(1f)
@@ -265,18 +274,14 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         val smallSize = with(density) { 64.dp.toPx() }
                         val smallLeft = with(density) { 22.dp.toPx() }
                         val smallTop = with(density) { 14.dp.toPx() }
-                        // P2-⑤ 横屏：舞台高度被控制台+顶栏挤到 ~100dp 级，而旧公式
-                        // `min(280dp, stageW, stageH*0.85)` 完全以高度为准 → 封面塌缩成
-                        // 64dp 左右的小圆（实测正是「横屏封面变小小圆形缩略图 + 下半屏留白」）。
-                        // 宽屏下改为「按可用高度与宽度共同约束，并保一个下限」：
-                        // - 短边（=高度）决定封面边长，但设 96dp 下限，避免变得比歌词小窗还小；
-                        // - 同时不超过舞台宽度的 42%，给呼吸区，不出现「一张大图顶满」。
-                        val bigSize = if (stageW > stageH) {
-                            minOf(stageH * 0.92f, stageW * 0.42f)
-                                .coerceAtLeast(with(density) { 96.dp.toPx() })
-                        } else {
-                            minOf(with(density) { 280.dp.toPx() }, stageW, stageH * 0.85f)
-                        }
+                        // P2-⑤：封面尺寸**一律由舞台可用空间推导**，不设任何超过父约束的下限。
+                        //
+                        // 血的教训（横屏真机实测）：曾用 `coerceAtLeast(96dp)` 想把封面撑大，
+                        // 但横屏单列时舞台只有 ~76dp 高——Modifier.size 会被父约束 coerce，
+                        // 于是 96dp 的边长被压成「宽 96 / 高 76」的**椭圆**，且 offset 后
+                        // 叠到顶栏标题上。封面尺寸必须 ≤ 舞台高，否则非方即溢。
+                        // 横屏真正变大靠的是 §布局 的双栏（舞台拿到整列高度），不是改这个下限。
+                        val bigSize = minOf(with(density) { 280.dp.toPx() }, stageW, stageH * 0.92f)
                         val bigCenterY = stageH / 2f -
                             if (pureMusic) with(density) { (18.dp + 20.dp).toPx() / 2f } else 0f
                         val smallRect = Rect(smallLeft, smallTop, smallLeft + smallSize, smallTop + smallSize)
@@ -358,8 +363,8 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             )
                         }
                     }
-                }
             }
+
 
             // ── 玻璃控制台（背景真模糊：采样舞台区）。玻璃本体/歌名/副标题/播放/下一首 = 共享真身；
             //    收藏/队列/进度/时间/随机/上一首/循环 = 非共享原地淡入淡出。
@@ -375,6 +380,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             )
             val sharedAlpha = { (flight?.playerSharedAlpha() ?: 1f) * sheetAlpha }
             val softAlpha = { (flight?.softAlpha() ?: 1f) * sheetAlpha }
+            val consoleBlock: @Composable () -> Unit = {
             GlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -525,6 +531,8 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     }
                 }
             }
+            }
+
 
             // 底部提示行（按当前视觉模式而非持久化偏好）；无歌词时不再教「滑动切换」（P3-65）——
             // 纯音乐没有歌词端可切，提示与舞台空态文案保持同一句话
@@ -533,6 +541,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                 showLyrics -> "点击歌词行可跳转 · 左右滑动切换封面 / 歌词"
                 else -> "左右滑动切换封面 / 歌词"
             }
+            val hintBlock: @Composable () -> Unit = {
             Text(
                 hint,
                 color = LocalGlassColors.current.textFaint, fontSize = 10.5.sp,
@@ -543,6 +552,37 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     .graphicsLayer { alpha = softAlpha() },
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             )
+            }
+
+            if (landscape) {
+                topBarBlock()
+                Row(Modifier.weight(1f).fillMaxWidth()) {
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .hazeSource(playerHaze),
+                    ) { stageBlock() }
+                    Column(
+                        Modifier
+                            .width(380.dp)
+                            .fillMaxHeight(),
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        consoleBlock()
+                        hintBlock()
+                    }
+                }
+            } else {
+                Box(Modifier.weight(1f).hazeSource(playerHaze)) {
+                    Column(Modifier.fillMaxSize()) {
+                        topBarBlock()
+                        stageBlock()
+                    }
+                }
+                consoleBlock()
+                hintBlock()
+            }
         }
     }
 }

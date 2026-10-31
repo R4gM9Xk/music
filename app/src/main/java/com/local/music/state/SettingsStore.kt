@@ -26,7 +26,68 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 
-private val Context.appDataStore: androidx.datastore.core.DataStore<Preferences> by preferencesDataStore(name = "glass_app_state")
+/**
+ * DataStore 实例工厂（**可重建**，这是 P1-② 的关键）。
+ *
+ * 为什么不能用 `by preferencesDataStore(name = ...)` 委托：那个委托返回的是
+ * **进程级单例**，内部把「读失败」也缓存进状态里。一旦 `preferences_pb` 的 protobuf
+ * 层损坏，单例进入永久失败态——即使事后把坏文件删掉，**同一个实例**的 `edit{}` 仍会
+ * 先重放那次失败、继续抛 CorruptionException，形成「删了也没用」的只读死锁。
+ * 真机实测确认（横幅消失、日志显示 deleted=true，但磁盘从此永远写不进去）。
+ *
+ * 因此改为自管实例 + [resetAppDataStore]：损坏时连同实例一起丢弃重建，
+ * 这样下一次 `edit{}` 才会真的从干净文件开始。
+ *
+ * 有意**不**使用 `ReplaceFileCorruptionHandler`：那会在读取期就把坏文件静默替换成空
+ * preferences，于是宿主拿到的是「键不存在」（首装语义）→ 默认值直接覆盖写盘，
+ * 正是 P1-② 要防的那条链。保留 CorruptionException 才能让宿主区分「首装」与「损坏」。
+ */
+@Volatile
+private var appDataStoreInstance: androidx.datastore.core.DataStore<Preferences>? = null
+
+/** 自管 scope：重建实例前必须先取消它，否则旧实例仍持有文件锁（见 [resetAppDataStore]） */
+@Volatile
+private var appDataStoreScope: kotlinx.coroutines.CoroutineScope? = null
+
+private val appDataStoreLock = Any()
+
+private fun Context.appDataStore(): androidx.datastore.core.DataStore<Preferences> {
+    appDataStoreInstance?.let { return it }
+    return synchronized(appDataStoreLock) {
+        appDataStoreInstance ?: run {
+            val scope = kotlinx.coroutines.CoroutineScope(
+                kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO,
+            )
+            androidx.datastore.preferences.core.PreferenceDataStoreFactory.create(
+                scope = scope,
+                produceFile = {
+                    File(applicationContext.filesDir, "datastore/glass_app_state.preferences_pb")
+                },
+            ).also {
+                appDataStoreInstance = it
+                appDataStoreScope = scope
+            }
+        }
+    }
+}
+
+/**
+ * 丢弃当前实例（下次 [appDataStore] 调用会重新创建并重新读盘）。
+ *
+ * **必须先取消旧 scope**：DataStore 在 `FileStorage.createConnection` 里做了
+ * 「同一文件不允许两个活跃实例」的检查，只置空引用而不取消协程，旧实例的文件连接
+ * 仍然算活跃 → 新实例抛 IllegalStateException（真机实测：
+ * "There are multiple DataStores active for the same file"）。
+ * 取消 scope 后 DataStore 会关闭其 storage connection，新实例才能接管。
+ */
+private fun resetAppDataStore() {
+    synchronized(appDataStoreLock) {
+        // runCatching：scope 可能已因宿主 cancel 而失效，取消失败不影响后续重建
+        runCatching { appDataStoreScope?.cancel() }
+        appDataStoreScope = null
+        appDataStoreInstance = null
+    }
+}
 
 /**
  * P2-27：快照读取三态。旧 [SettingsStore.read] 的「null = 首次启动 or 损坏」二义性
@@ -99,13 +160,13 @@ class SettingsStore(context: Context) : SnapshotStore {
      * 也不进 AppStateSnapshot——引导状态不是用户设置，不该随备份/恢复曲库迁移。
      */
     suspend fun allFilesPrompted(): Boolean = withContext(Dispatchers.IO) {
-        runCatching { appContext.appDataStore.data.first()[KEY_ALL_FILES_PROMPTED] ?: false }
+        runCatching { appContext.appDataStore().data.first()[KEY_ALL_FILES_PROMPTED] ?: false }
             .getOrDefault(false)
     }
 
     /** 标记引导已提示过（见 [allFilesPrompted]）：写失败只记日志，下次冷启动仍会再提示一次 */
     suspend fun markAllFilesPrompted() {
-        runCatching { appContext.appDataStore.edit { it[KEY_ALL_FILES_PROMPTED] = true } }
+        runCatching { appContext.appDataStore().edit { it[KEY_ALL_FILES_PROMPTED] = true } }
             .onFailure { Log.e(TAG, "markAllFilesPrompted failed", it) }
     }
 
@@ -129,7 +190,7 @@ class SettingsStore(context: Context) : SnapshotStore {
     }
 
     suspend fun read(): AppStateSnapshot? = withContext(Dispatchers.IO) {
-        val raw = appContext.appDataStore.data.first()[KEY_STATE] ?: return@withContext null
+        val raw = appContext.appDataStore().data.first()[KEY_STATE] ?: return@withContext null
         decode(raw)
     }
 
@@ -146,7 +207,7 @@ class SettingsStore(context: Context) : SnapshotStore {
      * 读取结果本身，照常返回 Corrupt。
      */
     suspend fun readResult(): SnapshotReadResult = withContext(Dispatchers.IO) {
-        val raw = appContext.appDataStore.data.first()[KEY_STATE]
+        val raw = appContext.appDataStore().data.first()[KEY_STATE]
             ?: return@withContext SnapshotReadResult.Absent
         // 损坏判定前先重试一次：DataStore 首次读取可能撞上「atomic 重命名刚完成」的瞬时窗口，
         // 读到半截文件会让 decode 失败，而一次失败就判损坏会白白冻住存盘（反而更糟）。
@@ -154,7 +215,7 @@ class SettingsStore(context: Context) : SnapshotStore {
         val snapshot = decode(raw) ?: run {
             kotlinx.coroutines.delay(READ_RETRY_DELAY_MS)
             val retryRaw = runCatching {
-                appContext.appDataStore.data.first()[KEY_STATE]
+                appContext.appDataStore().data.first()[KEY_STATE]
             }.getOrNull() ?: raw
             decode(retryRaw)?.let { return@withContext SnapshotReadResult.Ok(it) }
             null
@@ -185,14 +246,67 @@ class SettingsStore(context: Context) : SnapshotStore {
 
     private suspend fun write(snapshot: AppStateSnapshot) {
         try {
-            appContext.appDataStore.edit {
+            appContext.appDataStore().edit {
                 it[KEY_STATE] = encode(snapshot)
                 it[KEY_SCAN_FILTER_SHORT] = snapshot.scanFilterShort // 与快照原子同写：扫描侧同步读取的单一事实源
             }
         } catch (e: Exception) {
             // 写失败不能让 collector 协程死亡（否则之后所有 schedule 都不再落盘）
             Log.e(TAG, "snapshot write failed", e)
+            // P1-② 补强：DataStore 的 **protobuf 文件本身**损坏时（不是我们那层 JSON 解不开，
+            // 而是 preferences_pb 连 protobuf 都读不出来），`edit{}` 每次都必须先读旧文件，
+            // 于是**永远**抛 CorruptionException —— 「只读死锁」：放行了、用户点了重建，
+            // 可是写盘依然失败，磁盘永远停在坏文件上。真机实测确认了这个死锁。
+            //
+            // 修复要点有两个，缺一不可：
+            //   1) 删掉坏文件（resetDataStoreFile）；
+            //   2) **丢弃并重建 DataStore 实例** —— `preferencesDataStore` 委托是进程级单例，
+            //      它把「读取失败」缓存在自己的状态里，光删文件同一个实例照样失败
+            //      （实测：deleted=true 之后仍写不进去）。换新实例才会重新读盘。
+            // 之后立即重试一次：这一次落在干净文件上，必然成功——用户选的是「放弃旧快照
+            // 重新开始」，所以此刻写入磁盘正是他期望的结果。
+            if (e is androidx.datastore.core.CorruptionException ||
+                e.cause is androidx.datastore.core.CorruptionException
+            ) {
+                resetDataStoreFile()
+                resetAppDataStore()
+                runCatching {
+                    appContext.appDataStore().edit {
+                        it[KEY_STATE] = encode(snapshot)
+                        it[KEY_SCAN_FILTER_SHORT] = snapshot.scanFilterShort
+                    }
+                    Log.w(TAG, "datastore rebuilt; snapshot written on retry")
+                }.onFailure { Log.e(TAG, "retry after datastore reset failed", it) }
+            }
         }
+    }
+
+    /**
+     * 删除损坏的 DataStore 文件，让下一次 `edit{}` 从干净状态重建。
+     *
+     * 时机约束：**只在写路径已经确认 payload 可编码**之后调用（见 [write] 的 catch）——
+     * 这样「删掉旧文件」紧跟一次会成功的重建写入，不存在「删了又写不成」导致彻底丢数据的窗口。
+     * 坏文件本身不删丢弃：先拷一份到 corrupt_snapshot/ 留证（`*_preferences.pb`），
+     * 供人工排查；拷贝失败也继续（用户已经选择放弃旧快照）。
+     */
+    private suspend fun resetDataStoreFile() = withContext(Dispatchers.IO) {
+        runCatching {
+            val dir = File(appContext.filesDir, "datastore")
+            val file = File(dir, "$DATASTORE_NAME.preferences_pb")
+            if (file.isFile) {
+                // 留档：原始坏文件（二进制）复制一份，便于事后分析真正损坏原因
+                runCatching {
+                    val keep = File(File(appContext.filesDir, "corrupt_snapshot"), "preferences.${System.currentTimeMillis()}.pb")
+                    keep.parentFile?.mkdirs()
+                    file.copyTo(keep, overwrite = true)
+                    Log.e(TAG, "dead datastore dumped to ${keep.name}")
+                }
+                // DataStore 的 .tmp 兄弟文件同样可能是脏的，一并清掉
+                File(dir, "$DATASTORE_NAME.preferences_pb.tmp").delete()
+                val deleted = file.delete()
+                Log.e(TAG, "corrupted datastore file deleted=$deleted; next write will rebuild")
+            }
+        }.onFailure { Log.e(TAG, "resetDataStoreFile failed", it) }
     }
 
     companion object {
@@ -209,6 +323,13 @@ class SettingsStore(context: Context) : SnapshotStore {
         /** 判定损坏前的单次重试间隔：避开 DataStore 原子重命名的瞬时窗口（见 [readResult]） */
         private const val READ_RETRY_DELAY_MS = 30L
 
+        /**
+         * DataStore 文件名（必须与顶部 `preferencesDataStore(name = ...)` 一致）：
+         * [resetDataStoreFile] 需要按路径直接操作 `files/datastore/<name>.preferences_pb`，
+         * 而 DataStore 没有公开 API 让你删掉自己的 backing file（只能走这个约定路径）。
+         */
+        private const val DATASTORE_NAME = "glass_app_state"
+
         /** [flushBlocking] 的阻塞上限：只是兜底，正常 DataStore edit 是个位数毫秒 */
         private const val FLUSH_BLOCKING_TIMEOUT_MS = 400L
 
@@ -219,7 +340,7 @@ class SettingsStore(context: Context) : SnapshotStore {
          */
         fun readScanFilterShort(context: Context): Boolean = runBlocking {
             runCatching {
-                context.applicationContext.appDataStore.data.first()[KEY_SCAN_FILTER_SHORT] ?: true
+                context.applicationContext.appDataStore().data.first()[KEY_SCAN_FILTER_SHORT] ?: true
             }.getOrDefault(true)
         }
 
