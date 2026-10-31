@@ -86,7 +86,23 @@ object MediaLibrary {
     fun lastScanResult(): ScanResult? = lastScan
 
     /** 缓存指纹：扫描前先按 dataPath 建索引，命中且指纹一致则复用整条记录 */
-    private data class CachedEntry(val song: DemoSong, val lastModifiedSec: Long, val size: Long)
+    /**
+     * 缓存条目。[hadCoverRecord]：缓存文件里**曾经记录过** artworkUri（哪怕此刻文件已不在）。
+     *
+     * 为什么必须单独存这个布尔，而不能看 [song].artworkUri：增量扫描的 coverLost 判据是
+     * 「缓存说以前有封面，但磁盘 PNG 没了」→ 落回全量提取重新生成。而 song.artworkUri
+     * 是**已被读缓存时解析过**的值（文件不在就变 null），于是 coverLost 永远不成立：
+     * 会被误判成「这首歌本来就没封面」直接复用，随后 writeCache 把 null 写死进缓存 →
+     * **封面永久丢失再也不会自愈**。
+     * 真机复现过：系统清理 externalCacheDir（covers/ 在 /sdcard/Android/data 下，可被
+     * 清理助手/系统回收）后重启，57 首封面全灭且缓存被写成 0 张，只剩手动删缓存重扫才恢复。
+     */
+    private data class CachedEntry(
+        val song: DemoSong,
+        val lastModifiedSec: Long,
+        val size: Long,
+        val hadCoverRecord: Boolean = false,
+    )
 
     /**
      * 短音频阈值（B3）：小于该秒数视为通知音/录音碎片，默认过滤掉。
@@ -192,8 +208,13 @@ object MediaLibrary {
                     //    或源 cover.jpg 被删）→ 否则全库封面永久消失
                     // B. 缓存说**没**封面（artworkUri == null），但现在探到了可用的封面文件
                     //    （用户刚往目录里放了 cover.jpg）→ 否则「放图后重扫」永远看不到图
-                    val coverLost = c.artworkUri != null && restoredCoverFile == null
-                    val coverGained = c.artworkUri == null && restoredCoverFile != null
+                    //
+                    // **A 必须用 c.hadCoverRecord 而不是 c.artworkUri != null**：后者是
+                    // readCacheEntries 解析过文件存在性的结果，封面目录被清空后它已是 null，
+                    // 判据永远不成立 → 误判「本来就没封面」→ 复用 + writeCache 把 null 写死
+                    // → 封面永久丢失（真机实测：57 首全灭，只能删缓存重扫才恢复）。
+                    val coverLost = cached.hadCoverRecord && restoredCoverFile == null
+                    val coverGained = !cached.hadCoverRecord && restoredCoverFile != null
                     if (!coverLost && !coverGained) {
                         if (restoredCoverFile != null) coverDataPaths += dataPath
                         songs += c.copy(
@@ -884,11 +905,12 @@ object MediaLibrary {
             // 记录的 artworkUri——那多半是旧命名 c<hash>/d<hash>.png 且此刻还在盘上，
             // 冷启动（此处）因此不会因为换了键而首屏全灰。是否**真的**要重提取由增量扫描
             // 的 coverLost 判断（它只看新命名文件），所以回落到旧文件不会掩盖迁移。
+            val rawArtworkUri = o.optString("artworkUri")
             val artworkUri = if (dataPath.isEmpty()) {
-                o.optString("artworkUri").ifEmpty { null }
+                rawArtworkUri.ifEmpty { null }
             } else {
                 val cover = coverFileFor(context, dataPath).takeIf { it.isFile && it.length() > 0L }
-                    ?: legacyArtworkFile(o.optString("artworkUri"))
+                    ?: legacyArtworkFile(rawArtworkUri)
                 cover?.let { Uri.fromFile(it).toString() }
             }
             val song = DemoSong(
@@ -926,6 +948,9 @@ object MediaLibrary {
                 song = song,
                 lastModifiedSec = o.optLong("lastModified", 0L),
                 size = o.optLong("size", 0L),
+                // 用**原始 JSON 字段**判定「曾经记过封面」，不用解析后的 artworkUri：
+                // 后者在封面文件被清理后已成 null，会把「曾有过」误判成「从来没有」
+                hadCoverRecord = rawArtworkUri.isNotEmpty(),
             )
         }
         entries
