@@ -278,11 +278,14 @@ class PlayerFlight(private val scope: CoroutineScope) {
         phase = Phase.Exiting
         snapshot = player + mini
         started = true
-        // **正常退出也必须清 entryShowCover**：它是「本次进入暂落封面模式」的瞬态标记，
-        // 只在忙时中止分支清会让它泄漏到下一次「直入播放页」（state.screen = Player 不经飞行），
-        // 表现为先落封面态再滑走；若再次点的正是同一首（songSnapshot.id 相同），
-        // PlayerScreen 的清理守卫不成立 → 歌词页永久进不去。
-        entryShowCover = false
+        // **entryShowCover 不能在起飞时清**（P2-⑤ 回归的根因）：
+        // 它决定 PlayerScreen 的 showLyrics，而 showLyrics 驱动 modeT ——
+        // 若在这里同步清掉，PlayerScreen 下一帧重组就会看到 showLyrics 由 false 翻 true，
+        // modeT 立刻从 0 动画到 1：封面**同时**朝歌词小窗（左上）移动，与「缩回右下迷你条」
+        // 的飞行几何打架（用户看到向左上飞），歌词 rail 也按 modeT 淡入（闪一下歌词页）。
+        // 真机逐帧截图确认过这个现象（.zcode/screens/realdev/mid2.png）。
+        // 正确时机是**飞行结束、phase 归 Idle 之后**——那时播放页已离开组合，模式的翻转
+        // 无从影响飞行几何；同时仍满足「不留泄漏标记」的原意（见下方收尾）。
         cancelJobs()
         val gen = ++generation
         exitJob = scope.launch {
@@ -300,6 +303,10 @@ class PlayerFlight(private val scope: CoroutineScope) {
             snapshot = null
             started = false
             entrySource = null
+            // 收尾再清瞬态标记：此刻播放页已离开组合，翻转不再影响任何飞行几何。
+            // 保留清理是必要的——否则标记泄漏到下一次「直入播放页」（不经飞行）会先落
+            // 封面态再滑走，且同一首歌时 PlayerScreen 的守卫不成立 → 歌词页永久进不去。
+            entryShowCover = false
         }
     }
 

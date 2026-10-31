@@ -129,8 +129,13 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
     val configuration = LocalConfiguration.current
     val landscape = configuration.screenHeightDp < configuration.screenWidthDp
 
-    // 进入飞行落封面模式：entryShowCover 为瞬态，点击封面/手势即清除，不动持久化偏好
+    // 进入飞行落封面模式：entryShowCover 为瞬态，点击封面/手势即清除，不动持久化偏好。
+    //
+    // 注意：退出飞行期间这里**不会**翻转——`beginExit` 特意把 entryShowCover 的清理
+    // 推迟到飞行结束（见 Flight.beginExit 的注释）。否则本值由 false 翻 true 会让 modeT
+    // 从 0 动画到 1，封面改朝歌词小窗（左上）飞、歌词页闪一下，与「缩回右下迷你条」冲突。
     val showLyrics = state.lyricEnabled && lyrics != null && flight?.entryShowCover != true
+
     SideEffect {
         flight?.visualMode = if (showLyrics) PlayerFlight.VisualMode.Lyrics else PlayerFlight.VisualMode.Cover
     }
