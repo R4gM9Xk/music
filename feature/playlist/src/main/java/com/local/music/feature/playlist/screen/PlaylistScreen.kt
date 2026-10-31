@@ -14,7 +14,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
@@ -23,6 +23,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -33,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.ArtThumb
+import com.local.music.core.ui.components.ChromeBottomInset
 import com.local.music.core.ui.components.CollectionActionsSheet
 import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoSong
@@ -61,6 +63,9 @@ import com.local.music.core.ui.theme.LocalGlassColors
 fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
     // 命名草稿：remember 于本屏，面板 show 后经闭包活读写（重开保留上次草稿，同旧行为）
     var newName by remember { mutableStateOf("") }
+    // P3-39：滚动位置改 rememberSaveable（进程内重建可恢复）。注意 AnimatedContent 换屏
+    // 会销毁内容、rememberSaveable 不保留——真正跨屏保留需把该状态提到 AppState，属后续项
+    val scrollState = rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
     // 模态面板宿主（GlassApp 根层）：新建歌单/集合面板经 show 挂载
     val modal = LocalModalState.current
 
@@ -87,7 +92,7 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
         Column(
             Modifier
                 .weight(1f)
-                .verticalScroll(rememberScrollState()),
+                .verticalScroll(scrollState),
         ) {
             PageHeader(title = "歌单", actionIcon = GlassIcons.Plus, onAction = {
                 // 新建歌单面板（含输入框：GlassSheet 的 imePadding 让其浮在键盘之上，机制不动）
@@ -129,8 +134,12 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                     }
                 }
             })
-            // 玻璃封面墙（内建歌单已被删除的不再显示）
-            (state.visibleBuiltInPlaylists() + state.userPlaylists).chunked(2).forEach { pair ->
+            // 玻璃封面墙（内建歌单已被删除的不再显示）。P2-22：userPlaylists 先经 resolvePlaylist
+            // 实时解析——计数与详情页同口径、失效 id 被过滤；内建歌单 visibleBuiltInPlaylists()
+            // 已 resolve 过，重复 resolve 幂等（songIndex 缓存 O(1)），可接受
+            val wallPlaylists = (state.visibleBuiltInPlaylists() + state.userPlaylists)
+                .map { state.resolvePlaylist(it.id) ?: it } // 计数实时化 + 失效 id 过滤
+            wallPlaylists.chunked(2).forEach { pair ->
                 Row(
                     Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -145,12 +154,16 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                                 collectionActions(
                                     DetailTarget(DetailTarget.Kind.Playlist, playlist.id),
                                     playlist.title,
-                                    state.resolvePlaylist(playlist.id)?.tracks.orEmpty(),
+                                    playlist.tracks, // resolve 过的 tracks，与 meta 计数同源
                                 )
                             },
                             modifier = Modifier.weight(1f),
+                            // P3-43：封面取首曲（详情页同口径），不再恒为占位
+                            artworkUri = playlist.tracks.firstOrNull()?.artworkUri,
                         )
                     }
+                    // P2-2：奇数行右列补等重占位，避免唯一卡 weight 撑满整行（封面高度翻倍）
+                    if (pair.size == 1) Spacer(Modifier.weight(1f))
                 }
             }
 
@@ -198,7 +211,9 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                     )
                 }
             }
-            Spacer(Modifier.navigationBarsPadding().height(146.dp))
+            // 底部避让：悬浮 Chrome + 手势条；高度取自 core/ui 单点常量（原先与另外两个主屏
+            // 各自硬编码 146.dp，Chrome 高度一变就得同步三处，漏改一处最后一行被迷你条盖住）
+            Spacer(Modifier.navigationBarsPadding().height(ChromeBottomInset))
             }
     }
 }

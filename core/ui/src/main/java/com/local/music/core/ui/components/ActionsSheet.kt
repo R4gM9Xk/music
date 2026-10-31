@@ -64,7 +64,11 @@ fun SongActionsSheet(
     LaunchedEffect(visible) {
         if (!visible) sub = SongActionSub.None
     }
-    val canRemove = playlistContextId != null && playlistContextId.startsWith("user-") &&
+    // 可移除性判定统一走 isEditablePlaylist（内建常驻 + 自建可编辑；动态歌单由状态实时
+    // 解析、不可写）。旧实现要求 "user-" 前缀 → 内建歌单「能加歌、删不掉」，
+    // 用户加错歌没有任何自救途径（P2-3）。
+    val canRemove = playlistContextId != null &&
+        state.isEditablePlaylist(playlistContextId) &&
         state.isSongInPlaylist(playlistContextId, song.id)
     val favorite = state.isFavorite(song.id)
     GlassSheet(visible = visible && sub == SongActionSub.None, onDismiss = onDismiss, title = song.title) {
@@ -242,22 +246,35 @@ fun CollectionActionsSheet(
     onExportM3u: (() -> Unit)? = null,
 ) {
     var showRename by remember { mutableStateOf(false) }
+    // P2-③：删除二次确认。旧实现单击 `删除歌单` 立即销毁歌单及全部曲目关系（实测一次误触
+    // 即数据丢失，且无撤销入口）。改为两步：动作行只切到确认子面板，真正删除由确认行触发。
+    var showDeleteConfirm by remember { mutableStateOf(false) }
     var newName by remember { mutableStateOf("") }
     LaunchedEffect(visible) {
-        if (!visible) showRename = false
+        if (!visible) {
+            showRename = false
+            showDeleteConfirm = false
+        }
     }
     LaunchedEffect(showRename) {
         if (showRename) {
             newName = state.userPlaylists.firstOrNull { it.id == target.id }?.title.orEmpty()
         }
     }
+    // 重命名查重：与新建路径（PlaylistScreen.duplicate）同口径——user- 歌单与内建歌单标题
+    // 都算冲突。必须排除「名字没改」的情况，否则用户点保存会被误报重名。
+    // 旧实现重命名完全不查重，而 createPlaylist 有同名合并语义（同名返回现有歌单），
+    // 于是能造出两个同名歌单，后续合聚会命中较早那个，内容落到意料之外的歌单。
+    val trimmedName = newName.trim()
+    val currentTitle = state.userPlaylists.firstOrNull { it.id == target.id }?.title.orEmpty()
+    val duplicateName = trimmedName.isNotEmpty() && trimmedName != currentTitle &&
+        state.playlistTitleExists(trimmedName)
     fun commitRename() {
-        if (newName.isNotBlank()) {
-            state.renamePlaylist(target.id, newName)
-            onDismiss()
-        }
+        if (newName.isBlank() || duplicateName) return
+        state.renamePlaylist(target.id, newName)
+        onDismiss()
     }
-    GlassSheet(visible = visible && !showRename, onDismiss = onDismiss, title = title) {
+    GlassSheet(visible = visible && !showRename && !showDeleteConfirm, onDismiss = onDismiss, title = title) {
         SheetAction(
             icon = GlassIcons.Play,
             label = "全部播放",
@@ -313,16 +330,16 @@ fun CollectionActionsSheet(
                 },
             )
         }
+        // 动态歌单（收藏 / 最近播放 / 最常播放）由状态实时解析，既不接受加歌也不允许删除：
+        // 走 DemoCatalog.dynamicIds 集合判定，新增动态歌单无需再补这里的白名单
         val isDynamic = target.kind == DetailTarget.Kind.Playlist &&
-            (target.id == DemoCatalog.FavoritesId || target.id == DemoCatalog.RecentId)
+            target.id in DemoCatalog.dynamicIds
         if (target.kind == DetailTarget.Kind.Playlist && !isDynamic) {
             SheetAction(
                 icon = GlassIcons.Trash,
                 label = "删除歌单",
-                onClick = {
-                    state.deletePlaylist(target.id)
-                    onDismiss()
-                },
+                subtitle = "需要二次确认",
+                onClick = { showDeleteConfirm = true },
             )
         }
     }
@@ -339,9 +356,39 @@ fun CollectionActionsSheet(
         SheetAction(
             icon = GlassIcons.Edit,
             label = "保存",
-            subtitle = if (newName.isBlank()) "先输入名称" else "「${newName.trim()}」",
-            emphasized = newName.isNotBlank(),
+            subtitle = when {
+                trimmedName.isEmpty() -> "先输入名称"
+                duplicateName -> "已有同名歌单"
+                else -> "「$trimmedName」"
+            },
+            emphasized = trimmedName.isNotEmpty() && !duplicateName,
             onClick = { commitRename() },
+        )
+    }
+    // P2-③ 删除确认子面板：标题区写明「不可撤销」与受影响曲目数，确认行才真正删除。
+    // 与重命名面板同构（同一 GlassSheet 容器、同一 showXxx 布尔互斥），不引新模态机制。
+    GlassSheet(visible = visible && showDeleteConfirm, onDismiss = onDismiss, title = "删除歌单") {
+        Text(
+            "「$title」将从歌单列表移除，歌单内的 ${tracks.size} 首曲目关系一并清除，此操作不可撤销。",
+            color = LocalGlassColors.current.textSecondary,
+            fontSize = 13.sp,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
+        )
+        Spacer(Modifier.height(4.dp))
+        SheetAction(
+            icon = GlassIcons.Trash,
+            label = "确认删除",
+            subtitle = "「$title」· ${tracks.size} 首",
+            onClick = {
+                state.deletePlaylist(target.id)
+                onDismiss()
+            },
+        )
+        SheetAction(
+            icon = GlassIcons.Back,
+            label = "取消",
+            subtitle = "保留歌单",
+            onClick = { showDeleteConfirm = false },
         )
     }
 }
@@ -351,7 +398,7 @@ fun CollectionActionsSheet(
  * 顶部搜索过滤（纯标题/艺术家包含匹配，同 searchScope 模式）+ 全曲库多选
  * （LazyColumn 懒加载，key = 稳定歌曲 id）；已在歌单的行置灰不可选；
  * 底部「添加 N 首」经 [onAdd] 一次性提交——mutator 由调用方单点走 addToPlaylist，本组件不写状态。
- * 经 modal.show 挂根层宿主：每次打开都是新组合，搜索词与选中集天然重置。
+ * 状态自守：visible 转 false 时清空搜索词与选中集（不依赖「必须经 modal.show 组合」这一外部前提）。
  */
 @Composable
 fun AddSongsSheet(
@@ -364,10 +411,22 @@ fun AddSongsSheet(
 ) {
     var query by remember { mutableStateOf("") }
     val selected = remember { mutableStateListOf<String>() }
+    // 自守的重置：面板每次关闭即清空搜索词与选中集。
+    // 原先只在 KDoc 里声明「每次打开都是新组合，天然重置」——那依赖调用方必须经 modal.show
+    // （宿主销毁 content 才会重建状态）。组件契约不该寄托在调用方式上：将来任何「常驻组合」
+    // 的用法（新入口/预览/常驻侧栏）都会把上次的搜索词与选中集带出来。
+    // 对照同文件 SongActionsSheet 的 sub 状态就是显式重置的，这里补齐同款。
+    LaunchedEffect(visible) {
+        if (!visible) {
+            query = ""
+            selected.clear()
+        }
+    }
     // 已在歌单的曲目 id 集：置灰不可选（id 为 f<路径> 稳定体系，重扫后仍对位）
     val existingIds = remember(existingTracks) { existingTracks.map { it.id }.toHashSet() }
-    // 排序缓存（键 = library 引用 + 排序档，与曲库页同款）→ 过滤结果二次缓存（避免每次重组整库过滤）
-    val all = remember(state.library, state.songSort) { state.sortedSongs() }
+    // 排序缓存（键 = library 引用 + 排序档 + 过滤开关，与曲库页同款）→ 过滤结果二次缓存
+    // （P2-④：漏 scanFilterShort 会让「添加歌曲」列表仍列出已被过滤掉的短音频）
+    val all = remember(state.library, state.songSort, state.scanFilterShort) { state.sortedSongs() }
     val songs = remember(all, query) {
         val q = query.trim()
         if (q.isEmpty()) all else all.filter { it.title.contains(q, true) || it.artist.contains(q, true) }

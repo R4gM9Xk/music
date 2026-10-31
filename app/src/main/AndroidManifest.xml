@@ -27,12 +27,23 @@
         <package android:name="com.android.settings" />
     </queries>
 
+    <!-- P3-⑥：attributionTags 必须**预先在 manifest 声明**，否则 Android 12+ 的
+         AppOps 归因链拿不到归属，系统侧在 AppOps 探测处刷 E 级日志
+         （「attributionTag ... not declared」）。归因 tag 是 API 31+ 的机制：
+         应用若以带 tag 的 Context 访问受 AppOps 管控的能力（这里主要落在
+         media3 的媒体会话/通知链路 —— 通知栏媒体控件、蓝牙媒体按钮都要过
+         AppOps 的媒体控制校验），该 tag 必须先出现在 ApplicationInfo.attributionTags 里。
+         只声明不改行为：不动任何权限、不改变功能，仅让系统有确定归属可写。
+         单个 tag 足够——本应用所有音频播放/媒体会话同属一个业务域。 -->
     <application
         android:label="音乐"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/Theme.ColorOSMusic"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:attributionTags="media_playback">
 
         <provider
             android:name="androidx.core.content.FileProvider"

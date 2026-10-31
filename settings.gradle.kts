@@ -1,7 +1,9 @@
 // ColorOS 音乐 —— 工程设置
 //
 // 当前仓库为「液态玻璃流」UI 复刻工程：仅纳入真实存在源码的模块。
-// （历史反编译骨架中的 core:domain / core:player 等模块无源码，已从构建移除。）
+// 历史反编译骨架留下的 core/{coloros,common,data,database,datalocal,datastore,domain,model,player}
+// 九个目录只有一份自述「参考骨架」的 build.gradle.kts、没有任何 src，既不参与构建也不被引用
+// ——纯粹误导索引与代码审查，已整目录删除（那次提交可 git show 找回，无需留在工作树里）。
 
 pluginManagement {
     repositories {

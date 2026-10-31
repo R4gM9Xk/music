@@ -47,7 +47,15 @@ import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.auroraAccentColor
 
-/** SongRow 固定行高（9+48+9dp）：队列滚动定位与拖拽重排共享的数学基准 */
+/**
+ * SongRow 固定行高（9+48+9dp）：队列滚动定位与拖拽重排共享的数学基准。
+ *
+ * P3-60 已知局限：这是**视觉**固定高，不随字体缩放——系统大字号（fontScale ≥ 1.3）下
+ * 15sp 标题 + 12sp 副标题的 intrinsic 高度会超过 48dp 中列，内容被 66dp 行高压紧甚至裁切。
+ * 行高不能简单改成 IntrinsicSize：队列滚动定位与拖拽重排拿它做像素级数学（offset 换算），
+ * 动态高度会让两处计算全部失准。当前取「普通字号留白充足、大字号勉强可读」的折中；
+ * 若将来要支持无障碍大字号，需要把定位/拖拽两处同步改为按 measured height 计算。
+ */
 val SongRowHeight = 66.dp
 
 /** 大标题页头：30sp 粗体 + 可选右侧玻璃圆钮（.hd），可挂第二动作（渲染在主动作左侧）；actionLabel 作为按钮读屏描述 */
@@ -231,7 +239,9 @@ fun SongRow(
             song.art, Modifier.size(48.dp),
             RoundedCornerShape(if (squareThumb) 8.dp else 12.dp),
             bordered = true,
+            // coverBitmap 恒为 null（扫描不再预解码全库）；真封面经 artworkUri 按需解码
             bitmap = song.coverBitmap,
+            artworkUri = song.artworkUri,
         )
         Column(Modifier.weight(1f)) {
             Text(
@@ -248,6 +258,20 @@ fun SongRow(
             WaveIndicator(barCount = 4, playing = wavePlaying)
         } else if (selected) {
             Text("已选", fontSize = 12.sp, color = auroraAccentColor(), fontWeight = FontWeight.Medium)
+        } else if (onRemoveClick != null) {
+            // P3-74：onRemoveClick 优先（队列行不需要菜单，只要移除——与 KDoc 承诺一致，
+            // 队列行同时误传两个回调时不再被"更多"按钮抢先占位）
+            Box(
+                Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable(interactionSource = actionInteractionSource, indication = null, onClick = onRemoveClick)
+                    .semantics { contentDescription = "从队列移除" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(GlassIcons.MinusCircle, null, Modifier.size(16.dp),
+                    tint = LocalGlassColors.current.textFaint)
+            }
         } else if (onMoreClick != null) {
             // "更多"是独立触点：不再吞进整行的播放点击
             Box(
@@ -259,19 +283,6 @@ fun SongRow(
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(GlassIcons.More, null, Modifier.size(16.dp),
-                    tint = LocalGlassColors.current.textFaint)
-            }
-        } else if (onRemoveClick != null) {
-            // 队列行移除：36dp 独立触点
-            Box(
-                Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable(interactionSource = actionInteractionSource, indication = null, onClick = onRemoveClick)
-                    .semantics { contentDescription = "从队列移除" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(GlassIcons.MinusCircle, null, Modifier.size(16.dp),
                     tint = LocalGlassColors.current.textFaint)
             }
         } else if (trailing != null) {
@@ -298,6 +309,7 @@ fun PlaylistCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     bitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    artworkUri: String? = null,
     onLongClick: (() -> Unit)? = null,
 ) {
     val glass = LocalGlassColors.current
@@ -309,7 +321,10 @@ fun PlaylistCard(
         onLongClick = onLongClick,
     ) {
         Column {
-            ArtThumb(art, Modifier.fillMaxWidth().aspectRatio(1.6f), RoundedCornerShape(0.dp), bitmap = bitmap)
+            ArtThumb(
+                art, Modifier.fillMaxWidth().aspectRatio(1.6f), RoundedCornerShape(0.dp),
+                bitmap = bitmap, artworkUri = artworkUri,
+            )
             Column(
                 Modifier
                     .fillMaxWidth()

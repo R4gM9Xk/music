@@ -1,9 +1,11 @@
 package com.local.music.player
 
 import android.content.Intent
+import android.app.PendingIntent
 import android.media.audiofx.Equalizer
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -17,6 +19,8 @@ import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.SettableFuture
+import com.local.music.MainActivity
 import com.local.music.core.ui.state.SongSpec
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -43,6 +47,12 @@ class MusicPlaybackService : MediaSessionService() {
 
     // 定时关闭（不持久化）：分钟档协程 + 播完档旗标；重复下发新定时先取消旧协程/清旗标
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    // 续播读盘线程（见 onPlaybackResumption）：单线程即可——同一进程内恢复请求是低频且串行语义，
+    // 不需要并发；随服务实例创建/销毁（onDestroy 里 shutdown），不跨实例共享，
+    // 避免 companion 静态执行器被首个实例关掉后，第二个实例再也用不了
+    private val queueReadExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "queue-state-reader").apply { isDaemon = true }
+    }
     private var sleepJob: Job? = null
     private var stopAfterCurrent = false // -1 档：切到下一首的瞬间暂停
     private var stopAtQueueEnd = false // -2 档：队列自然播完（ENDED）暂停
@@ -61,6 +71,20 @@ class MusicPlaybackService : MediaSessionService() {
             .setWakeMode(C.WAKE_MODE_LOCAL)
             .build()
         mediaSession = MediaSession.Builder(this, player)
+            // **必须设置 sessionActivity**：media3 的 sessionActivity 默认 null，而
+            // DefaultMediaNotificationProvider 会无条件 `setContentIntent(getSessionActivity())`
+            // → 通知能显示但**没有 contentIntent**，于是下拉通知栏点媒体卡片、锁屏点封面、
+            // ColorOS 流体云点胶囊都不会打开 App，只有播放控制按钮可用。
+            .setSessionActivity(
+                PendingIntent.getActivity(
+                    this, 0,
+                    Intent(this, MainActivity::class.java)
+                        .setAction(Intent.ACTION_MAIN)
+                        .addCategory(Intent.CATEGORY_APP_MUSIC)
+                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                ),
+            )
             .setCallback(
                 object : MediaSession.Callback {
                     // 自定义命令必须在此声明，否则控制器 sendCustomCommand 被拒（EQ 预设 / shuffle 插入修正 / 定时关闭共用此通道）
@@ -86,23 +110,41 @@ class MusicPlaybackService : MediaSessionService() {
                      * （AppState.scheduleSave 时同步写的 queue_state.json）。
                      * 返回的 MediaItemsWithStartPosition 让播放器直接装载队列并定位到上次进度。
                      * 无现场（首装 / 用户清空过队列）返回空列表：系统按默认行为处理，不强行播放。
+                     *
+                     * **必须异步返回**：本回调在 media3 的主 looper 上执行，而 QueueStateStore.read
+                     * 是 readText + 整份 JSON 解析（整库队列数百 KB，低端机可达数百毫秒）。
+                     * 在这里同步读会把主线程连同正在启动的播放器初始化一起卡住（黑屏/ANR 风险）。
+                     * 因此先在回调里立刻返回一个 SettableFuture，把读盘丢到 [queueReadExecutor]，
+                     * 读完再 set —— media3 只是把这个 Future 当挂起中的结果，不会阻塞它自己的 looper。
+                     *
+                     * 失败兜底（保持既有语义）：读不到 / 解析异常 / 空队列一律 set 合法空结果，
+                     * 绝不 setException —— 让系统走默认行为，比抛出去导致恢复流程崩掉安全。
                      */
                     override fun onPlaybackResumption(
                         mediaSession: MediaSession,
                         controller: MediaSession.ControllerInfo,
                     ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
-                        val state = QueueStateStore.read(this@MusicPlaybackService)
-                        if (state == null || state.specs.isEmpty()) {
-                            return Futures.immediateFuture(
-                                MediaSession.MediaItemsWithStartPosition(emptyList(), 0, C.TIME_UNSET),
-                            )
+                        val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
+                        // 整个后台执行体都兜住：任何异常都必须落成空结果，否则 Future 永不完成，
+                        // 系统侧会一直挂着等一个不会来的恢复结果
+                        val readTask = Runnable {
+                            val result = runCatching { buildResumptionState() }
+                                .getOrElse { e ->
+                                    Log.e(TAG, "onPlaybackResumption read failed", e)
+                                    null
+                                }
+                                ?: MediaSession.MediaItemsWithStartPosition(emptyList(), 0, C.TIME_UNSET)
+                            future.set(result)
                         }
-                        val items = state.specs.map { it.toMediaItem() }
-                        val index = state.index.coerceIn(0, items.lastIndex)
-                        val positionMs = (state.positionSec * 1000f).toLong().coerceAtLeast(0L)
-                        return Futures.immediateFuture(
-                            MediaSession.MediaItemsWithStartPosition(items, index, positionMs),
-                        )
+                        try {
+                            queueReadExecutor.execute(readTask)
+                        } catch (e: java.util.concurrent.RejectedExecutionException) {
+                            // 服务正在销毁（执行器已 shutdown）时仍可能收到回调：
+                            // 同线程直接算掉，保证 Future 一定有结果，不把系统侧挂死
+                            Log.e(TAG, "queueReadExecutor rejected, reading inline", e)
+                            readTask.run()
+                        }
+                        return future
                     }
 
                     override fun onCustomCommand(
@@ -155,16 +197,37 @@ class MusicPlaybackService : MediaSessionService() {
                 }
 
                 override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                    // -1 档「播完当前首」：切到下一首的瞬间暂停并清旗标（手动切歌同此瞬间，一并承接）
+                    // -1 档「播完当前首」：只认**自然播完**（AUTO）这一次切换。
+                    // 为什么必须判 reason：用户在播放中手动点下一首 / 拖动进度到下一区段（SEEK）、
+                    // 播放队列被替换（PLAYLIST_CHANGED）、单曲循环重入（REPEAT）都会触发同一个回调。
+                    // 旧实现不判 reason，于是「设了播完当前首 → 用户主动切歌」也会被暂停——
+                    // 用户明确要听下一首却被拦下，是纯粹的误伤。
+                    // 非 AUTO 的处理：**仍清旗标、但不暂停**。清掉是必须的——旗标没有回执，
+                    // 留着就是悬空的「下一次自动切歌时莫名暂停」，那是比丢失定时更糟的体验；
+                    // UI 侧手动切歌本就会自行撤销定时（AppState.setSleepTimer(0)），这里只是兜住
+                    // 「UI 没来得及下发撤销」的窗口期，语义上一致。
                     if (stopAfterCurrent) {
                         stopAfterCurrent = false
-                        player.pause()
+                        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) player.pause()
                     }
                 }
             },
         )
         // 均衡器挂播放器音频会话；音频会话未就绪时由首次 EQ 命令/首个 READY 延迟创建
         runCatching { ensureEqualizer(player.audioSessionId) }
+    }
+
+    /**
+     * 组装续播现场（在 [queueReadExecutor] 的后台线程执行，见 onPlaybackResumption）。
+     * 无现场返回 null，由调用方落成空结果——空列表即「按系统默认处理」，不强行播放。
+     */
+    private fun buildResumptionState(): MediaSession.MediaItemsWithStartPosition? {
+        val state = QueueStateStore.read(this) ?: return null
+        if (state.specs.isEmpty()) return null
+        val items = state.specs.map { it.toMediaItem() }
+        val index = state.index.coerceIn(0, items.lastIndex)
+        val positionMs = (state.positionSec * 1000f).toLong().coerceAtLeast(0L)
+        return MediaSession.MediaItemsWithStartPosition(items, index, positionMs)
     }
 
     /**
@@ -206,7 +269,8 @@ class MusicPlaybackService : MediaSessionService() {
             )
             .build()
 
-    /** 按预设名应用频段增益（5 段增益表 → 实际频段数线性重采样）；Off = 关闭音效 */    private fun applyEqPreset(presetName: String?) {
+    /** 按预设名应用频段增益（5 段增益表 → 实际频段数线性重采样）；Off = 关闭音效 */
+    private fun applyEqPreset(presetName: String?) {
         if (presetName != null) lastPreset = presetName
         runCatching { ensureEqualizer(mediaSession?.player?.audioSessionId ?: 0) }
         val eq = equalizer ?: return
@@ -242,7 +306,13 @@ class MusicPlaybackService : MediaSessionService() {
 
     /**
      * 定时关闭（服务端权威）：mode > 0 = N 分钟后暂停（协程 delay 到点）；
-     * -1 = 播完当前首（播放器切歌瞬间暂停）；-2 = 播完整个队列（ENDED 暂停）；0 = 取消。
+     * -1 = 播完当前首（**仅** Player.MEDIA_ITEM_TRANSITION_REASON_AUTO 那一瞬暂停）；
+     * -2 = 播完整个队列（ENDED 暂停）；0 = 取消。
+     *
+     * -1 的边界（与 UI 的契约）：只有「这一首自己播完」才算达成。手动切歌 / 拖动进度 /
+     * 队列被替换都不暂停，且顺手清掉旗标（悬空旗标会让下一次自然切歌莫名暂停，更危险）；
+     * UI 侧（AppState）在用户手动切歌或手动暂停时本就会下发 0 撤销定时，两处口径一致。
+     *
      * 重复下发新定时先取消旧协程/清旗标；到点执行后引用就地清理，随服务销毁整体取消。
      */
     private fun applySleepTimer(modeMinutes: Int) {
@@ -275,6 +345,7 @@ class MusicPlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         serviceScope.cancel() // 定时关闭协程随作用域取消，无泄漏
+        queueReadExecutor.shutdown() // 续播读盘的守护线程收摊（任务已跑完/正在跑的那个自行结束）
         runCatching { equalizer?.release() }
         equalizer = null
         mediaSession?.run {
@@ -303,6 +374,7 @@ class MusicPlaybackService : MediaSessionService() {
         const val KEY_SLEEP_MODE = "sleepMode"
 
         private const val GAIN_STEPS = 5
+        private const val TAG = "MusicPlaybackService"
 
         /** 5 频段（低→高）增益表，单位 dB，幅度控制在 ±6 内 */
         private fun eqGainsFor(presetName: String?): FloatArray? = when (presetName) {

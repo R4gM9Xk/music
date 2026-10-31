@@ -2,22 +2,29 @@ package com.local.music.update
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import android.content.pm.Signature
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import com.local.music.feature.settings.screen.UpdateUiState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.Locale
 
 /**
  * 应用内更新（GitHub 仓库 git 分发，无 API 依赖）：
@@ -36,38 +43,82 @@ class UpdateManager(
     private var pendingInfo: UpdateInfo? = null
     private val apkFile: File get() = File(context.filesDir, "update/app-update.apk")
 
+    /**
+     * 检查在飞标记：手动检查与启动静默检查共用一把锁。
+     *
+     * 为什么不只看 [state]：状态置位是协程体里的第一句，但 `scope.launch` 只是把任务排进队列——
+     * 从「判断状态」到「协程真正跑起来置位」之间有一段窗口，启动 5s 静默检查与用户点设置页
+     * 恰好落在这个窗口里就会双进：两路 fetchManifest（整体 15s 预算）白跑一遍，并互相覆盖
+     * 彼此的 state（静默检查先回来置 Available，手动检查后回来又覆盖）。
+     * AtomicBoolean 是同步置位，跨线程/跨调度都能立刻看到，窗口不存在。
+     *
+     * 代价（有意为之）：静默检查在飞时用户点「检查更新」会被合并进那一路，不再单独发请求；
+     * 静默检查最长 15s（整体预算，见 [fetchManifest]）内必然收敛并更新 state，
+     * 不值得为这点体感再开一路并发拉清单。
+     */
+    private val checkInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // 下载进度节流基准：上一次真正写进 Compose state 的整数百分比与时刻（见 updateProgress）。
+    // @Volatile：写入发生在 downloadTo 的 IO 线程，读也只在同一线程，但重置点在主线程的
+    // startUpdate 里——加 volatile 保证主线程的复位对下载线程可见，不必再上锁
+    @Volatile private var lastProgressPercent = -1
+    @Volatile private var lastProgressAtMs = 0L
+
+    // P3-50 不定长模式的节流基准：已读字节换算的 MB 数（见 updateProgress 的 total <= 0 分支）
+    @Volatile private var lastIndeterminateReadMb = -1
+
     /** 手动检查（设置页点击；失败显示原因） */
     fun check() {
-        if (state.status == UpdateUiState.Status.Checking) return // 并发防护：检查中忽略重复点击
+        // 并发防护：检查中忽略重复点击（含静默检查在飞）
+        if (!checkInFlight.compareAndSet(false, true)) return
+        // 状态先行、同步置位：UI 立即进入「检查中」并把按钮禁用，
+        // 不能等协程调度到才有反馈（否则连点两下的第二下会看到旧状态）
+        state = UpdateUiState(status = UpdateUiState.Status.Checking)
         scope.launch {
-            state = UpdateUiState(status = UpdateUiState.Status.Checking)
-            val info = fetchManifest()
-            state = when {
-                info == null -> UpdateUiState(status = UpdateUiState.Status.Failed, message = "无法连接更新源")
-                info.versionCode <= currentVersionCode() ->
-                    UpdateUiState(status = UpdateUiState.Status.UpToDate)
-                else -> UpdateUiState(
-                    status = UpdateUiState.Status.Available,
-                    versionName = info.versionName,
-                    changelog = info.changelog,
-                ).also { pendingInfo = info }
+            try {
+                val info = fetchManifest()
+                state = when {
+                    info == null -> UpdateUiState(
+                        status = UpdateUiState.Status.Failed,
+                        message = "无法连接更新源",
+                        failStage = UpdateUiState.FailStage.Check, // P2-25：检查失败 ≠ 下载失败，文案按阶段给
+                    )
+                    info.versionCode <= currentVersionCode() ->
+                        UpdateUiState(status = UpdateUiState.Status.UpToDate)
+                    else -> UpdateUiState(
+                        status = UpdateUiState.Status.Available,
+                        versionName = info.versionName,
+                        changelog = info.changelog,
+                    ).also { pendingInfo = info }
+                }
+            } finally {
+                // 必须无条件释放：fetchManifest 内部是 runCatching 兜底的，但「协程被取消」
+                // 同样会走到这里——漏放会让本次进程内再也无法检查更新
+                checkInFlight.set(false)
             }
         }
     }
 
     /** 启动静默检查：失败无声、有新版仅点亮设置行 */
     fun checkSilently() {
+        // 与手动检查共用「在飞」标记：静默检查在飞时用户点检查，直接复用它的结果（它完成后会更新 state），
+        // 不重复拉清单；反之手动检查在飞时静默检查让路
+        if (!checkInFlight.compareAndSet(false, true)) return
         scope.launch {
-            val info = fetchManifest() ?: return@launch
-            if (info.versionCode > currentVersionCode() &&
-                state.status == UpdateUiState.Status.Idle
-            ) {
-                pendingInfo = info
-                state = UpdateUiState(
-                    status = UpdateUiState.Status.Available,
-                    versionName = info.versionName,
-                    changelog = info.changelog,
-                )
+            try {
+                val info = fetchManifest() ?: return@launch
+                if (info.versionCode > currentVersionCode() &&
+                    state.status == UpdateUiState.Status.Idle
+                ) {
+                    pendingInfo = info
+                    state = UpdateUiState(
+                        status = UpdateUiState.Status.Available,
+                        versionName = info.versionName,
+                        changelog = info.changelog,
+                    )
+                }
+            } finally {
+                checkInFlight.set(false)
             }
         }
     }
@@ -76,22 +127,34 @@ class UpdateManager(
     fun startUpdate() {
         val info = pendingInfo ?: return
         if (state.status == UpdateUiState.Status.Downloading) return // 并发防护：下载中忽略重复点击
+        // P3-51：清掉上次进程被杀残留的半截 tmp（downloadApk 的成败路径都会删 tmp，
+        // 唯独进程中途死亡没人兜底；不清理的话旧半截会一直占着私有目录空间）
+        runCatching { File(apkFile.parentFile, TMP_NAME).delete() }
+        // 进度节流基准随本次下载重置，避免上一次下载的百分比/时间戳让首块数据被误判为「无需写」
+        lastProgressPercent = -1
+        lastProgressAtMs = 0L
+        lastIndeterminateReadMb = -1 // P3-50：不定长基准一并重置
         scope.launch {
             state = UpdateUiState(
                 status = UpdateUiState.Status.Downloading,
                 versionName = info.versionName,
                 changelog = info.changelog,
                 progress = 0f,
+                // P3-50：先按「不定长」显示；首次回调拿到有效 Content-Length 再转百分比
+                // （经代理转发常丢 Content-Length，旧实现这种场景全程恒 0%）
+                indeterminate = true,
             )
             val downloaded = withContext(Dispatchers.IO) { downloadApk(info) }
             when {
                 downloaded != null -> {
-                    state = state.copy(status = UpdateUiState.Status.ReadyToInstall)
+                    state = state.copy(status = UpdateUiState.Status.ReadyToInstall, indeterminate = false)
                     install()
                 }
                 else -> state = state.copy(
                     status = UpdateUiState.Status.Failed,
                     message = "网络异常或下载中断",
+                    failStage = UpdateUiState.FailStage.Download, // P2-25：真·下载失败
+                    indeterminate = false,
                 )
             }
         }
@@ -103,6 +166,24 @@ class UpdateManager(
             state = state.copy(
                 status = UpdateUiState.Status.Failed,
                 message = "安装包已丢失，请重新下载",
+                failStage = UpdateUiState.FailStage.Install, // P2-25：包丢了要重下，与验签失败（不许重试）区分
+            )
+            return
+        }
+        // 签名校验（最后一道防线，fail-closed）：sha256 只能证明「下载到的字节与清单写的一致」，
+        // 而清单与 APK 走同一条不受信通道（gh-proxy / raw / jsDelivr），可被同时篡改——
+        // 真正拦得住伪造包的是「待装包签名必须与当前运行包一致」。校验不过就地删除包，
+        // 避免下次误装，并保留明确原因。
+        if (!verifyApkSignature()) {
+            runCatching { apkFile.delete() }
+            // P2-25：验签失败必须同时清 pendingInfo——同一份坏字节重下（同源同签名）必然再失败，
+            // 否则设置页「Failed 且 versionName != null → onStartUpdate()」会把用户锁进死循环。
+            // 清掉后 onStartUpdate 对 null pendingInfo 直接 return，重试入口即便误触也无害
+            pendingInfo = null
+            state = state.copy(
+                status = UpdateUiState.Status.Failed,
+                message = "安装包签名校验失败，已拒绝安装",
+                failStage = UpdateUiState.FailStage.Verify, // P2-25：此阶段**不给**「重新下载」重试入口
             )
             return
         }
@@ -121,6 +202,56 @@ class UpdateManager(
         )
     }
 
+    /**
+     * 校验待装 APK 的签名是否与当前运行包一致（**fail-closed**：读不到也算失败）。
+     *
+     * 为什么必须有这一步：release 变体沿用 debug keystore 签名（见 app/build.gradle.kts），
+     * 而 debug keystore 是公开的通用密钥——任何人都能签出一个「同包名同签名」的包来覆盖安装。
+     * 清单里的 sha256 挡不住这种攻击（攻击者能同时改清单与 APK）。
+     *
+     * 签名按 hex 字符串集合比较，避免 ByteArray.equals 的引用比较陷阱。
+     */
+    private fun verifyApkSignature(): Boolean = runCatching {
+        val pm = context.packageManager
+        val archive = pm.getPackageArchiveInfo(
+            apkFile.absolutePath,
+            PackageManager.GET_SIGNING_CERTIFICATES,
+        ) ?: return@runCatching false
+        val current = pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+        val archiveSigs = signaturesOf(archive)
+        val currentSigs = signaturesOf(current)
+        // 两侧都必须非空（空集相等会误判为通过）
+        archiveSigs.isNotEmpty() && currentSigs.isNotEmpty() && archiveSigs == currentSigs
+    }.getOrDefault(false)
+
+    /** 取包的签名集合（hex 字符串）：优先新 API 的 apkContentsSigners，退回签名历史 */
+    @Suppress("DEPRECATION")
+    private fun signaturesOf(info: PackageInfo): Set<String> {
+        val raw: Array<Signature>? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val signing = info.signingInfo
+            when {
+                signing == null -> null
+                signing.hasMultipleSigners() -> signing.apkContentsSigners
+                else -> signing.apkContentsSigners.ifEmpty { signing.signingCertificateHistory }
+            }
+        } else {
+            info.signatures
+        }
+        return raw.orEmpty().map { it.toByteArray().toHex() }.toSet()
+    }
+
+    /**
+     * 字节数组 → 小写 hex。
+     *
+     * 显式固定 [Locale.US]：`"%02x".format(byte)` 走的是默认 locale 的 formatter，
+     * 在阿拉伯语/波斯语等区域（ar-EG、fa-IR）会把 ASCII 数字换成该区域的数字字形
+     * （如 ٠١٢٣…），产出的就**不是合法 hex 字符串**了——sha256 比对必然恒不相等
+     * （更新永远校验失败），签名比对同样恒不相等（fail-closed 直接拒绝安装）。
+     * 这类 locale 恰好是本应用重点覆盖的市场之一，不能靠运气。
+     */
+    private fun ByteArray.toHex(): String =
+        joinToString("") { String.format(Locale.US, "%02x", it) }
+
     // ── 内部实现 ──────────────────────────────────────────
 
     private data class UpdateInfo(
@@ -134,16 +265,28 @@ class UpdateManager(
     private fun currentVersionCode(): Int = try {
         context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode.toInt()
     } catch (e: Exception) {
+        // 退 0 的理论后果是「清单里任何版本号都被判定为有新版」——实际几乎不可达（读自己包
+        // 的信息只会在 PM 完全异常时失败），但真出现「永远提示有更新」时要有痕迹可查
+        android.util.Log.e("UpdateManager", "currentVersionCode failed; treating as 0 (every manifest looks newer)", e)
         0
     }
 
-    /** 清单三链回退，单链 5s 超时；任一成功即返回 */
+    /**
+     * 清单三链回退，单链 5s 超时；任一成功即返回。
+     *
+     * P3-52：整体再套一层 15s 预算——单链实际是 connect 5s + read 5s 两个独立超时（最长 10s/链），
+     * 三链全卡满理论上要 30s，用户早失去耐心；15s 内走不完就当检查失败处理。
+     * 注意 withTimeoutOrNull 取消的是阻塞 IO 线程上挂起的调用点，已发出的底层连接要等
+     * 单链自身超时才真正断开，但本函数调用方拿到的返回时机不再超过 15s。
+     */
     private suspend fun fetchManifest(): UpdateInfo? = withContext(Dispatchers.IO) {
-        MANIFEST_URLS.firstNotNullOfOrNull { url ->
-            runCatching {
-                val body = httpGet(url, timeoutMs = 5_000) ?: return@runCatching null
-                parseManifest(JSONObject(body))
-            }.getOrNull()
+        withTimeoutOrNull(15_000) {
+            MANIFEST_URLS.firstNotNullOfOrNull { url ->
+                runCatching {
+                    val body = httpGet(url, timeoutMs = 5_000) ?: return@runCatching null
+                    parseManifest(JSONObject(body))
+                }.getOrNull()
+            }
         }
     }
 
@@ -166,32 +309,85 @@ class UpdateManager(
         )
     }
 
-    /** 按清单地址逐个尝试下载；sha256 缺失或不符均视为校验失败（fail-closed），换下一个源 */
+    /**
+     * 按清单地址逐个尝试下载；sha256 缺失或不符均视为校验失败（fail-closed），换下一个源。
+     *
+     * P3-51：runCatching 换显式 try/catch——runCatching 连 CancellationException 一起吞掉，
+     * 协程取消信号会被它伪装成「下载失败」，且阻塞 IO 里的 downloadTo 根本感知不到取消。
+     * 现在循环内 catch 到取消就删 tmp 并原样重抛，让取消语义回到协程层。
+     */
     private fun downloadApk(info: UpdateInfo): File? {
         apkFile.parentFile?.mkdirs()
-        val tmp = File(apkFile.parentFile, "app-update.tmp")
+        val tmp = File(apkFile.parentFile, TMP_NAME)
         for (url in info.apkUrls) {
-            val ok = runCatching {
+            val ok = try {
                 downloadTo(url, tmp) { read, total -> updateProgress(read, total) }
                 val actual = sha256Of(tmp)
                 if (info.sha256 == null || actual != info.sha256) {
                     tmp.delete()
-                    return@runCatching false // sha256 缺失（疑似被代理裁剪）或不符：跳过该源
+                    false // sha256 缺失（疑似被代理裁剪）或不符：跳过该源
+                } else {
+                    tmp.renameTo(apkFile) || (apkFile.delete() && tmp.renameTo(apkFile))
                 }
-                tmp.renameTo(apkFile) || (apkFile.delete() && tmp.renameTo(apkFile))
-            }.getOrDefault(false)
+            } catch (e: CancellationException) {
+                // 取消（协程被杀）：清掉半截包后原样上抛，不能吞
+                tmp.delete()
+                throw e
+            } catch (e: Exception) {
+                // 普通网络异常：换下一个源（等价于旧 runCatching 的兜底语义）
+                false
+            }
             if (ok) return apkFile
         }
         tmp.delete()
         return null
     }
 
+    /**
+     * 下载进度回报（64KB 一块回调 → 快网下每秒可达数百次）。
+     *
+     * 为什么要节流：每次赋值都是一次 snapshot state 写入，会唤醒所有读 progress 的组合
+     * （设置页整行 + 进度条 + 按钮文案），数百 Hz 的无效重组纯属浪费——用户看到的是一根
+     * 百分比进度条，1% 的变化量已经是它物理上能表达的最小粒度（还要再加上一帧 16ms 的显示延迟）。
+     *
+     * 规则：整数百分比变了就写；没变但距上次写入 ≥ [PROGRESS_MIN_INTERVAL_MS] 也写。
+     * 后者是「慢速网络」的补偿——龟速下载时可能几十秒都跨不过 1%，全靠时间兜底，
+     * 否则进度条看起来彻底卡死（块级涓流也要让用户看到它还在动）。
+     *
+     * P3-50：total <= 0（经代理转发丢 Content-Length）时不再直接 return（旧实现进度恒 0%），
+     * 改为按「不定长」回报：首次命中把 indeterminate 置 true（startUpdate 起步已预置 true，
+     * 这里幂等重写）；此后 read 每跨 1MB 或距上次写入 ≥ 100ms 写一次 progress（增量节流），
+     * 让 UI 能表达「仍在动」。某链半途给出了有效 total（>0），立即转回百分比模式。
+     */
     private fun updateProgress(read: Long, total: Long) {
-        if (total > 0) {
-            val p = (read.toFloat() / total).coerceIn(0f, 1f)
+        if (total <= 0) {
+            // 不定长模式：无法计算百分比，用「已读字节数」做节流基准
             if (state.status == UpdateUiState.Status.Downloading) {
-                state = state.copy(progress = p)
+                if (!state.indeterminate) state = state.copy(indeterminate = true)
+                val now = android.os.SystemClock.elapsedRealtime()
+                // 注意两侧必须同型比较（Long vs Int 的 == 走装箱 equals 恒为 false）
+                val mb = read shr 20
+                val mbChanged = mb != lastIndeterminateReadMb.toLong()
+                val intervalElapsed = now - lastProgressAtMs >= PROGRESS_MIN_INTERVAL_MS
+                if (mbChanged || intervalElapsed) {
+                    lastIndeterminateReadMb = mb.toInt()
+                    lastProgressAtMs = now
+                    state = state.copy(progress = read.toFloat())
+                }
             }
+            return
+        }
+        if (state.indeterminate) state = state.copy(indeterminate = false) // 拿到总长：转回百分比模式
+        val p = (read.toFloat() / total).coerceIn(0f, 1f)
+        val percent = (p * 100).toInt()
+        val now = android.os.SystemClock.elapsedRealtime()
+        val percentChanged = percent != lastProgressPercent
+        val intervalElapsed = now - lastProgressAtMs >= PROGRESS_MIN_INTERVAL_MS
+        if (!percentChanged && !intervalElapsed) return
+        lastProgressPercent = percent
+        lastProgressAtMs = now
+        if (state.status == UpdateUiState.Status.Downloading) {
+            state = state.copy(progress = p)
         }
     }
 
@@ -254,12 +450,18 @@ class UpdateManager(
                 md.update(buf, 0, n)
             }
         }
-        md.digest().joinToString("") { "%02x".format(it) }
+        md.digest().joinToString("") { String.format(Locale.US, "%02x", it) }
     }.getOrDefault("")
 
     companion object {
         /** 下载通过下限：APK 至少 1MB（再叠文件头 "PK" 魔数校验） */
         private const val MIN_APK_BYTES = 1L * 1024 * 1024
+
+        /** 下载临时文件名（downloadApk 与 startUpdate 的陈旧清理共用，避免两处字符串漂移） */
+        private const val TMP_NAME = "app-update.tmp"
+
+        /** 进度写入最小间隔（见 [updateProgress]）：低于一帧的刷新率对人眼无意义 */
+        private const val PROGRESS_MIN_INTERVAL_MS = 100L
 
         /** 清单地址链：gh-proxy（国内可达优先）→ raw 直连 → jsDelivr（CDN，可能有最长数小时缓存） */
         private val MANIFEST_URLS = listOf(

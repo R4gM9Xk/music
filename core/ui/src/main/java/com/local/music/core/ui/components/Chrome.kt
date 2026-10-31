@@ -49,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
@@ -56,87 +57,159 @@ import com.local.music.core.ui.theme.LocalGlassColors
 /**
  * 播放进度轨：5px 高圆角轨道，seed2→文字色 渐变填充 + 端点 12dp 发光圆点。
  * 点击直接 seek；拖动本地预览、松手提交；24dp 触摸热区 + 读屏进度语义。
+ *
+ * **入参是取值函数而不是 Float**：调用方多为「每 100ms 变一次」的播放进度，
+ * 若以 Float 形参传入，读状态发生在**调用方的组合作用域**——整个屏幕（含 Chrome 整条
+ * Column、NavBar 三个 tab、封面 lambda 链）都会 10Hz 重组。改成 lambda 后，读取被推迟到
+ * 绘制阶段（[androidx.compose.ui.draw.drawWithCache]），快照状态变化只失效绘制，
+ * 不触发任何重组；读屏语义由独立的极小子组件承接（只它自己重组）。
+ *
+ * [enabled] = false 时**不挂任何手势**：轨道退化为纯展示。更新面板这类「进度由外部驱动、
+ * onSeek 是空实现」的调用方必须传 false——旧实现无条件挂手势，用户拖了会立刻弹回真实
+ * 进度，看起来像 bug（P3-58）。
+ * [onPreview] 把拖动中的预览值（0f..1f）回传给调用方，松手/取消时回传 null，
+ * 供「已播时长」等外部文案跟随手指变化（P3-64）；null = 调用方不需要预览。
  */
 @Composable
 fun ProgressTrack(
-    progress: Float,
+    progressProvider: () -> Float,
     onSeek: (Float) -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    onPreview: ((Float?) -> Unit)? = null,
 ) {
     val palette = LocalAuroraPalette.current
     val glass = LocalGlassColors.current
+    // 拖动预览仍留在组合态：值只在手势期间变，且必须覆盖真实进度
     var dragProgress by remember { mutableStateOf<Float?>(null) }
-    val shown = (dragProgress ?: progress).coerceIn(0f, 1f)
 
     Box(
         modifier
             .fillMaxWidth()
             .height(24.dp) // 触摸热区（视觉轨道仍 5dp 居中）
-            .pointerInput(Unit) {
-                detectTapGestures { offset ->
-                    onSeek((offset.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f))
+            // 链式里按开关拼接：enabled = false 时整段手势不存在（不是"挂了但忽略"）
+            .then(
+                if (enabled) {
+                    Modifier.pointerInput(Unit) {
+                        detectTapGestures { offset ->
+                            onSeek((offset.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f))
+                        }
+                    }
+                } else {
+                    Modifier
+                },
+            )
+            .then(
+                if (enabled) {
+                    Modifier.pointerInput(Unit) {
+                        detectHorizontalDragGestures(
+                            onHorizontalDrag = { change, _ ->
+                                change.consume()
+                                val x = (change.position.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f)
+                                dragProgress = x
+                                onPreview?.invoke(x)
+                            },
+                            onDragEnd = {
+                                dragProgress?.let(onSeek)
+                                dragProgress = null
+                                onPreview?.invoke(null)
+                            },
+                            onDragCancel = {
+                                dragProgress = null
+                                onPreview?.invoke(null)
+                            },
+                        )
+                    }
+                } else {
+                    Modifier
+                },
+            )
+            // 绘制期读进度：drawWithCache 的 onDrawBehind 在读快照状态时只失效「绘制」，
+            // 不产生重组；缓存块本身只在尺寸/取色/拖动预览变化时重建
+            .drawWithCache {
+                val trackColor = glass.textPrimary.copy(alpha = 0.20f)
+                val fillBrush = Brush.horizontalGradient(listOf(palette.seed2, glass.textPrimary))
+                val dotGlow = glass.textPrimary.copy(alpha = 0.35f)
+                val dotColor = glass.textPrimary
+                val trackHeight = 5.dp.toPx()
+                val dotRadius = 6.dp.toPx()
+                val barTop = (size.height - trackHeight) / 2f
+                onDrawBehind {
+                    val shown = (dragProgress ?: progressProvider()).coerceIn(0f, 1f)
+                    val barWidth = size.width
+                    drawRoundRect(
+                        color = trackColor,
+                        topLeft = Offset(0f, barTop),
+                        size = androidx.compose.ui.geometry.Size(barWidth, trackHeight),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(trackHeight / 2f),
+                    )
+                    if (shown > 0f) {
+                        drawRoundRect(
+                            brush = fillBrush,
+                            topLeft = Offset(0f, barTop),
+                            size = androidx.compose.ui.geometry.Size(barWidth * shown, trackHeight),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(trackHeight / 2f),
+                        )
+                    }
+                    // 端点圆点 + 辉光（.fill::after）：x 随进度变化，绘制期算即可
+                    val cx = (barWidth * shown).coerceIn(dotRadius, (barWidth - dotRadius).coerceAtLeast(dotRadius))
+                    val cy = barTop + trackHeight / 2f
+                    drawCircle(dotGlow, radius = dotRadius * 1.8f, center = Offset(cx, cy))
+                    drawCircle(dotColor, radius = dotRadius, center = Offset(cx, cy))
                 }
-            }
-            .pointerInput(Unit) {
-                detectHorizontalDragGestures(
-                    onHorizontalDrag = { change, _ ->
-                        change.consume()
-                        dragProgress = (change.position.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f)
-                    },
-                    onDragEnd = {
-                        dragProgress?.let(onSeek)
-                        dragProgress = null
-                    },
-                    onDragCancel = { dragProgress = null },
-                )
-            }
-            .semantics {
-                contentDescription = "播放进度"
-                progressBarRangeInfo = ProgressBarRangeInfo(shown, 0f..1f)
             },
         contentAlignment = Alignment.CenterStart,
     ) {
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .height(5.dp)
-                .clip(RoundedCornerShape(3.dp))
-                .background(glass.textPrimary.copy(alpha = 0.20f)),
-        )
-        Box(
-            Modifier
-                .fillMaxWidth(shown)
-                .height(5.dp)
-                .clip(RoundedCornerShape(3.dp))
-                .background(Brush.horizontalGradient(listOf(palette.seed2, glass.textPrimary))),
-        )
-        // 端点圆点 + 辉光（.fill::after）
-        Row(Modifier.fillMaxWidth()) {
-            Spacer(Modifier.fillMaxWidth().weight(shown.coerceIn(0.001f, 1f)))
-            Box(
-                Modifier
-                    .size(12.dp)
-                    .drawBehind {
-                        drawCircle(glass.textPrimary.copy(alpha = 0.35f), radius = size.minDimension * 0.9f)
-                    }
-                    .clip(CircleShape)
-                    .background(glass.textPrimary),
-            )
-            Spacer(Modifier.fillMaxWidth().weight(1f - shown.coerceIn(0f, 0.999f)))
-        }
+        // 读屏进度语义：独立小组件，10Hz 变化只重组它自己，不波及整条 Chrome
+        ProgressSemantics(progressProvider)
     }
 }
 
-/** 悬浮迷你条：62h / 圆角 20 / hi 玻璃，底部 2.5px 进度线 */
+/** 进度轨的读屏语义载体（零尺寸）：state 读取被隔离在此，重组范围最小 */
+@Composable
+private fun ProgressSemantics(progressProvider: () -> Float) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .semantics {
+                contentDescription = "播放进度"
+                progressBarRangeInfo = ProgressBarRangeInfo(progressProvider().coerceIn(0f, 1f), 0f..1f)
+            },
+    )
+}
+
+/** 进度轨的定值重载（更新下载进度等低频场景；不需要绘制期延迟读，直接走 lambda 包一层）。
+ *  [enabled] / [onPreview] 与主重载同义并原样转发（P3-58 / P3-64）。 */
+@Composable
+fun ProgressTrack(
+    progress: Float,
+    onSeek: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    onPreview: ((Float?) -> Unit)? = null,
+) = ProgressTrack(
+    progressProvider = { progress },
+    onSeek = onSeek,
+    modifier = modifier,
+    enabled = enabled,
+    onPreview = onPreview,
+)
+
+/** 悬浮迷你条：62h / 圆角 20 / hi 玻璃，底部 2.5px 进度线。
+ *
+ *  [hasSongs] = false（空曲库 / 权限被拒）时**不渲染播放与下一首按钮**：
+ *  旧实现无门控，空曲库下迷你条显示占位曲「暂无歌曲 / 本地曲库」+ 两个可点按钮，
+ *  而 togglePlayPause / next 内部有 hasSongs 守卫 → 点了完全没反应，纯死按钮。 */
 @Composable
 fun MiniPlayerBar(
     song: DemoSong,
     playing: Boolean,
-    progress: Float,
+    progressProvider: () -> Float,
     onClick: () -> Unit,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     modifier: Modifier = Modifier,
+    hasSongs: Boolean = true,
 ) {
     val palette = LocalAuroraPalette.current
     val glass = LocalGlassColors.current
@@ -158,7 +231,15 @@ fun MiniPlayerBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(11.dp),
         ) {
-            ArtThumb(song.art, Modifier.trackFlight(FlightKeys.MiniCover, keepOnDispose = true).size(42.dp), RoundedCornerShape(11.dp), bordered = true, bitmap = song.coverBitmap)
+            ArtThumb(
+                song.art,
+                Modifier.trackFlight(FlightKeys.MiniCover, keepOnDispose = true).size(42.dp),
+                RoundedCornerShape(11.dp),
+                bordered = true,
+                // coverBitmap 恒为 null（扫描不再预解码全库）；真封面经 artworkUri 按需解码
+                bitmap = song.coverBitmap,
+                artworkUri = song.artworkUri,
+            )
             Column(Modifier.weight(1f)) {
                 Text(song.title, color = glass.textPrimary, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -167,15 +248,20 @@ fun MiniPlayerBar(
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.trackFlight(FlightKeys.MiniArtist, keepOnDispose = true))
             }
-            MiniBarButton(onPlayPause, Modifier.trackFlight(FlightKeys.MiniPlay, keepOnDispose = true)) {
-                Icon(if (playing) GlassIcons.Pause else GlassIcons.Play, null,
-                    Modifier.size(22.dp), tint = glass.textPrimary)
-            }
-            MiniBarButton(onNext, Modifier.trackFlight(FlightKeys.MiniNext, keepOnDispose = true)) {
-                Icon(GlassIcons.Next, null, Modifier.size(22.dp), tint = glass.textPrimary)
+            // 空曲库不渲染控制键（见函数 KDoc）
+            if (hasSongs) {
+                MiniBarButton(onPlayPause, Modifier.trackFlight(FlightKeys.MiniPlay, keepOnDispose = true)) {
+                    Icon(if (playing) GlassIcons.Pause else GlassIcons.Play, null,
+                        Modifier.size(22.dp), tint = glass.textPrimary)
+                }
+                MiniBarButton(onNext, Modifier.trackFlight(FlightKeys.MiniNext, keepOnDispose = true)) {
+                    Icon(GlassIcons.Next, null, Modifier.size(22.dp), tint = glass.textPrimary)
+                }
             }
         }
-        // 底部进度线（.mini .ml）
+        // 底部进度线（.mini .ml）：绘制期读进度（同上，避免 10Hz 重组迷你条整行）
+        // 空曲库（hasSongs = false）时进度恒为 0：不读 progressProvider，画出全空轨道，
+        // 避免占位曲场景下显示一条来历不明的填充（P2-11）
         Box(
             Modifier
                 .align(Alignment.BottomStart)
@@ -183,15 +269,16 @@ fun MiniPlayerBar(
                 .fillMaxWidth()
                 .height(2.5.dp)
                 .clip(RoundedCornerShape(2.dp))
-                .background(glass.textPrimary.copy(alpha = 0.15f)),
-        ) {
-            Box(
-                Modifier
-                    .fillMaxWidth(progress.coerceIn(0f, 1f))
-                    .fillMaxHeight()
-                    .background(Brush.horizontalGradient(listOf(palette.seed2, glass.textPrimary))),
-            )
-        }
+                .background(glass.textPrimary.copy(alpha = 0.15f))
+                .drawWithCache {
+                    val brush = Brush.horizontalGradient(listOf(palette.seed2, glass.textPrimary))
+                    onDrawBehind {
+                        val shown = if (hasSongs) progressProvider().coerceIn(0f, 1f) else 0f
+                        val w = size.width * shown
+                        if (w > 0f) drawRect(brush = brush, size = androidx.compose.ui.geometry.Size(w, size.height))
+                    }
+                },
+        )
     }
 }
 
@@ -219,10 +306,13 @@ fun GlassNavBar(
 ) {
     val palette = LocalAuroraPalette.current
     val glass = LocalGlassColors.current
+    // 文案与目标页必须一致：index 0/1/2 = 曲库 / 歌单 / 设置（GlassApp 的 TAB_SCREENS 序）。
+    // 旧文案「曲库 / 发现 / 我的」是设计稿残留——「发现」实际跳的是歌单页、「我的」跳的是
+    // 设置页，图标（指南针/人形）也跟着错位，三处都不符，属纯文案缺陷而非设计意图。
     val items = listOf(
-        Triple("曲库", GlassIcons.Home, 0),
-        Triple("发现", GlassIcons.Compass, 1),
-        Triple("我的", GlassIcons.User, 2),
+        Triple(NavLabel.Library, GlassIcons.Home, 0),
+        Triple(NavLabel.Playlist, GlassIcons.Queue, 1),
+        Triple(NavLabel.Settings, GlassIcons.Gear, 2),
     )
     GlassSurface(
         modifier = modifier.fillMaxWidth().height(58.dp),
@@ -279,18 +369,22 @@ fun GlassNavBar(
     }
 }
 
-/** 屏幕底部 chrome：迷你条 + 胶囊导航（左右 12、下 10，悬浮于极光之上） */
+/** 屏幕底部 chrome：迷你条 + 胶囊导航（左右 12、下 10，悬浮于极光之上）
+ *
+ *  [progressProvider] 而非 Float：见 [ProgressTrack] 的说明——进度是 10Hz 变的状态，
+ *  以 Float 形参传入会让**调用方屏幕**每 tick 重组一次（Chrome + NavBar + 封面链全部重跑）。 */
 @Composable
 fun GlassChrome(
     song: DemoSong,
     playing: Boolean,
-    progress: Float,
+    progressProvider: () -> Float,
     navSelected: Int,
     onNavSelect: (Int) -> Unit,
     onOpenPlayer: () -> Unit,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     modifier: Modifier = Modifier,
+    hasSongs: Boolean = true,
 ) {
     val flight = LocalPlayerFlight.current
     Column(
@@ -299,8 +393,8 @@ fun GlassChrome(
             .navigationBarsPadding() // 手势条悬浮于 chrome 之下（对应设计稿 homebar）
             .padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
     ) {
-        MiniPlayerBar(song, playing, progress, onOpenPlayer, onPlayPause, onNext)
-        Spacer(Modifier.height(8.dp))
+        MiniPlayerBar(song, playing, progressProvider, onOpenPlayer, onPlayPause, onNext, hasSongs = hasSongs)
+        Spacer(Modifier.height(NavBarBottomInsetSpacer))
         // 导航胶囊：飞行期间随 t 消隐/复原；rect 供进入飞行的覆盖层渐隐替身使用
         GlassNavBar(
             navSelected, onNavSelect,
@@ -310,3 +404,21 @@ fun GlassChrome(
         )
     }
 }
+
+/** 底部导航三项文案（index 语义与 GlassApp 的 TAB_SCREENS 同序，改这里等于改三个主屏名称） */
+object NavLabel {
+    const val Library = "曲库"
+    const val Playlist = "歌单"
+    const val Settings = "设置"
+}
+
+/**
+ * 主屏列表底部避让高度：悬浮 Chrome（迷你条 62 + 间距 8 + 导航 58 + 底距 10 ≈ 138dp）+ 余量。
+ *
+ * 单点定义的原因：曲库/歌单/设置三个主屏原本各自硬编码 `Spacer(height = 146.dp)`，
+ * Chrome 高度一改就要同步改三处，漏一处就是最后一行被迷你条盖住（且很难在评审里发现）。
+ */
+val ChromeBottomInset: androidx.compose.ui.unit.Dp = 146.dp
+
+/** 迷你条与导航胶囊之间的间距（[ChromeBottomInset] 的构成之一，避免两处魔数漂移） */
+private val NavBarBottomInsetSpacer = 8.dp

@@ -9,6 +9,7 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.MediaStore
+import android.util.Log
 import androidx.palette.graphics.Palette
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asAndroidBitmap
@@ -27,6 +28,10 @@ import com.local.music.core.ui.theme.GlassPalettes
 object MediaLibrary {
 
     private const val FALLBACK_ART_COUNT = 6
+    private const val TAG = "MediaLibrary"
+
+    /** 小写 hex 查表（[stableHash] 用）：避免 formatter 的 locale 依赖与每次调用的对象分配 */
+    private val HEX_CHARS = "0123456789abcdef".toCharArray()
 
     /** 扫描互斥：并发重扫（如设置页连点 / 启动扫描与手动重扫撞车）只跑一次，重入直接返回当前结果 */
     private val scanning = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -43,8 +48,16 @@ object MediaLibrary {
      * 留在缓存里；关过滤=直接从缓存出，零重解码（大曲库通知音不再每次冷启动白解码）。
      *
      * @param filterShort 过滤短音频（B3：默认 <30s 的通知音/录音碎片不进返回列表；调用方传设置开关）
+     * @param isCancelled 取消通道（P2-19）：MediaStore 游标每轮循环开头检查，命中即 break
+     *   （**break 而非抛异常**——finally 才能正常关 cursor、复位 scanning 标志）。
+     *   中止时返回已组装的部分结果，且本次不做孤儿封面清扫（见 [loadInternal] 末尾）；
+     *   调用方也不应据此写缓存。默认 `{ false }`：既有调用点不改也编译。
      */
-    fun load(context: Context, filterShort: Boolean = true): List<DemoSong> {
+    fun load(
+        context: Context,
+        filterShort: Boolean = true,
+        isCancelled: () -> Boolean = { false },
+    ): List<DemoSong> {
         // 互斥：已有扫描在跑就等它，拿它的结果（避免两路并发写同一缓存文件）
         if (!scanning.compareAndSet(false, true)) {
             synchronized(scanLock) {
@@ -56,7 +69,7 @@ object MediaLibrary {
             return lastScan?.songs?.let { outputFiltered(it, filterShort) } ?: emptyList()
         }
         try {
-            val result = loadInternal(context)
+            val result = loadInternal(context, isCancelled)
             lastScan = result
             return outputFiltered(result.songs, filterShort)
         } finally {
@@ -75,10 +88,18 @@ object MediaLibrary {
     /** 缓存指纹：扫描前先按 dataPath 建索引，命中且指纹一致则复用整条记录 */
     private data class CachedEntry(val song: DemoSong, val lastModifiedSec: Long, val size: Long)
 
-    /** 短音频阈值（B3）：小于该秒数视为通知音/录音碎片，默认过滤掉 */
-    private const val MIN_TRACK_SEC = 30
+    /**
+     * 短音频阈值（B3）：小于该秒数视为通知音/录音碎片，默认过滤掉。
+     *
+     * **单一事实源**：直接引用 `AppState.MIN_TRACK_SEC`。输出层已收敛到
+     * `AppState.visibleLibrary()`（P2-④），扫描侧这里只是同口径的兜底/直调路径——
+     * 两处各留一份字面量会有「改了一处、另一处没改」的分叉风险（比如扫描侧滤 30s、
+     * 输出层滤 20s，用户就会看到开关行为飘忽）。状态层不依赖 app 模块是单向的，
+     * 反向引用常量没有循环依赖。
+     */
+    private const val MIN_TRACK_SEC = com.local.music.core.ui.state.AppState.MIN_TRACK_SEC
 
-    private fun loadInternal(context: Context): ScanResult {
+    private fun loadInternal(context: Context, isCancelled: () -> Boolean = { false }): ScanResult {
         // 先读旧缓存建指纹索引（v3 才有 lastModified/size；旧缓存缺省 0 视为不命中 → 该条重扫）。
         // light 模式：只读 JSON 字段，不解码封面、不读歌词（那是命中后才需要补的）
         val cachedByPath: Map<String, CachedEntry> = runCatching {
@@ -89,7 +110,11 @@ object MediaLibrary {
         val coverDataPaths = mutableListOf<String>() // 本次扫描落盘了封面的歌曲（收尾清扫孤儿封面时保留）
         val reused = mutableListOf<CachedEntry>()    // 复用缓存项：写回时保留其指纹
         val freshFingerprints = mutableMapOf<String, Pair<Long, Long>>() // 新提取条目的指纹
+        // P2-19：显式中止标记——用「循环里确实 break 了」而非「此刻 isCancelled()」判定，
+        // 避免扫描恰好自然跑完后调用方才置取消，把完整扫描误判成中止而漏掉 sweep
+        var aborted = false
         folderCoverCache.clear() // 每次扫描重查文件夹封面（用户可能增删 cover.jpg）
+        folderCoverBitmaps.clear() // 缩略位图只服务单次扫描，不跨扫描缓存（Palette 取色后即可释放）
         val projection = arrayOf(
             MediaStore.Audio.Media._ID,
             MediaStore.Audio.Media.TITLE,
@@ -122,6 +147,14 @@ object MediaLibrary {
             val colSize = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
 
             while (cursor.moveToNext()) {
+                // P2-19 取消检查：命中即 break（不抛异常），保证下面的 use{} 正常关 cursor。
+                // 中止时返回已组装的部分结果——lastScan 仍被赋值（见 load），但 aborted=true
+                // 会让本次跳过 sweepCovers（孤儿清扫基于"全库"命名集，半截结果会把未扫到
+                // 的歌的封面误当孤儿删掉）；调用方 GlassApp 拿到 partial 结果后也不写缓存
+                if (isCancelled()) {
+                    aborted = true
+                    break
+                }
                 val relativePath = cursor.getString(colPath) ?: continue
                 val id = cursor.getLong(colId)
                 val dataPath = cursor.getString(colData) ?: continue
@@ -150,25 +183,35 @@ object MediaLibrary {
                     // 两者都要计入保留集，否则收尾清扫会误删
                     val coverFile = coverFileFor(context, dataPath)
                     val hasOwnCover = coverFile.isFile && coverFile.length() > 0L
-                    val folderCover = if (hasOwnCover) null else folderCoverCacheFile(context, dataPath)
+                    // 目录兜底封面必须**校验源 cover.jpg 仍在且未变**：否则用户删图后仍显示旧图
+                    // （B4「删掉后重扫应回退」），换图后也永远拿旧图
+                    val folderCover = if (hasOwnCover) null else reusableFolderCover(context, dataPath)
                     val restoredCoverFile = if (hasOwnCover) coverFile else folderCover
-                    if (restoredCoverFile != null) coverDataPaths += dataPath
-                    songs += c.copy(
-                        // 播放地址用当次 MediaStore _id 重算（_id 可能漂移，路径才是稳定键）
-                        mediaUri = ContentUris.withAppendedId(
-                            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id,
-                        ).toString(),
-                        dateAddedSec = cursor.getLong(colDateAdded),
-                        // light 模式读缓存时跳过的重资源，命中后再补：封面位图按落盘文件解码
-                        // （不重新解码音频内嵌图，仍是增量语义）、歌词读同名 .lrc
-                        coverBitmap = restoredCoverFile?.let {
-                            android.graphics.BitmapFactory.decodeFile(it.absolutePath)?.asImageBitmap()
-                        },
-                        artworkUri = restoredCoverFile?.let { Uri.fromFile(it).toString() },
-                        lyricLines = readLrc(context, dataPath),
-                    )
-                    reused += cached
-                    continue
+                    // 两种「缓存与磁盘不一致」都要落回全量提取，不能就此复用旧记录：
+                    // A. 缓存说**有**封面，但磁盘 PNG 不见了（系统/清理助手清 externalCacheDir，
+                    //    或源 cover.jpg 被删）→ 否则全库封面永久消失
+                    // B. 缓存说**没**封面（artworkUri == null），但现在探到了可用的封面文件
+                    //    （用户刚往目录里放了 cover.jpg）→ 否则「放图后重扫」永远看不到图
+                    val coverLost = c.artworkUri != null && restoredCoverFile == null
+                    val coverGained = c.artworkUri == null && restoredCoverFile != null
+                    if (!coverLost && !coverGained) {
+                        if (restoredCoverFile != null) coverDataPaths += dataPath
+                        songs += c.copy(
+                            // 播放地址用当次 MediaStore _id 重算（_id 可能漂移，路径才是稳定键）
+                            mediaUri = ContentUris.withAppendedId(
+                                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id,
+                            ).toString(),
+                            dateAddedSec = cursor.getLong(colDateAdded),
+                            // 不再解码位图（全库常驻数百 MB 的根因），只留 artworkUri：
+                            // 由 ArtThumb 在真正要画时经 ArtworkBitmapCache 按需解码（LRU 24MB）
+                            coverBitmap = null,
+                            artworkUri = restoredCoverFile?.let { Uri.fromFile(it).toString() },
+                            lyricLines = readLrc(context, dataPath),
+                        )
+                        reused += cached
+                        continue
+                    }
+                    // coverLost / coverGained：不 continue，继续走下面的全量提取
                 }
 
                 val uri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
@@ -192,14 +235,16 @@ object MediaLibrary {
                 // retriever 才可靠）；是否展示给用户由 load() 输出层按 filterShort
                 // 决定，开关切换零重解码
 
-                val persistedUri = coverBitmap?.let { persistCover(context, dataPath, it) }
+                val persistedUri = coverBitmap?.let { persistCover(context, dataPath, it, lastModified) }
                 if (persistedUri != null) coverDataPaths += dataPath
                 // 无内嵌封面时回退同目录 cover.jpg/folder.jpg/albumart.jpg（整专辑图常见形态）：
                 // 按目录缓存一次，同目录其余无封面歌曲共享（不重复读盘）。
                 // 兜底图也落盘到 covers/（键 = 目录路径哈希），这样用户删掉原图后缓存仍可用，
                 // 且 artworkUri 与内嵌封面同一套寻址方式（通知栏/锁屏可直接取）。
+                // **降采样**：目录封面常是 3000×3000 级扫描图，裸 decodeFile 单张约 34MB，
+                // 同目录 N 首各解一次直接打穿堆 → 走 decodeSampledCover（长边 ≤256px + 目录去重）
                 val effectiveCover = coverBitmap ?: folderCoverFor(context, dataPath)?.let { file ->
-                    android.graphics.BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
+                    decodeSampledCover(file, dataPath)
                 }
                 val effectiveArtworkUri = persistedUri
                     ?: effectiveCover?.let { bmp -> persistFolderCover(context, dataPath, bmp) }
@@ -219,7 +264,8 @@ object MediaLibrary {
                     year = meta.tags.year,
                     trackNo = meta.tags.trackNo,
                     mediaUri = uri.toString(),
-                    coverBitmap = effectiveCover,
+                    // 位图不留驻（同上：改为按需解码）；palette 仍取一次缩略图算色
+                    coverBitmap = null,
                     artworkUri = effectiveArtworkUri,
                     lyricLines = readLrc(context, dataPath),
                     codec = format?.codec ?: dataPath.substringAfterLast('.', "").uppercase(),
@@ -233,28 +279,98 @@ object MediaLibrary {
                 freshFingerprints[dataPath] = lastModified to size
             }
         }
-        sweepCovers(context, coverDataPaths) // 全量扫描收尾：清掉孤儿封面（含旧 song<id>.png 命名，天然迁移）
+        // P2-19：中途取消（半截结果）时**不 sweep**——sweepCovers 的保留集来自本次扫描，
+        // 半截结果意味着大量未扫到的歌不在保留集里，跑了就是把好封面当孤儿批量误删。
+        // 写缓存同理由调用方规避（GlassApp 拿 partial 结果不落盘）
+        if (!aborted) {
+            sweepCovers(context, coverDataPaths) // 全量扫描收尾：清掉孤儿封面（含旧 song<id>.png 命名，天然迁移）
+        }
         // 指纹表随结果一并返回，writeCache 写回时使用（新扫条目用本次 cursor 值，
         // 复用条目沿用缓存指纹，保证下次扫描仍能命中）
-        return ScanResult(songs, reused.associate { it.song.id.removePrefix("f") to (it.lastModifiedSec to it.size) } + freshFingerprints)
+        return ScanResult(
+            songs,
+            reused.associate { it.song.id.removePrefix("f") to (it.lastModifiedSec to it.size) } + freshFingerprints,
+            aborted,
+        )
     }
 
-    /** 扫描结果 + 各条目指纹（dataPath → lastModified/size），writeCache 依此写回 */
+    /**
+     * 扫描结果 + 各条目指纹（dataPath → lastModified/size），writeCache 依此写回。
+     * [aborted]（P2-19）：true = 扫描被取消通道中止的半截结果——调用方据此**不应写缓存**
+     * （writeCache 默认路径已内置防线，显式传指纹的调用方自行检查此标志）。
+     */
     data class ScanResult(
         val songs: List<DemoSong>,
         val fingerprints: Map<String, Pair<Long, Long>>,
+        val aborted: Boolean = false,
     )
 
     /**
-     * 封面缓存文件（单一事实源）：covers 目录下按 dataPath 稳定哈希命名——
+     * 封面缓存文件（单一事实源）：covers 目录下按 dataPath 稳定摘要命名——
      * 旧键 song<MediaStore _id> 会随重扫/数据库重建漂移且从不清理（无限增长）；
      * persistCover 落盘与 loadCache 读缓存共用此命名，全量扫描收尾按它清扫孤儿。
+     *
+     * 命名键从 32 位 String.hashCode 换成 [stableHash]（SHA-256 前 8 字节）的原因：
+     * hashCode 只有 32 位，而来源是**文件绝对路径**——1 万首约 1% 概率出现两条不同路径
+     * 碰撞成同一个 "c"+hash（生日问题，n²/2^33）。碰撞不是「少一张图」，而是**串图**：
+     * 后落盘者覆写前一文件，两首歌永久共用同一张 PNG（缓存里 artworkUri 指向同一路径，
+     * 谁也不会自愈），且冲突对是确定的、用户永远修不好。
+     *
+     * 迁移链（旧命名 → 新命名，全部靠现有分支自愈，无需版本号/一次性迁移代码）：
+     * 1. 读缓存：[readCacheEntries] 优先按新名找文件；找不到时**回落到缓存里记录的旧
+     *    artworkUri**（旧名 PNG 此时通常还在）。这一步不只是「冷启动别变灰」的观感问题——
+     *    它同时是第 2 步的**触发条件**：回落让 `c.artworkUri != null`，而新名文件不存在，
+     *    于是 coverLost 成立。若此处不回落，缓存条目会以 artworkUri=null 被判定为
+     *    「本来就没封面」（coverLost/coverGained 都不成立）直接复用，随后 writeCache 把
+     *    空 uri 写回缓存——封面就**永久**丢了，再也不会自愈。
+     * 2. 增量命中判断：旧文件在新名下不存在 → restoredCoverFile == null 且缓存记录有封面
+     *    → coverLost 成立 → 该条落回全量提取分支，重新取内嵌/目录封面并按**新名**落盘。
+     * 3. 收尾清扫：[sweepCovers] 的保留集只含新名，旧名 PNG 一律当孤儿删除（不占空间）。
+     * 4. 下一次 writeCache 把 artworkUri 写成新名，之后彻底稳定。
+     * 代价：升级后第一次全量扫描要为「有封面」的歌各重提取一次（与一次冷装扫描同量级）；
+     * 之后的增量扫描照旧命中缓存，不再重解码——一次性迁移，换来缓存键不再碰撞。
+     * 注意 directory 兜底封面（d 前缀）同理：reusableFolderCover 也只认新名，
+     * 旧名目录图会被判为「缓存不存在」→ 落全量分支重提取 → 同样经 sweepCovers 清掉。
      */
     fun coverFileFor(context: Context, dataPath: String): java.io.File =
         java.io.File(
             java.io.File(context.externalCacheDir, "covers"),
-            "c" + Integer.toHexString(dataPath.hashCode()) + ".png",
+            "c" + stableHash(dataPath) + ".png",
         )
+
+    /**
+     * 封面键迁移的兼容读取（见 [coverFileFor] 迁移链第 1 步）：按缓存里记录的 artworkUri
+     * 取回旧命名文件。只接受 `file://` 且确实存在于盘上的路径——记录可能是空串、
+     * 指向已被清掉的 externalCacheDir，或是历史遗留的异常 uri；这些一律当「无封面」。
+     */
+    private fun legacyArtworkFile(recorded: String): java.io.File? {
+        if (recorded.isEmpty()) return null
+        val path = runCatching { Uri.parse(recorded) }.getOrNull()
+            ?.takeIf { it.scheme == "file" }?.path ?: return null
+        return java.io.File(path).takeIf { it.isFile && it.length() > 0L }
+    }
+
+    /**
+     * 稳定摘要（16 位小写 hex = SHA-256 的前 8 字节）：封面缓存文件名的键。
+     *
+     * 为什么不用 String.hashCode：32 位、且来源是**文件绝对路径**（一万首 ≈ 1% 生日碰撞），
+     * 碰撞会导致两首歌的封面文件同名 → 后写者覆写前者 → 两首歌永久显示同一张图且无法自愈。
+     * SHA-256 前 8 字节 = 64 位，碰撞概率降到可忽略；截断到 8 字节是为了文件名短、目录列表快。
+     *
+     * 不用 `"%02x".format()`：那走默认 locale（阿拉伯语/波斯语区域会输出非 ASCII 数字字形，
+     * 名字里出现非法字符）。手写查表既不依赖 locale，也没有 formatter 的分配开销。
+     * 注意：本函数结果**参与文件名**，改动它等于让所有缓存失效——不要再改算法。
+     */
+    private fun stableHash(s: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(s.toByteArray(Charsets.UTF_8))
+        val out = StringBuilder(16)
+        for (i in 0 until 8) {
+            val b = digest[i].toInt() and 0xFF
+            out.append(HEX_CHARS[b ushr 4]).append(HEX_CHARS[b and 0x0F])
+        }
+        return out.toString()
+    }
 
     /**
      * 文件夹封面兜底：同目录下 cover.jpg / folder.jpg / albumart.jpg（常见整专辑图形态）。
@@ -281,15 +397,86 @@ object MediaLibrary {
 
     private val FOLDER_COVER_NAMES = listOf("cover.jpg", "folder.jpg", "albumart.jpg", "Cover.jpg", "Folder.jpg")
 
-    /** 文件夹封面落盘文件名：以「目录」而非单曲为键（同目录共享一份，清扫时按目录保留） */
-    private fun folderCoverKey(dataPath: String): String = "d" + Integer.toHexString(
-        dataPath.substringBeforeLast('/', "").hashCode(),
+    /** 文件夹封面落盘文件名：以「目录」而非单曲为键（同目录共享一份，清扫时按目录保留）；
+     *  键同样走 [stableHash]（目录路径而非单曲路径）——理由见 [coverFileFor] 的迁移链说明。
+     *  默认值 "" 必须保留：无目录分隔符的 dataPath 归到「空目录」键，与旧命名一一对应 */
+    private fun folderCoverKey(dataPath: String): String = "d" + stableHash(
+        dataPath.substringBeforeLast('/', ""),
     ) + ".png"
 
     /** 已落盘的文件夹兜底封面文件（存在且非空才返回） */
     private fun folderCoverCacheFile(context: Context, dataPath: String): java.io.File? {
         val file = java.io.File(java.io.File(context.externalCacheDir, "covers"), folderCoverKey(dataPath))
         return file.takeIf { it.isFile && it.length() > 0L }
+    }
+
+    /**
+     * 增量复用分支专用：取「仍然有效」的目录兜底封面缓存。
+     *
+     * 旧实现（只查 d&lt;hash&gt;.png 是否存在）在三处会给出错结果：
+     * 1. 用户**删掉** cover.jpg → 缓存 PNG 还在，永远显示旧图（B4「删掉后重扫应回退」必失败）
+     * 2. 用户**换掉** cover.jpg → persistFolderCover 见文件存在即跳过，永远旧图
+     * 3. 系统清 externalCacheDir → PNG 没了，旧实现只把封面置空，不触发重提取（封面永久消失）
+     *
+     * 判新鲜度用**磁盘 mtime 比较**而不是内存里的指纹表——指纹表每次扫描都会清空，
+     * 目录内第一首歌必然「无历史可比」，换图后首扫仍会误用旧 PNG；mtime 是跨进程持久的。
+     * 判定：源图不存在 → 删缓存回退；缓存不存在 → 落全量分支重提取；
+     * 源图比缓存新 → 视为换图，删缓存重提取；否则缓存仍有效。
+     */
+    private fun reusableFolderCover(context: Context, dataPath: String): java.io.File? {
+        val dir = dataPath.substringBeforeLast('/', "")
+        if (dir.isEmpty()) return null
+        val source = folderCoverFileFor(context, dataPath)
+        val cache = folderCoverCacheFile(context, dataPath)
+        if (source == null) {
+            // 源图不在了：清掉陈旧缓存 PNG，让「删图后重扫」真正回退到无封面
+            cache?.delete()
+            return null
+        }
+        if (!source.isFile || source.length() <= 0L) return null
+        if (cache == null) return null // 缓存被系统清理：落全量分支重新提取（自愈）
+        if (source.lastModified() > cache.lastModified()) {
+            // 源图比缓存新 → 用户换过封面，删旧图重提取
+            cache.delete()
+            return null
+        }
+        return cache
+    }
+
+    /** 降采样解码缓存：dataPath（目录级去重）→ 缩略位图，避免同目录每首歌重复解一张大图 */
+    private val folderCoverBitmaps = mutableMapOf<String, androidx.compose.ui.graphics.ImageBitmap?>()
+
+    /** 长边上限：全库缩略图最大显示约 80dp（≈240px @3x），256 留余量 */
+    private const val COVER_MAX_EDGE_PX = 256
+
+    /**
+     * 降采样解码目录封面：长边压到 [COVER_MAX_EDGE_PX]，并按**目录**去重。
+     *
+     * 旧实现是 `BitmapFactory.decodeFile(path)` 裸解：3000×3000 扫描封面单张 ≈ 34MB，
+     * 同目录 N 首无内嵌封面的歌各解一次（folderCoverCache 只缓存 File 不缓存 Bitmap），
+     * N=15 即 515MB，直接打穿默认堆（Manifest 无 largeHeap）——这是项目里最容易 OOM 的点。
+     */
+    private fun decodeSampledCover(
+        file: java.io.File,
+        dataPath: String,
+    ): androidx.compose.ui.graphics.ImageBitmap? {
+        val key = dataPath.substringBeforeLast('/', "")
+        folderCoverBitmaps[key]?.let { return it }
+        val decoded = runCatching {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= COVER_MAX_EDGE_PX ||
+                bounds.outHeight / (sample * 2) >= COVER_MAX_EDGE_PX
+            ) {
+                sample *= 2
+            }
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            BitmapFactory.decodeFile(file.absolutePath, opts)?.asImageBitmap()
+        }.getOrNull()
+        folderCoverBitmaps[key] = decoded
+        return decoded
     }
 
     /** 文件夹封面落盘（键 = 目录哈希）：与内嵌封面同目录、同寻址方式 */
@@ -300,31 +487,70 @@ object MediaLibrary {
     ): String? = try {
         val file = java.io.File(java.io.File(context.externalCacheDir, "covers"), folderCoverKey(dataPath))
         file.parentFile?.mkdirs()
-        if (!file.exists() || file.length() == 0L) {
-            java.io.FileOutputStream(file).use { out ->
-                bitmap.asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 90, out)
-            }
+        // **总是覆写**：旧实现「已存在即跳过」会让换 cover.jpg 后永远显示旧图。
+        // 调用方（reusableFolderCover）已先用源指纹判定新鲜度，能走到这里就是需要重写。
+        java.io.FileOutputStream(file).use { out ->
+            bitmap.asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 90, out)
         }
         Uri.fromFile(file).toString()
     } catch (e: Exception) {
+        // 落盘失败只影响「通知栏/锁屏封面 + 缓存复用」，不该中断整次扫描（降级为无封面）；
+        // 但必须留痕：磁盘满 / externalCacheDir 不可写时，用户看到的正是「封面时有时无」这种
+        // 找不到原因的怪状，没日志就只能靠猜
+        Log.e(TAG, "persistFolderCover failed: ${folderCoverKey(dataPath)}", e)
         null
     }
 
-    /** 封面落盘为 PNG（cache/covers/）：媒体通知 / 锁屏 / 流体云需要可寻址的 artworkUri；失败返回 null（空串也是无效 uri） */
-    private fun persistCover(context: Context, dataPath: String, bitmap: androidx.compose.ui.graphics.ImageBitmap): String? {
+    /**
+     * 封面落盘为 PNG（cache/covers/）：媒体通知 / 锁屏 / 流体云需要可寻址的 artworkUri；失败返回 null（空串也是无效 uri）。
+     *
+     * P3-31 写放大治理：能证明「源音频没变」时跳过覆写——扫描走到这里通常意味着
+     * 元数据被重新解码了，但重新解码 ≠ 封面变了（增量缓存 miss 的原因多是 mtime/size
+     * 之外的指纹细节）。判定用源音频 DATE_MODIFIED（MediaStore 秒级）与 PNG 落盘
+     * mtime（毫秒→秒）比对：一致即认为封面与上次相同，直接返回现有文件。
+     * 源 mtime 不可信（≤0）或 PNG 不存在/为空时照旧覆写——**正确性优先于写放大**：
+     * 宁可多写一次，不冒「内嵌封面换图后通知栏永远旧图」的险（那是当初改成总是覆写的原因）。
+     */
+    private fun persistCover(
+        context: Context,
+        dataPath: String,
+        bitmap: androidx.compose.ui.graphics.ImageBitmap,
+        sourceLastModifiedSec: Long = 0L,
+    ): String? {
         return try {
             val file = coverFileFor(context, dataPath)
+            // 差异跳过：PNG 在、非空、且与源音频 mtime 同秒 → 封面没变，不重写
+            if (sourceLastModifiedSec > 0L && file.isFile && file.length() > 0L &&
+                file.lastModified() / 1000L == sourceLastModifiedSec
+            ) {
+                return Uri.fromFile(file).toString()
+            }
             file.parentFile?.mkdirs()
-            if (!file.exists() || file.length() == 0L) {
-                java.io.FileOutputStream(file).use { out ->
-                    bitmap.asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 90, out)
-                }
+            // **总是覆写**：旧实现「已存在即跳过」→ 内嵌封面换图后通知栏和重启后的
+            // in-app 都永远显示旧图（缓存键稳定哈希后不再自愈）。扫描走到这里说明本次
+            // 确实重新提取了内嵌封面，写盘就该以本次结果为准（能证明没变时上面已提前返回）。
+            java.io.FileOutputStream(file).use { out ->
+                bitmap.asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 90, out)
+            }
+            // P3-31 盖戳：上面跳过分支比的是 PNG 的 mtime，而刚写完的 PNG mtime = 写入时刻，
+            // 与源音频 mtime 天然不等——不把 PNG mtime 显式对齐到源 mtime，跳过分支永远
+            // 不命中，「差异跳过」形同虚设。盖戳后比对语义变为「这张 PNG 属于 mtime=X 的
+            // 那一版音频」：下次扫到同一版本（X 未变）即跳过，换图/改文件（mtime 变）则照常覆写。
+            // setLastModified 失败（个别 FS 不支持）只退化为每次多写一次，无正确性影响，静默即可
+            if (sourceLastModifiedSec > 0L) {
+                runCatching { file.setLastModified(sourceLastModifiedSec * 1000L) }
             }
             Uri.fromFile(file).toString()
         } catch (e: Exception) {
+            // 同 persistFolderCover：降级为无封面，但留痕（失败原因几乎总是磁盘/权限）
+            Log.e(TAG, "persistCover failed: ${coverNameOrDash(context, dataPath)}", e)
             null
         }
     }
+
+    /** persistCover 的日志辅助：文件名算不出来也不能抛（日志路径不允许二次失败） */
+    private fun coverNameOrDash(context: Context, dataPath: String): String =
+        runCatching { coverFileFor(context, dataPath).name }.getOrDefault("-")
 
     /** 清扫 covers 目录孤儿：删除不在本次曲库命名集内的文件；externalCacheDir 为 null 等异常静默跳过（与 persistCover 防御一致） */
     private fun sweepCovers(context: Context, keepDataPaths: List<String>) {
@@ -401,7 +627,9 @@ object MediaLibrary {
                     ?.let { parseTrackNo(it) } ?: 0,
             )
         } catch (e: Exception) {
-            // 标签读取失败不影响封面/时长/格式：各自已有降级
+            // 标签读取失败不影响封面/时长/格式：各自已有降级。留痕是为了区分
+            // 「文件本来就没标签」与「这台的 MediaMetadataRetriever 打不开该容器」
+            Log.w(TAG, "tag read failed: $uri", e)
         } finally {
             try { retriever.release() } catch (e: Exception) {}
         }
@@ -433,6 +661,10 @@ object MediaLibrary {
                 runCatching { extractor.release() } // 损坏文件抛异常也不能泄漏 native 资源
             }
         } catch (e: Exception) {
+            // 格式提取失败（损坏文件 / 不支持的容器）：降级为「参数未知」（codec 回退扩展名、
+            // 其余 0），不影响入库。但这是用户「采样率/位深不显示」的唯一线索，按 warn 留痕——
+            // 只对真正取不到格式的文件报一条，正常曲库为 0，量级可控
+            Log.w(TAG, "format extract failed: $uri", e)
             null
         }
 
@@ -486,46 +718,92 @@ object MediaLibrary {
     )
 
     /**
-     * 同名 .lrc 歌词：优先读应用专属外部目录 files/lrc/<音频文件名>.lrc
-     * （adb 可直推、免任何权限；scoped storage 下跨应用读 .lrc 会被拦），
-     * 回退音频同目录同名 .lrc（部分 ROM 可读）。都取不到则回退演示歌词。
+     * 同名 .lrc 歌词（P2-20）：音频同目录 sibling **优先**，回退应用专属外部目录
+     * files/lrc/<音频文件名>.lrc（scoped storage 下跨应用读 .lrc 会被拦，
+     * adb 可直推该目录、免任何权限，作兜底）。
+     * 返回 null = 两个候选都不存在；候选存在但无有效时间戳行时降级为纯文本
+     * 单行歌词（见 [parseLrcOrPlainText]），不再与「无文件」混同。
      */
     private fun readLrc(context: Context, audioPath: String): List<LyricLine>? {
+        // 注意：文件名取 basename 后再剥扩展名——不能对**整条路径**用 substringBeforeLast('.')，
+        // 否则「无扩展名文件名 + 含点目录」会算到目录的那个点上：
+        //   /a.b/song（无扩展名）→ 整路径法得 /a.lrc（错），basename 法得 /a.b/song.lrc（对）。
+        // 更糟的是错误路径可能命中同目录另一首歌的歌词，变成错误关联而非缺失。
         val fileName = audioPath.substringAfterLast('/').substringBeforeLast('.')
+        val sibling = audioPath.substringBeforeLast('/') + "/" + fileName + ".lrc"
+        // P2-20：同目录 sibling 优先，files/lrc 兜底（顺序反了的话，私有目录里的旧文件
+        // 会永远压过音频同目录的正确歌词——用户删/改同目录 lrc 后重扫无效）。
+        // files/lrc 存在的理由：scoped storage 下跨应用读 .lrc 会被拦，adb 推歌词到
+        // 应用专属目录免权限，作为同目录读不到时的兜底通道
         val candidates = listOfNotNull(
+            java.io.File(sibling),
             context.getExternalFilesDir(null)?.let { java.io.File(it, "lrc/$fileName.lrc") },
-            java.io.File(audioPath.substringBeforeLast('.') + ".lrc"),
         )
-        // 逐候选"读取+解析"，一个候选存在但损坏/为空时继续尝试下一个
+        // 逐候选"读取+解析"，一个候选存在但损坏/为空时继续尝试下一个。
+        // P3-30：先看大小再读——超大 .lrc（几百 MB 的误下载/二进制同名文件）readText
+        // 会整读进堆并逐行跑正则，卡死扫描线程；超限视同该候选不存在
         return candidates.asSequence()
             .filter { it.isFile }
+            .filter { it.length() <= LRC_MAX_BYTES }
             .firstNotNullOfOrNull { file ->
-                runCatching { parseLrc(file.readText()).ifEmpty { null } }.getOrNull()
+                runCatching { parseLrcOrPlainText(file).ifEmpty { null } }.getOrNull()
             }
+    }
+
+    /** P3-30：.lrc 读取上限（512 KiB）——正常歌词远小于此，超限的基本是误命中的大文件 */
+    private const val LRC_MAX_BYTES = 512 * 1024
+
+    /**
+     * P3-29：读 .lrc 的三态封装（文件不存在 → null；有时间戳 → 解析结果；
+     * 文件在但**无任何有效时间戳行** → 纯文本降级）。
+     *
+     * 为什么需要第三态：旧链路 parseLrc 丢弃无时间戳行 → 空列表 → readLrc 把
+     * 「有文件但解析为空」与「无文件」混同返回 null → UI 拿别的歌的演示歌词兜底。
+     * 纯文本 .lrc（简谱附词/漏写时间戳）至少应该显示这首歌自己的文字。
+     * 文本截断到 2000 字符：整文件作为单行歌词渲染会撑爆布局/纹理。
+     */
+    private fun parseLrcOrPlainText(file: java.io.File): List<LyricLine> {
+        val text = file.readText()
+        val parsed = parseLrc(text)
+        if (parsed.isNotEmpty()) return parsed
+        val plain = text.trim()
+        if (plain.isEmpty()) return emptyList()
+        return listOf(LyricLine(plain.take(2000), 0f))
     }
 
     private val lrcRegex = Regex("\\[(\\d{1,3}):(\\d{1,2})(?:[.:](\\d{1,3}))?\\]")
     private val lrcOffsetRegex = Regex("\\[offset:\\s*([+-]?\\d+)\\s*\\]", RegexOption.IGNORE_CASE)
     private val lrcEnhancedRegex = Regex("<\\d{1,3}:\\d{1,2}(?:[.:]\\d{1,3})?>") // 增强歌词行内时间戳
 
-    /** 标准 LRC：[mm:ss.xx]（可多时间戳）；忽略 [ti:][ar:][offset:] 等标签行，offset 参与全局偏移，剥离增强标签 */
+    /**
+     * 标准 LRC：[mm:ss.xx]（可多时间戳）；忽略 [ti:][ar:] 等标签行；剥离增强标签。
+     *
+     * P3-28 两趟解析：[offset:] 是**文件级**标签，旧实现逐行即时扣减有两个 bug——
+     * ① 写在文件尾的 [offset:] 对前面已解析的行不生效（不回溯）；
+     * ② 某行同时含时间戳与 [offset:] 时，时间戳分支先命中，offset 被静默忽略。
+     * 修法：第一趟在**全文**级别取最后一次出现的 [offset:]（同一文件写多个时以最后
+     * 一个为准），第二趟逐行只解析时间戳，最后统一减去 offset。
+     */
     fun parseLrc(text: String): List<LyricLine> {
-        var offsetMs = 0
+        // 第一趟：全文扫 offset（lastOrNull：约定以文件中最后一次声明为准）
+        val offsetMs = lrcOffsetRegex.findAll(text).lastOrNull()
+            ?.groupValues[1]?.toIntOrNull() ?: 0
         val out = mutableListOf<LyricLine>()
         text.lineSequence().forEach { rawLine ->
             val line = rawLine.trim().removePrefix("﻿") // UTF-8 BOM
             val stamps = lrcRegex.findAll(line).toList()
-            if (stamps.isEmpty()) {
-                lrcOffsetRegex.find(line)?.let { offsetMs = it.groupValues[1].toIntOrNull() ?: 0 }
-                return@forEach
-            }
+            if (stamps.isEmpty()) return@forEach // 标签行/纯文本行：时间戳解析阶段一律跳过（纯文本降级见 parseLrcOrPlainText）
+            // P3-28 收尾：行内 [offset:] 文本也要从 content 剥离——第二趟 stamps-first 意味着
+            // 「时间戳与 offset 同行」时 offset 文本会混进歌词展示内容；offset 本体已由第一趟
+            // 全文扫描统一生效，这里只清理展示文本
             val content = line.substring(stamps.last().range.last + 1)
                 .replace(lrcEnhancedRegex, "")
+                .replace(lrcOffsetRegex, "")
                 .trim()
             if (content.isEmpty()) return@forEach
             stamps.forEach { match ->
                 val (mm, ss, frac) = match.destructured
-                // offset 取负：主流 LRC 约定正 offset 让歌词提前显示
+                // offset 取负：主流 LRC 约定正 offset 让歌词提前显示（此处对全文统一扣减）
                 val sec = mm.toInt() * 60 + ss.toInt() + (frac.padEnd(3, '0').take(3).toInt() / 1000f) -
                     offsetMs / 1000f
                 out += LyricLine(content, sec)
@@ -569,9 +847,17 @@ object MediaLibrary {
     private const val CACHE_FILE = "library_cache.json"
     private const val CACHE_VERSION = 3
 
-    /** 读曲库缓存：无/损坏/版本不符返回 null（自愈：随后的全量重扫会重写） */
-    fun loadCache(context: Context): List<DemoSong>? = runCatching {
-        readCacheEntries(context).takeIf { it.isNotEmpty() }?.map { it.song }
+    /**
+     * 读曲库缓存：无/损坏/版本不符返回 null（自愈：随后的全量重扫会重写）。
+     *
+     * [filterShort]：与 [load] 同一套输出层过滤语义（B3）。冷启动读缓存时若不过滤，
+     * 默认开着过滤的库在重扫完成前会把短音频（通知音/录音碎片）先放出来闪一下——
+     * 缓存刻意全量保存（见 [writeCache]），所以过滤必须在**输出**这一层补。
+     */
+    fun loadCache(context: Context, filterShort: Boolean = true): List<DemoSong>? = runCatching {
+        readCacheEntries(context).takeIf { it.isNotEmpty() }?.let { entries ->
+            outputFiltered(entries.map { it.song }, filterShort)
+        }
     }.getOrNull()
 
     /**
@@ -593,12 +879,17 @@ object MediaLibrary {
             val o = arr.getJSONObject(i)
             val dataPath = o.optString("dataPath")
             // 封面统一按 dataPath 重导出（缓存存的就是 dataPath，不依赖落盘时的旧文件名）；
-            // 无 dataPath 的条目沿用缓存里的 artworkUri
+            // 无 dataPath 的条目沿用缓存里的 artworkUri。
+            // 迁移兼容（见 [coverFileFor] 的迁移链第 1 步）：新命名文件不存在时，回落到缓存里
+            // 记录的 artworkUri——那多半是旧命名 c<hash>/d<hash>.png 且此刻还在盘上，
+            // 冷启动（此处）因此不会因为换了键而首屏全灰。是否**真的**要重提取由增量扫描
+            // 的 coverLost 判断（它只看新命名文件），所以回落到旧文件不会掩盖迁移。
             val artworkUri = if (dataPath.isEmpty()) {
                 o.optString("artworkUri").ifEmpty { null }
             } else {
-                coverFileFor(context, dataPath)
-                    .takeIf { it.isFile && it.length() > 0L }?.let { Uri.fromFile(it).toString() }
+                val cover = coverFileFor(context, dataPath).takeIf { it.isFile && it.length() > 0L }
+                    ?: legacyArtworkFile(o.optString("artworkUri"))
+                cover?.let { Uri.fromFile(it).toString() }
             }
             val song = DemoSong(
                 id = o.getString("id"),
@@ -613,9 +904,7 @@ object MediaLibrary {
                 year = o.optInt("year", 0),
                 trackNo = o.optInt("trackNo", 0),
                 mediaUri = o.optString("mediaUri").ifEmpty { null },
-                coverBitmap = if (light) null else artworkUri?.let { uri ->
-                    android.graphics.BitmapFactory.decodeFile(uri.removePrefix("file://"))?.asImageBitmap()
-                },
+                coverBitmap = null, // 按需解码（ArtworkBitmapCache）：全库常驻数百 MB 的根因
                 artworkUri = artworkUri,
                 lyricLines = if (light || dataPath.isEmpty()) null else readLrc(context, dataPath),
                 codec = o.optString("codec"),
@@ -643,20 +932,39 @@ object MediaLibrary {
     }.getOrDefault(emptyList())
 
     /** 扫描成功后写缓存（IO 线程调用）；失败静默（下次重扫再写）。
-     *  指纹取自 [lastScanResult]：新扫条目用本次 cursor 值、复用条目沿用旧指纹，
-     *  保证下一次增量扫描仍能命中（否则退化成每次全量重扫）。
+     *  指纹取自 [fingerprints] 参数或 [lastScanResult]：新扫条目用本次 cursor 值、
+     *  复用条目沿用旧指纹，保证下一次增量扫描仍能命中（否则退化成每次全量重扫）。
+     *  P3-32：[fingerprints] 显式传入时可与 songs **同源**——旧实现固定读单例 lastScan，
+     *  两次扫描交错（扫描 A 刚写完 lastScan，扫描 B 才调 writeCache）会把 A 的指纹
+     *  配到 B 的 songs 上，错位后下次增量永远 miss。默认 null 保持旧行为，既有调用点不改也编译；
+     *  GlassApp 拿到 load() 返回的 ScanResult 后可传 result.fingerprints。
      *  B3 缓存全量：调用方（GlassApp）传入的是 load() **输出层过滤后**的列表，
-     *  被滤掉的短音频须从本次全量扫描结果（lastScan.songs）补回再落盘——
+     *  被滤掉的短音频须从本次全量扫描结果（scan.songs）补回再落盘——
      *  否则缓存文件缺了它们的条目与指纹，关掉过滤后的下一次扫描只能对短音频
      *  重新跑 MediaExtractor/MediaMetadataRetriever（正是两层分离要消除的浪费）。 */
-    fun writeCache(context: Context, songs: List<DemoSong>) {
+    fun writeCache(
+        context: Context,
+        songs: List<DemoSong>,
+        fingerprints: Map<String, Pair<Long, Long>>? = null,
+    ) {
         val scan = lastScan
-        val fingerprints = scan?.fingerprints.orEmpty()
+        // P2-19 防线：扫描被取消通道中止时 break 而非抛异常，调用方的 runCatching
+        // 分流不出「中止」与「成功」，会把半截 songs 当成功写进缓存（覆盖掉好缓存，
+        // 且半截 songs 配全量指纹会让下次增量把未扫到的歌判为「指纹一致」永久复用旧记录）。
+        // 默认路径（未显式传 fingerprints）在此拦截；显式传指纹视为「同源调用方已自查
+        // ScanResult.aborted」，不再代拦。lastScan 为 null（从未扫过）时不拦——songs 本身
+        // 就是调用方现成数据，无「半截」可言
+        if (fingerprints == null && scan?.aborted == true) return
+        val fps = fingerprints ?: scan?.fingerprints.orEmpty()
         val presentIds = songs.asSequence().map { it.id }.toHashSet()
         val allSongs = if (scan != null) songs + scan.songs.filter { it.id !in presentIds } else songs
         runCatching {
             val arr = org.json.JSONArray()
             allSongs.forEach { s ->
+                // P3-33：id 体系是 "f" + 绝对路径；非 f 前缀（如演示/导入的合成条目）
+                // removePrefix 后得空串 dataPath，写进缓存会变成无路径幽灵条目，
+                // 还可能覆盖读侧对 dataPath 的判空分支——直接不入缓存
+                if (!s.id.startsWith("f")) return@forEach
                 arr.put(org.json.JSONObject().apply {
                     put("id", s.id)
                     put("title", s.title)
@@ -677,7 +985,7 @@ object MediaLibrary {
                     put("bitrateKbps", s.bitrateKbps)
                     put("dateAdded", s.dateAddedSec)
                     // 增量扫描指纹（v3）：缺省 0 → 下次视为不命中，该条重扫（自愈）
-                    val fp = fingerprints[s.id.removePrefix("f")]
+                    val fp = fps[s.id.removePrefix("f")]
                     put("lastModified", fp?.first ?: 0L)
                     put("size", fp?.second ?: 0L)
                     s.palette?.let { p ->
@@ -694,6 +1002,11 @@ object MediaLibrary {
             java.io.File(context.filesDir, CACHE_FILE).writeText(
                 org.json.JSONObject().put("v", CACHE_VERSION).put("songs", arr).toString(),
             )
+        }.onFailure {
+            // 写缓存失败不阻断本次扫描（本进程内曲库照常可用，下次重扫再写）。
+            // 但这是「每次冷启动都要重扫十几秒」的直接原因（磁盘满 / filesDir 不可写），
+            // 静默吞掉会让性能问题完全无法归因，故留痕
+            Log.e(TAG, "writeCache failed (${songs.size} songs)", it)
         }
     }
 }

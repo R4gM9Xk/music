@@ -35,6 +35,10 @@ import com.local.music.core.ui.theme.LocalGlassColors
 /**
  * 主题色色板（F2）：圆形色点网格，选中项带描边 + 对勾语义。
  * 只负责「选颜色」，派生逻辑在 AuroraPalette.fromSeed（调用方传 seed 即可）。
+ *
+ * P3-56：选中环只用一层 3dp textPrimary 描边——旧实现外面 3dp 强调圈再叠一圈 2dp 白圈，
+ * 深色下白圈贴着浅色描边只剩约 0.5dp 的"白牙"，反而把选中态弄糊；读屏 description
+ * 也从清一色「主题色」改为带全局序号（"主题色 N"），逐项可区分。
  */
 @Composable
 fun ThemeColorSwatches(
@@ -45,12 +49,14 @@ fun ThemeColorSwatches(
 ) {
     val glass = LocalGlassColors.current
     Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        seeds.chunked(5).forEach { row ->
+        seeds.chunked(5).forEachIndexed { rowIndex, row ->
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                row.forEach { color ->
+                row.forEachIndexed { colIndex, color ->
+                    // 全局索引（跨行连续）：读屏序号与色板展示顺序一一对应
+                    val index = rowIndex * 5 + colIndex
                     val on = selected != null && color.toArgbValue() == selected.toArgbValue()
                     Box(
                         Modifier
@@ -68,18 +74,10 @@ fun ThemeColorSwatches(
                             .semantics {
                                 this.role = Role.RadioButton
                                 this.selected = on
-                                contentDescription = "主题色"
-                            }
-                            .then(
-                                // 选中态内圈白点：纯视觉指示（读屏走 selected 语义）
-                                if (on) {
-                                    Modifier.border(2.dp, Color.White.copy(alpha = 0.85f), CircleShape)
-                                } else {
-                                    Modifier
-                                },
-                            ),
+                                contentDescription = "主题色 ${index + 1}"
+                            },
                     ) {
-                        // 色点内不放内容：纯色块 + 描边已足够识别
+                        // 色点内不放内容：纯色块 + 3dp 描边已足够识别（P3-56：不再叠白圈）
                     }
                 }
                 // 不足 5 个时补空位，保持网格对齐

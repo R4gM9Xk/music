@@ -24,8 +24,10 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -39,11 +41,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -91,12 +95,15 @@ import com.local.music.player.MusicPlaybackService
 import com.local.music.player.M3uPlaylistIO
 import com.local.music.player.QueueStateStore
 import com.local.music.state.SettingsStore
+import com.local.music.state.SnapshotReadResult
 import com.local.music.update.UpdateManager
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -121,7 +128,14 @@ fun GlassApp() {
         }
     }
     DisposableEffect(Unit) {
-        onDispose { queueStateExecutor.shutdown() }
+        onDispose {
+            // **必须先解绑写入器再关执行器**：state.queueStateWriter 是个存活到 AppState 销毁的
+            // lambda，它内部会 queueStateExecutor.execute(...)。若只 shutdown 不解绑，
+            // dispose 之后任何一次 scheduleSave()（tick 每 20s / 用户操作）都会在已关闭的
+            // executor 上 execute → RejectedExecutionException → UI 线程未捕获 → 崩溃。
+            state.queueStateWriter = null
+            queueStateExecutor.shutdown()
+        }
     }
     val modalState = remember { ModalState() }
     // 播放页共享元素飞行动效（迷你条 ⇄ 播放页），纯 UI 态不进 AppState
@@ -129,7 +143,13 @@ fun GlassApp() {
 
     // ── 所有文件访问（MANAGE_EXTERNAL_STORAGE）：读取任意公共目录的同名 .lrc 歌词 ──
     var allFilesGranted by remember { mutableStateOf(Environment.isExternalStorageManager()) }
-    var jumpedAllFiles by remember { mutableStateOf(false) } // 每进程只自动跳一次，避免拒绝后反复打扰
+    // All-Files 自动跳转的「已提示过」标记：**跨进程持久化**，不是进程内布尔。
+    // 旧实现用 remember 的 Boolean（jumpedAllFiles），注释自认「每进程一次」——但对坚持不授权的
+    // 用户，"每进程一次"实际等于「每次冷启动都把人拽到系统页一次」，属每次启动的打扰。
+    // 现在改为：只在从未提示过时自动跳一次，之后再进全靠设置页的手动入口（功能重复但不再打扰）。
+    var allFilesPrompted by remember { mutableStateOf(true) } // 初值 true = 偏好未读完前不跳
+    var allFilesPromptRead by remember { mutableStateOf(false) } // 持久化标记已读过（下面据此单点触发）
+    var jumpedAllFiles by remember { mutableStateOf(false) } // 本进程内是否已自动跳过（防反复跳）
     // 音频权限上次授权态：ON_RESUME 对比检测（用户在系统设置手动授权后返回能自动装载真曲库）
     var audioGranted by remember {
         mutableStateOf(
@@ -137,6 +157,37 @@ fun GlassApp() {
                 PackageManager.PERMISSION_GRANTED,
         )
     }
+    /** 音频权限被拒（运行时弹窗拒绝 / 从未授权）：UI 据此在曲库页与设置页给出应用内再引导入口 */
+    var audioDenied by remember { mutableStateOf(false) }
+    /** 本次进程内是否已经弹过一次运行时权限弹窗（判断「不再询问」态用，见 requestAudioPermission）。
+     *  P3-46：rememberSaveable 而不是 remember——Activity 重建（配置变更/内存回收重启）会把
+     *  remember 清零，用户勾了「不再询问」后系统弹窗秒拒，旧实现却因标记丢失再次 launch，
+     *  表现为「点『去授权』没任何反应」每进程复现一次；Saveable 随实例状态恢复，重启后
+     *  直接走系统详情页引导（最小修：不引入 SettingsStore 新键，该文件不在本修复写域） */
+    var audioDenialShown by rememberSaveable { mutableStateOf(false) }
+    /**
+     * P1-②：快照读取失败（损坏/来自更新版本/IO 异常）。
+     *
+     * 为 true 时【不】markHydrated → [com.local.music.core.ui.state.AppState.scheduleSave]
+     * 全程空转，磁盘上的旧快照原样保留（readResult 已把坏串留档到 corrupt_snapshot/）。
+     * 这既是防止「默认值覆盖用户设置」的闸门，也是给 UI 的提示信号：
+     * 设置页据此显示「设置快照读取失败，本次改动不会保存」，而不是静默丢设置。
+     */
+    var corruptSnapshot by remember { mutableStateOf(false) }
+
+    /** 打开本应用的系统详情页（权限在「权限」子页，用户可在此手动开音频访问） */
+    fun openAppDetailsPage() {
+        val intent = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.parse("package:${context.packageName}"),
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { context.startActivity(intent) }.onFailure {
+            runCatching {
+                context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
+        }
+    }
+
     fun openAllFilesAccessPage() {
         jumpedAllFiles = true
         val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${context.packageName}"))
@@ -150,16 +201,41 @@ fun GlassApp() {
             }
     }
     fun maybeRequestAllFiles() {
-        if (!allFilesGranted && !jumpedAllFiles) openAllFilesAccessPage()
+        // 读持久化标记之前不得自动跳（初值是 true，读完后才可能放开）
+        if (!allFilesPromptRead || allFilesGranted || jumpedAllFiles || allFilesPrompted) return
+        allFilesPrompted = true // 先置位：跳转失败也不该每次启动重跳
+        scope.launch { runCatching { store.markAllFilesPrompted() } }
+        openAllFilesAccessPage()
     }
 
     fun loadRealLibrary(onDone: () -> Unit = {}) {
+        // P2-19 取消探针：MediaLibrary.load 是阻塞式扫描（IO 线程内联跑游标循环），
+        // 探针 lambda 由扫描线程调用——非 suspend lambda 里取不到协程上下文，只能
+        // 在启动前捕获组合作用域的 Job 引用给探针判活。Activity 重建/离开组合时
+        // rememberCoroutineScope 被取消 → Job 失活 → 游标循环开头命中 break 提前返回
+        // （aborted 半截结果由 MediaLibrary.writeCache 默认路径自守卫，不会覆盖好缓存）
+        val probeJob = scope.coroutineContext[Job]
         scope.launch {
             // 扫描可能因权限被撤销抛 SecurityException：容错并上报，不让协程崩溃
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    // B3：扫描过滤开关随扫描传入（默认滤除 <30s 的通知音/录音碎片）
-                    MediaLibrary.load(context, filterShort = SettingsStore.readScanFilterShort(context))
+                    // P2-④：**始终全量扫描**（filterShort = false）。
+                    //
+                    // B3 的设计是「扫描/缓存全量、过滤只在输出层」，但旧实现又把开关传了进来，
+                    // 于是 library 里根本没有短音频条目——输出层再想过滤也无从滤起，反过来
+                    // 用户关掉过滤时也没有条目可放出来（必须重扫）。两个后果都实测到了：
+                    // 「扫描过滤=ON 却显示全量 11 首」（输出层被绕过时无处兜底）以及
+                    // 「拨开关不立即生效，要重扫才对」。
+                    //
+                    // 现在扫描恒定全量，过滤唯一生效点是 AppState.visibleLibrary()：
+                    // 开关两个方向都即时生效、零重扫，library_cache.json 也自然是全量的
+                    // （writeCache 里原先要靠 lastScan 兜底并入短音频的那段因此变成纯冗余）。
+                    // 同时传取消探针（见上）：Activity 重建/离开后阻塞式扫描能提前 break。
+                    MediaLibrary.load(
+                        context,
+                        filterShort = false,
+                        isCancelled = { probeJob?.isActive != true },
+                    )
                 }
             }
             result.exceptionOrNull()?.let {
@@ -167,13 +243,31 @@ fun GlassApp() {
                 state.reportEngineFailure("读取媒体库失败，请检查存储权限")
             }
             val songs = result.getOrDefault(emptyList())
-            android.util.Log.d("MediaLibrary", "loadRealLibrary got ${songs.size}")
             state.loadLibrary(songs)
-            if (songs.isNotEmpty()) {
+            // 缓存写回策略按「扫描是否成功」分流，而不是按「有没有歌」——
+            // 旧写法把「扫到 0 首」和「扫描失败」混在同一个 else 里，两种情况都不写缓存，
+            // 于是用户删空曲库后旧 library_cache.json 仍保留全部已删曲目：冷启动读回幽灵曲库，
+            // 而 librarySettled 已被置 true 使后续纠正分支永不触发，只能清应用数据才好。
+            // - 成功：无论空不空都写（空库写成空数组，覆盖掉陈旧缓存）
+            // - 失败：不写（一次权限异常不该把好缓存清空）
+            if (result.isSuccess) {
+                // P2-④ 起扫描恒为全量，songs 即完整曲库，缓存如实全量落盘
+                // （原先「并入 lastScan 以保留被滤掉的短音频」的兜底已成冗余，无需再依赖）。
                 withContext(Dispatchers.IO) { runCatching { MediaLibrary.writeCache(context, songs) } }
+                if (songs.isEmpty() && !state.librarySettled) {
+                    state.markLibrarySettled() // 扫描成功但确实没有曲目：确认无曲库终态
+                }
             } else if (!state.librarySettled) {
-                state.markLibrarySettled() // 无缓存且扫描为空：确认无曲库（演示模式终态）
+                // **扫描失败 ≠ 确认无曲库**：旧实现在这里也调 markLibrarySettled()，而该函数会
+                // abandonPendingPlayback()——一次 MediaStore 瞬时错误/权限竞态就把用户的恢复队列
+                // 永久丢掉（之后重扫成功曲库会回来，播放现场却回不来了）。
+                // 失败时只放行启动门面（让 UI 不再卡在「正在整理曲库…」），**不清 pending**：
+                // pending 在后续 loadLibrary 成功时仍会被消费，扫到空库时才由成功分支收终态。
+                state.settleLibraryKeepingPending()
             }
+            // onDone 必须无条件执行：它是设置页「扫描中…」的唯一复位信号。
+            // 若上面任一步抛异常（loadLibrary 内部、写缓存等）而跳过它，按钮会永久停在
+            // 「扫描中…」直到离开该页。用 runCatching 包住整个尾部，最后 finally 语义地调 onDone。
             onDone()
         }
     }
@@ -185,22 +279,81 @@ fun GlassApp() {
         // 切 IO 线程写：scheduleSave 由 tick 每 5s 调用，同步写会卡 UI；
         // 用单线程串行执行器保证「后写的覆盖先写的」，不会出现乱序写
         state.queueStateWriter = { specs, index, positionSec ->
-            queueStateExecutor.execute {
-                QueueStateStore.write(context, specs, index, positionSec)
+            // runCatching：executor 可能在 dispose 后已被 shutdown（queueStateWriter 的解绑
+            // 与 shutdown 之间仍有一个极窄窗口），此处兜底避免抛到 UI 线程
+            runCatching {
+                queueStateExecutor.execute {
+                    QueueStateStore.write(context, specs, index, positionSec)
+                }
             }
         }
-        val snapshot = runCatching { store.read() }.getOrNull()
-        if (snapshot != null) {
-            state.restore(snapshot)
-        } else {
-            state.markHydrated() // 首次启动/快照损坏：无现场可保护，放行存盘
+        // All-Files 引导是否已提示过（跨进程）：决定启动时会不会再自动跳系统页
+        allFilesPrompted = withContext(Dispatchers.IO) {
+            runCatching { store.allFilesPrompted() }.getOrDefault(false)
+        }
+        allFilesPromptRead = true
+        // 音频权限终态记忆：冷启动时若已拒绝过，曲库页/设置页直接给出应用内再引导入口
+        audioDenied = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.READ_MEDIA_AUDIO,
+        ) != PackageManager.PERMISSION_GRANTED
+        // P1-②：三态读取，区分「真首装」与「快照损坏」。
+        //
+        // 旧写法 `store.read()` 只有 null/非 null 两态，而 null 同时表示「键不存在（首装）」
+        // 和「解码失败（损坏）」。损坏时走 markHydrated() 放行存盘 → 服务端 queue_state.json
+        // 恢复出的播放字段（queue/queueIndex/progressSec）被填进默认状态，tick 存盘把
+        // **全默认设置**（favorites=[]、eqPreset=Off、songSort=Title…）覆盖写盘，用户改动
+        // 不可恢复。实测就是这么丢的（报告 §1 P1-②）。
+        //
+        // 现在：损坏时**不**放行存盘（hydrated 保持 false，scheduleSave 全部空转），
+        // 原坏串已由 readResult() 留档到 files/corrupt_snapshot/，磁盘上的快照保持原样；
+        // 同时把「快照已损坏」这一事实暴露给 UI（corruptSnapshot 标志），让用户知道
+        // 设置回落到默认是**因为读取失败**，而不是自己改丢了。
+        // 只有真正的「键不存在（首装）」才 markHydrated 放行首份快照。
+        val readOutcome = runCatching { store.readResult() }
+        when (val readResult = readOutcome.getOrNull()) {
+            is SnapshotReadResult.Ok -> state.restore(readResult.snapshot)
+            // 首装：无现场可保护，放行存盘写出第一份快照
+            SnapshotReadResult.Absent -> state.markHydrated()
+            // 读取/解析异常：不放行存盘（保住磁盘上的旧快照，留待后续人工/版本修复），
+            // 也不 restore（无可用数据）——UI 显示默认值 + 损坏提示
+            is SnapshotReadResult.Corrupt -> {
+                corruptSnapshot = true
+                android.util.Log.e(
+                    "GlassApp",
+                    "snapshot corrupt (len=${readResult.raw.length}); holding writes to preserve on-disk state",
+                )
+            }
+            // readResult 自身抛异常（DataStore IO 错误）：同损坏处理，宁可只读也不覆盖
+            null -> {
+                corruptSnapshot = true
+                android.util.Log.e("GlassApp", "snapshot read threw; holding writes", readOutcome.exceptionOrNull())
+            }
         }
         // 曲库缓存即时真实化（应用私有文件、无需权限）：恢复场景 <1s 呈现，
-        // 随后的全量重扫在后台对账（新增/删除歌曲、封面刷新）并重写缓存
+        // 随后的全量重扫在后台对账（新增/删除歌曲、封面刷新）并重写缓存。
+        // filterShort 取**已恢复的内存态**（state.scanFilterShort）而不是磁盘独立键：
+        // 两者正常时同值，但快照损坏/防抖窗口内会分叉，读磁盘会让「设置页开关」与
+        // 「实际显示的曲目」互相打脸（P2-④）。快照读取在本 effect 中已先完成，
+        // 这里取到的就是用户当前看到的那个开关值，两个界面必然一致。
         val cached = withContext(Dispatchers.IO) {
-            runCatching { MediaLibrary.loadCache(context) }.getOrNull()
+            runCatching {
+                MediaLibrary.loadCache(context, filterShort = state.scanFilterShort)
+            }.getOrNull()
         }
-        if (cached != null) state.loadLibrary(cached)
+        // **必须门控 realLibraryLoaded**：本 effect 与「扫描 effect」是并发的两条链。
+        // 增量扫描（热缓存，几十 ms）可能先于 loadCache（全量读缓存 + 每首 readLrc，数百次小文件
+        // IO）完成；扫描先到会把 library 换成新结果，随后陈旧的缓存再无条件 loadLibrary 进来，
+        // 走 loadLibrary 的重扫分支整引用换回旧列表 → 新歌消失 / 已删歌复活，持续整个会话。
+        if (cached != null && !state.realLibraryLoaded) state.loadLibrary(cached)
+    }
+    // SettingsStore 持有自建 IO scope + 常驻 collector：Activity 重建（密度/字号/语言变更等
+    // manifest 未吞的配置变更）会再 remember 一个新实例，旧实例的 scope 无人取消 → 泄漏。
+    // 显式在组合销毁时停掉，flush 一次保住最近快照（防抖窗口内被杀会丢最后一次修改）。
+    DisposableEffect(store) {
+        onDispose {
+            runCatching { store.flushBlocking() }
+            store.cancel()
+        }
     }
     // 设置变更 → 存盘（播放进度的存盘由 tick 每 5s 节流 + 各行为触发）
     LaunchedEffect(Unit) {
@@ -220,7 +373,10 @@ fun GlassApp() {
                 val grantedNow = Environment.isExternalStorageManager()
                 val grantedBefore = allFilesGranted
                 allFilesGranted = grantedNow
-                if (jumpedAllFiles && grantedNow && !grantedBefore) {
+                // **不要绑 jumpedAllFiles**：那个标记只在「应用主动拉起系统页」时置位，
+                // 用户自行去系统设置开「所有文件访问」再返回时它是 false，于是不重扫、
+                // .lrc 不被拾取。grantedNow && !grantedBefore 已经足够表达「刚刚获得授权」。
+                if (grantedNow && !grantedBefore) {
                     jumpedAllFiles = false
                     loadRealLibrary() // 授权回来：重扫拾取各目录 .lrc
                 }
@@ -230,6 +386,7 @@ fun GlassApp() {
                 ) == PackageManager.PERMISSION_GRANTED
                 val audioBefore = audioGranted
                 audioGranted = audioNow
+                audioDenied = !audioNow
                 if (audioNow && !audioBefore && !state.realLibraryLoaded) {
                     loadRealLibrary() // 真曲库未装载才扫：记住上次授权态，普通回前台不重扫
                 }
@@ -245,14 +402,51 @@ fun GlassApp() {
         when (result[Manifest.permission.READ_MEDIA_AUDIO]) {
             true -> {
                 audioGranted = true // 同步记忆授权态：随后的 ON_RESUME 对比不再重复触发扫描
+                audioDenied = false
                 loadRealLibrary()
                 maybeRequestAllFiles() // 音频权限落定后再引导所有文件访问
             }
             false -> {
-                state.abandonPendingPlayback() // 曲库永远不可用：放弃待恢复现场，按演示态如实存盘
-                state.markLibrarySettled()
+                audioDenied = true // UI 据此给出应用内「去授权」入口（不再只能靠用户自己去系统设置）
+                audioDenialShown = true // 已弹过一次：再点「去授权」要改走系统设置页
+                // 曲库不可用只是**当前**状态，不是终态：保留待恢复现场（用户随时可能去授权，
+                // 授权回来后 loadRealLibrary 仍能把播放现场接上）。旧实现这里用 markLibrarySettled
+                // 会连带 abandonPendingPlayback，把一次拒绝升级成「现场永久丢失」。
+                state.settleLibraryKeepingPending()
             }
             null -> Unit // 本次只补申请了通知权限
+        }
+    }
+
+    /**
+     * 申请音频权限：能弹运行时弹窗就弹，弹不出来就跳应用详情页。
+     *
+     * 为什么需要这条分支：READ_MEDIA_AUDIO 被拒一次之后（尤其用户勾了「不再询问」），
+     * `permissionLauncher.launch(...)` 会**立刻以 denied 返回、系统连弹窗都不显示** ——
+     * 用户点了「去授权」却什么都没发生，比不给入口更糟。
+     * 判据（两条缺一不可）：
+     * - `shouldShowRequestPermissionRationale == true` → 系统还愿意再弹；
+     * - 本次进程没问过（audioDenialShown == false）→ 首装首问，弹窗必然会出现。
+     * 两者都为否 = 「不再询问」态 → 只能引导用户去系统设置页。
+     */
+    fun requestAudioPermission() {
+        val granted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.READ_MEDIA_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            loadRealLibrary() // 已授权：直接重扫（用户可能刚从系统设置回来）
+            return
+        }
+        val canAskAgain = (context as? Activity)?.let { act ->
+            androidx.core.app.ActivityCompat.shouldShowRequestPermissionRationale(
+                act, Manifest.permission.READ_MEDIA_AUDIO,
+            )
+        } ?: true
+        if (canAskAgain || !audioDenialShown) {
+            audioDenialShown = true
+            permissionLauncher.launch(arrayOf(Manifest.permission.READ_MEDIA_AUDIO))
+        } else {
+            openAppDetailsPage()
         }
     }
 
@@ -261,13 +455,16 @@ fun GlassApp() {
             context, permission,
         ) == PackageManager.PERMISSION_GRANTED
         val audioGranted = granted(Manifest.permission.READ_MEDIA_AUDIO)
+        audioDenied = !audioGranted
         val toRequest = buildList {
             if (!audioGranted) add(Manifest.permission.READ_MEDIA_AUDIO)
             if (!granted(Manifest.permission.POST_NOTIFICATIONS)) add(Manifest.permission.POST_NOTIFICATIONS)
         }
         if (audioGranted) {
             loadRealLibrary()
-            maybeRequestAllFiles() // 启动即引导一次（每进程一次；拒绝可从设置页再进）
+            // 等「已提示过」标记从磁盘读完再决定是否跳（否则会按初值跳过、或按默认值误跳）
+            snapshotFlow { allFilesPromptRead }.first { it }
+            maybeRequestAllFiles() // 已提示过则不再打扰：之后只从设置页手动进入
         }
         if (toRequest.isNotEmpty()) permissionLauncher.launch(toRequest.toTypedArray())
     }
@@ -460,14 +657,23 @@ fun GlassApp() {
                             if (last != null && last != size) flight.onRootSizeChanged()
                             lastRootSize = size
                         }
-                        // 飞行期全内容区指针消费（Initial 隧道先行）：PlayerScreen 内部的消费层
-                        // 盖不到 AnimatedContent 旧页（曲库/详情仍在退场渲染），双击迷你条的第二击
-                        // 会穿透到列表行触发 playSong——根层统一兜住（Idle 时零开销）
+                        // 飞行期指针闸门（P3-22 收窄）：只吞 **up**（Initial 隧道先行），down/move 全放行。
+                        // 旧实现吞掉所有事件——等待期（最长 1.8s）全屏点不动也滑不动，体感像卡死。
+                        // 为什么只吞 up 就能挡「点」：点击类手势（clickable/combinedClickable）必须
+                        // 拿到未被消费的 up 才成立，up 在隧道层被吃掉后 tap 全部落空（按压涟漪闪
+                        // 一下即复位，可接受；双击迷你条的第二击同样在此被拦）。
+                        // 为什么**不能**连 down 一起吞：滑动检测（awaitFirstDown 默认要求未被消费的
+                        // down）看到 consumed down 会跳过继续等，滑动手势永远起不来——那比挡不住
+                        // 点击更糟。代价（设计取舍）：长按在超时瞬间即触发、不看 up，飞行期长按菜单
+                        // 仍可能弹出；滑动手势最后一帧的 up 被吞会让该次 drag 以 cancel 收场（无
+                        // 惯性 fling），仅发生在 0.5~2.3s 的飞行窗口内。
                         .then(
                             if (flight.isActive) Modifier.pointerInput(Unit) {
                                 awaitPointerEventScope {
                                     while (true) {
-                                        awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
+                                        awaitPointerEvent(PointerEventPass.Initial).changes.forEach {
+                                            if (it.changedToUp()) it.consume()
+                                        }
                                     }
                                 }
                             } else Modifier,
@@ -535,7 +741,13 @@ fun GlassApp() {
                             ) { target ->
                                 when (target) {
                                     GlassScreen.Player -> PlayerScreen(state)
-                                    GlassScreen.Library -> LibraryScreen(state)
+                                    // 音频权限被拒时曲库页给出空态 + 应用内「去授权」入口
+                                    // （否则拒绝后只剩一片空白，用户不知道该怎么救）
+                                    GlassScreen.Library -> LibraryScreen(
+                                        state,
+                                        audioDenied = audioDenied,
+                                        onRequestAudioPermission = ::requestAudioPermission,
+                                    )
                                     GlassScreen.Playlist -> PlaylistScreen(state)
                                     GlassScreen.Detail -> PlaylistDetailScreen(
                                         state,
@@ -549,7 +761,9 @@ fun GlassApp() {
                                                     ?: com.local.music.core.ui.components.ArtStyle.Night,
                                                 tracks = tracks,
                                             )
-                                            m3uExportLauncher.launch("$title.m3u8")
+                                            // 文件名经 sanitize：歌单名不受限（用户可输入 / 等非法字符），
+                                            // 原实现直接拼 "$title.m3u8" 交给 SAF，部分 ROM 会拒绝或截断
+                                            m3uExportLauncher.launch(M3uPlaylistIO.suggestedFileName(title))
                                         },
                                     )
                                     GlassScreen.Search -> SearchScreen(state)
@@ -564,6 +778,8 @@ fun GlassApp() {
                                                 context.packageManager
                                                     .getPackageInfo(context.packageName, 0).versionName ?: ""
                                             } catch (e: Exception) {
+                                                // 仅影响设置页「当前版本」文案（显示空串）；记一条日志便于排查
+                                                android.util.Log.e("GlassApp", "read versionName failed", e)
                                                 ""
                                             }
                                         },
@@ -577,6 +793,17 @@ fun GlassApp() {
                                             } else {
                                                 openAllFilesAccessPage()
                                             }
+                                        },
+                                        // 音频权限被拒时的应用内再引导（否则只能靠用户自己去系统设置）
+                                        audioDenied = audioDenied,
+                                        onRequestAudioPermission = ::requestAudioPermission,
+                                        // P1-②：快照损坏 → 横幅可见 + 用户确认后才解除写冻结
+                                        corruptSnapshot = corruptSnapshot,
+                                        onRebuildFromCorrupt = {
+                                            // 先清标志再放行：横幅据此即时消失，
+                                            // 且顺序保证 rebuild 内部第一次 scheduleSave 已不受限
+                                            corruptSnapshot = false
+                                            state.rebuildFromCurrentState()
                                         },
                                         // D2 导入 M3U / D3 备份恢复
                                         onImportM3u = {
@@ -613,7 +840,11 @@ fun GlassApp() {
                             GlassChrome(
                                 song = state.currentSong,
                                 playing = state.playing,
-                                progress = state.progressFraction,
+                                // 传取值函数而不是 Float：进度 10Hz 变，以值传入会让调用方
+                                // （整个 GlassApp 组合）每 tick 重组一次。见 GlassChrome 的说明。
+                                progressProvider = { state.progressFraction },
+                                // 空曲库时迷你条不渲染播放/下一首（否则是可点但无反应的死按钮）
+                                hasSongs = state.hasSongs,
                                 navSelected = when (state.screen) {
                                     GlassScreen.Playlist -> 1
                                     GlassScreen.Settings -> 2
@@ -632,9 +863,15 @@ fun GlassApp() {
                                         GlassScreen.Settings -> 2
                                         else -> 0
                                     }
-                                    // 忙时兜底直切（同 PlaylistDetailScreen）：飞行中不重入共享元素动画
-                                    if (flight.isActive) state.screen = GlassScreen.Player
-                                    else flight.beginEntry(state.currentSong, navSelected) { state.screen = it }
+                                    // 忙时兜底直切（同 PlaylistDetailScreen）：飞行中不重入共享元素动画。
+                                    // **必须先 abort()**：只改 screen 的话，正在跑的 exitJob 尾部仍会
+                                    // navigate(目标屏)，用户落进播放页后被弹回曲库（约 100-225ms 后）。
+                                    if (flight.isActive) {
+                                        flight.abort()
+                                        state.screen = GlassScreen.Player
+                                    } else {
+                                        flight.beginEntry(state.currentSong, navSelected, { state.screen = it }, state.screen)
+                                    }
                                 },
                                 onPlayPause = state::togglePlayPause,
                                 onNext = { state.next() },
@@ -652,69 +889,67 @@ fun GlassApp() {
                         }
                     }
 
-                    // 文件 IO 结果提示（D2/D3：导出/导入/备份恢复）：与错误条同款，4s 自动消退
-                    ioMessage?.let { message ->
-                        LaunchedEffect(message) {
-                            delay(4000)
-                            ioMessage = null
+                    // 顶部提示区：IO 结果（导出/导入/备份）与播放错误共用同一个纵向栈。
+                    //
+                    // **必须同栈**：旧实现两条提示各自 `align(TopCenter) + padding(top = 8.dp)`，
+                    // 是同一个父 Box 里的两个兄弟 → 同时出现时后绘的那条直接盖住前一条，
+                    // 用户只看到一条、另一条 4s 后无声消失（例如导出失败期间恰好播放出错）。
+                    // 放进 Column 后两条按顺序堆叠，谁也盖不住谁；单条时视觉与原来完全一致。
+                    Column(
+                        Modifier
+                            .align(Alignment.TopCenter)
+                            .statusBarsPadding()
+                            .padding(top = 8.dp)
+                            .fillMaxWidth(),
+                    ) {
+                        // 文件 IO 结果提示（D2/D3：导出/导入/备份恢复）：4s 自动消退
+                        ioMessage?.let { message ->
+                            LaunchedEffect(message) {
+                                delay(4000)
+                                ioMessage = null
+                            }
+                            TopBanner(message, maxLines = 3) { ioMessage = null }
                         }
-                        GlassSurface(
-                            modifier = Modifier
-                                .align(Alignment.TopCenter)
-                                .statusBarsPadding()
-                                .padding(top = 8.dp)
-                                .fillMaxWidth()
-                                .padding(horizontal = 20.dp),
-                            level = GlassLevel.Hi,
-                            shape = RoundedCornerShape(16.dp),
-                            onClick = { ioMessage = null },
-                        ) {
-                            Text(
-                                message,
-                                color = LocalGlassColors.current.textPrimary,
-                                fontSize = 12.5.sp,
-                                maxLines = 3,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                            )
+                        // 播放错误提示条（4s 自动消退，点击关闭）
+                        state.playbackError?.let { message ->
+                            LaunchedEffect(message) {
+                                delay(4000)
+                                state.dismissPlaybackError()
+                            }
+                            if (ioMessage != null) Spacer(Modifier.height(6.dp)) // 两条并存才需要间距
+                            TopBanner(message, maxLines = 2) { state.dismissPlaybackError() }
                         }
                     }
 
                     // 共享元素飞行覆盖层：6 个替身（玻璃/封面/歌名/作者/播放/下一首），纯绘制不挡触摸
                     PlayerFlightOverlay(flight, playing = state.playing)
-
-                    // 播放错误提示条（4s 自动消退，点击关闭）
-                    state.playbackError?.let { message ->
-                        LaunchedEffect(message) {
-                            delay(4000)
-                            state.dismissPlaybackError()
-                        }
-                        GlassSurface(
-                            modifier = Modifier
-                                .align(Alignment.TopCenter)
-                                .statusBarsPadding()
-                                .padding(top = 8.dp)
-                                .fillMaxWidth()
-                                .padding(horizontal = 20.dp),
-                            level = GlassLevel.Hi,
-                            shape = RoundedCornerShape(16.dp),
-                            onClick = state::dismissPlaybackError,
-                        ) {
-                            Text(
-                                message,
-                                color = LocalGlassColors.current.textPrimary,
-                                fontSize = 12.5.sp,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                            )
-                        }
-                    }
                 }
             }
         }
     }
 }
 
-/** 底部 Chrome 承载的三个主屏（导航顺序：曲库 0 / 发现 1 / 我的 2） */
+/** 底部 Chrome 承载的三个主屏（导航顺序：曲库 0 / 歌单 1 / 设置 2） */
 private val TAB_SCREENS = setOf(GlassScreen.Library, GlassScreen.Playlist, GlassScreen.Settings)
+
+/** 顶部单条玻璃提示（IO 结果 / 播放错误共用）：样式单点定义，避免两条各写一份后漂移 */
+@Composable
+private fun TopBanner(message: String, maxLines: Int, onClick: () -> Unit) {
+    GlassSurface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp),
+        level = GlassLevel.Hi,
+        shape = RoundedCornerShape(16.dp),
+        onClick = onClick,
+    ) {
+        Text(
+            message,
+            color = LocalGlassColors.current.textPrimary,
+            fontSize = 12.5.sp,
+            maxLines = maxLines,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+        )
+    }
+}

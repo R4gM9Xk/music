@@ -1,5 +1,6 @@
 package com.local.music.feature.player.screen
 
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.updateTransition
@@ -32,11 +33,12 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
@@ -56,6 +58,7 @@ import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
@@ -100,6 +103,8 @@ import com.local.music.core.ui.theme.auroraAccentColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlin.math.roundToInt
 
 /**
@@ -117,6 +122,11 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
     val flight = LocalPlayerFlight.current
     // 模态面板宿主（GlassApp 根层）：队列/更多面板经 show 挂载，屏内不再渲染 GlassSheet
     val modal = LocalModalState.current
+    // P2-⑤：横屏判定（供舞台/控制台/提示行的紧凑化共用）。
+    // 用 configuration 的宽高比较而不是舞台的 stageW/stageH：舞台高度还受控制台占位影响，
+    // 不能反过来当屏幕方向用（否则控制台一压，舞台自己就把自己判成横屏）。
+    val configuration = LocalConfiguration.current
+    val landscape = configuration.screenHeightDp < configuration.screenWidthDp
 
     // 进入飞行落封面模式：entryShowCover 为瞬态，点击封面/手势即清除，不动持久化偏好
     val showLyrics = state.lyricEnabled && lyrics != null && flight?.entryShowCover != true
@@ -154,10 +164,12 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
         )
     }
 
-    // 封面点击：对当前视觉模式取反（entryShowCover 态下首次点击即回到正常切换语义）
+    // 封面点击：对当前视觉模式取反（entryShowCover 态下首次点击即回到正常切换语义）。
+    // 无歌词（纯音乐）时不再静默写 lyricEnabled（P3-66）——点击没有任何视觉反馈，
+    // 偏好却被改掉，之后回到有歌词的歌才发现「歌词开关自己变了」
     val onCoverClick: () -> Unit = {
         flight?.entryShowCover = false
-        state.lyricEnabled = !showLyrics
+        if (lyrics != null) state.lyricEnabled = !showLyrics
     }
 
     // 播放页自持采样状态：顶栏+舞台为 hazeSource，控制台为兄弟效果层
@@ -194,11 +206,12 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             Box(Modifier.weight(1f).hazeSource(playerHaze)) {
                 Column(Modifier.fillMaxSize()) {
                     // ── 顶栏：收起 / 正在播放 / 更多（非共享：原地由虚到实）──
+                    // P2-⑤：横屏纵向极度紧张，顶栏收紧内边距（6dp → 0dp），把高度让给舞台
                     Row(
                         Modifier
                             .fillMaxWidth()
                             .graphicsLayer { alpha = flight?.softAlpha() ?: 1f }
-                            .padding(start = 20.dp, end = 20.dp, top = 6.dp),
+                            .padding(start = 20.dp, end = 20.dp, top = if (landscape) 0.dp else 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
@@ -252,7 +265,18 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         val smallSize = with(density) { 64.dp.toPx() }
                         val smallLeft = with(density) { 22.dp.toPx() }
                         val smallTop = with(density) { 14.dp.toPx() }
-                        val bigSize = minOf(with(density) { 280.dp.toPx() }, stageW, stageH * 0.85f)
+                        // P2-⑤ 横屏：舞台高度被控制台+顶栏挤到 ~100dp 级，而旧公式
+                        // `min(280dp, stageW, stageH*0.85)` 完全以高度为准 → 封面塌缩成
+                        // 64dp 左右的小圆（实测正是「横屏封面变小小圆形缩略图 + 下半屏留白」）。
+                        // 宽屏下改为「按可用高度与宽度共同约束，并保一个下限」：
+                        // - 短边（=高度）决定封面边长，但设 96dp 下限，避免变得比歌词小窗还小；
+                        // - 同时不超过舞台宽度的 42%，给呼吸区，不出现「一张大图顶满」。
+                        val bigSize = if (stageW > stageH) {
+                            minOf(stageH * 0.92f, stageW * 0.42f)
+                                .coerceAtLeast(with(density) { 96.dp.toPx() })
+                        } else {
+                            minOf(with(density) { 280.dp.toPx() }, stageW, stageH * 0.85f)
+                        }
                         val bigCenterY = stageH / 2f -
                             if (pureMusic) with(density) { (18.dp + 20.dp).toPx() / 2f } else 0f
                         val smallRect = Rect(smallLeft, smallTop, smallLeft + smallSize, smallTop + smallSize)
@@ -270,12 +294,14 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         )
                         val coverShape = RoundedCornerShape(lerp(28.dp, 18.dp, modeT))
 
-                        // 歌词 rail：modeT>0 时在组合内；整体随 modeT 淡入淡出 × softAlpha（歌词区归非共享组）
-                        if (lyrics != null && modeT > 0f) {
+                        // 歌词 rail：常驻组合（P3-15——旧写法 modeT>0 的组合期读取让模式切换
+                        // 500ms 内整个舞台每帧重组）；淡入淡出交给下方 graphicsLayer 绘制期读。
+                        // onSelect 门控 showLyrics：封面模式下 rail alpha=0 仍驻组合，不可见行不得响应点击
+                        if (lyrics != null) {
                             LyricRail(
                                 lines = lyrics,
                                 current = state.currentLyricIndex,
-                                onSelect = { index -> state.seekTo(lyrics[index].timeSec + 0.01f) },
+                                onSelect = { index -> if (showLyrics) state.seekTo(lyrics[index].timeSec + 0.01f) },
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .graphicsLayer { alpha = modeT * (flight?.softAlpha() ?: 1f) },
@@ -313,6 +339,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                 Modifier.fillMaxSize(),
                                 coverShape,
                                 bitmap = song.coverBitmap,
+                                artworkUri = song.artworkUri,
                             )
                         }
 
@@ -339,19 +366,38 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             //    底部面板打开时控制台整体让位：读全局 ModalState（含退场期，与 GlassApp 对
             //    Chrome 的门控同源）——面板滑出全程保持隐藏，退场时长到 content 清空后才复位
             val sheetOpen = modal.isOpen
-            val sharedAlpha = { (flight?.playerSharedAlpha() ?: 1f) * (if (sheetOpen) 0f else 1f) }
-            val softAlpha = { (flight?.softAlpha() ?: 1f) * (if (sheetOpen) 0f else 1f) }
+            // 面板开合走 360ms 淡出/淡入（P3-63——if 硬切会让控制台在面板滑出的第一帧瞬时消失、
+            // 回来时又瞬间闪现）；两个 lambdas 只在 graphicsLayer 内调用，绘制期读，不产生逐帧重组
+            val sheetAlpha by animateFloatAsState(
+                targetValue = if (sheetOpen) 0f else 1f,
+                animationSpec = GlassMotion.tweenPage(),
+                label = "sheetAlpha",
+            )
+            val sharedAlpha = { (flight?.playerSharedAlpha() ?: 1f) * sheetAlpha }
+            val softAlpha = { (flight?.softAlpha() ?: 1f) * sheetAlpha }
             GlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 16.dp, end = 16.dp, bottom = 14.dp)
+                    // P2-⑤：横屏收紧外边距与底部留白，控制台少占的高度全部给舞台
+                    .padding(
+                        start = 16.dp,
+                        end = 16.dp,
+                        bottom = if (landscape) 6.dp else 14.dp,
+                    )
                     .trackFlight(FlightKeys.PlayerGlass)
                     .graphicsLayer { alpha = sharedAlpha() },
                 level = GlassLevel.Md,
                 shape = RoundedCornerShape(28.dp),
                 blur = GlassLevel.Md,
             ) {
-                Column(Modifier.padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 16.dp)) {
+                Column(
+                    Modifier.padding(
+                        start = 18.dp,
+                        end = 18.dp,
+                        top = if (landscape) 8.dp else 14.dp,
+                        bottom = if (landscape) 8.dp else 16.dp,
+                    ),
+                ) {
                     // 歌曲信息 + 收藏 + 队列
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
@@ -405,7 +451,12 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     // 进度：轨道 + 时间
                     Spacer(Modifier.height(12.dp))
                     Box(Modifier.graphicsLayer { alpha = softAlpha() }) {
-                        ProgressTrack(progress = state.progressFraction, onSeek = state::seekToFraction)
+                        // 传取值函数：进度 10Hz 变，以 Float 传入会让整个控制台（含歌词区外的
+                        // 音量/模式行）每 tick 重组。绘制期读才是这套 UI 的既有做法。
+                        ProgressTrack(
+                            progressProvider = { state.progressFraction },
+                            onSeek = state::seekToFraction,
+                        )
                     }
                     Row(
                         Modifier
@@ -414,8 +465,10 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             .graphicsLayer { alpha = softAlpha() },
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        Text(state.progressSec.toInt().asTime(), color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
-                        Text(song.duration, color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
+                        // 时间文本无法走绘制期读（Text 必须组合期排版）：抽成极小组件，
+                        // 让 10Hz 的重组范围只限于这一张文本，而不是整条控制台
+                        ElapsedTimeText(state)
+                        TotalTimeText(state)
                     }
 
                     // 控制键：随机 / 上一首 / 播放 / 下一首 / 循环（三态）
@@ -473,13 +526,20 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                 }
             }
 
-            // 底部提示行（按当前视觉模式而非持久化偏好）
+            // 底部提示行（按当前视觉模式而非持久化偏好）；无歌词时不再教「滑动切换」（P3-65）——
+            // 纯音乐没有歌词端可切，提示与舞台空态文案保持同一句话
+            val hint = when {
+                lyrics == null -> "纯音乐，请欣赏"
+                showLyrics -> "点击歌词行可跳转 · 左右滑动切换封面 / 歌词"
+                else -> "左右滑动切换封面 / 歌词"
+            }
             Text(
-                if (showLyrics) "点击歌词行可跳转 · 左右滑动切换封面 / 歌词" else "左右滑动切换封面 / 歌词",
+                hint,
                 color = LocalGlassColors.current.textFaint, fontSize = 10.5.sp,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 12.dp)
+                    // P2-⑤：横屏下提示行紧贴控制台，避免它在 720dp 高度里白占一行
+                    .padding(bottom = if (landscape) 4.dp else 12.dp)
                     .graphicsLayer { alpha = softAlpha() },
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             )
@@ -488,7 +548,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
 }
 
 /**
- * 歌词 rail：点击行 seek 到该行 + 500ms 弹性滚动居中；上下 18% 羽化渐隐。
+ * 歌词 rail：点击行 seek 到该行；首次/切歌瞬时居中，行进切换 500ms 弹性滚动；上下羽化渐隐。
  * （原 LyricStage 去掉内嵌封面小窗——封面由统一舞台接管，rail 只负责歌词）
  */
 @Composable
@@ -501,39 +561,48 @@ private fun LyricRail(
     val density = LocalDensity.current
     // 每行在 rail 内的中心坐标（px），由 onGloballyPositioned 回填
     val lineCenters = remember { mutableStateMapOf<Int, Float>() }
-    var targetOffset by remember { mutableFloatStateOf(0f) }
-    val railOffset by animateFloatAsState(
-        targetValue = targetOffset,
-        animationSpec = GlassMotion.tweenLyric(),
-        label = "railOffset",
-    )
+    // P2-32：偏移改 Animatable 手控。旧 animateFloatAsState 初值恒 0——每次进入播放页/切歌
+    // 都会从 offset=0「滑」到居中位；Animatable 允许首次定位 snapTo 瞬时落位，行进切换才弹性动画
+    val railOffset = remember { Animatable(0f) }
+    // 当前歌词是否已完成过首次居中：换歌词（实例身份变化）即重置，每首歌的第一次定位不走动画
+    var hasPositioned by remember(lines) { mutableStateOf(false) }
 
     BoxWithConstraints(modifier.clipToBounds()) {
         val stageHeightPx = with(density) { maxHeight.toPx() }
-        // 切歌：清空旧行坐标并归零偏移，避免上一首的 rail 位置带入新歌词
+        // 切歌：清空旧行坐标并瞬时归零偏移（snapTo 不带动画），避免上一首的 rail 位置带入新歌词
         LaunchedEffect(lines) {
             lineCenters.clear()
-            targetOffset = 0f
+            railOffset.snapTo(0f)
         }
-        // 当前行中心 → 对齐舞台中心（rail 与舞台同高，行坐标即舞台坐标，同 CSS 公式）
-        LaunchedEffect(current, stageHeightPx, lineCenters[current]) {
-            val center = lineCenters[current] ?: return@LaunchedEffect
-            targetOffset = stageHeightPx / 2f - center
+        // 当前行中心 → 对齐舞台中心（rail 与舞台同高，行坐标即舞台坐标，同 CSS 公式）。
+        // 行坐标由 onGloballyPositioned 异步回填：用 snapshotFlow 等它就绪后取一次，
+        // 而不是把 lineCenters[current] 挂进 key（旧写法每次回填都重启 effect，当前行漂移 P3-67）
+        LaunchedEffect(lines, current, stageHeightPx) {
+            val center = snapshotFlow { lineCenters[current] }.filterNotNull().first()
+            if (hasPositioned) {
+                railOffset.animateTo(stageHeightPx / 2f - center, GlassMotion.tweenLyric())
+            } else {
+                // 首次定位（进入播放页 / 刚换歌）：瞬时对齐，不做「从 0 滑到居中」的入场动画
+                railOffset.snapTo(stageHeightPx / 2f - center)
+                hasPositioned = true
+            }
         }
 
         // 歌词 rail：自定义 Layout——子行一律以无界高度测量。
         // （Column.fillMaxSize 会把溢出行的剩余高度压成 0，真实 .lrc 三四十行时"后半部分无显示"；
         //   这里测出内容总高后按 (舞台高−内容高)/2 居中放置，行坐标仍是舞台坐标系，
-        //   targetOffset 公式与逐行位置衰减零改动）
+        //   railOffset 居中公式与逐行位置衰减零改动）
         Layout(
             content = {
                 lines.forEachIndexed { index, line ->
-                    val stageY = railOffset + (lineCenters[index] ?: 0f)
-                    val positionalAlpha = positionalFade(stageY, stageHeightPx)
                     LyricLineRow(
                         text = line.text,
                         distance = kotlin.math.abs(index - current),
-                        positionalAlpha = positionalAlpha,
+                        // 位置衰减以 lambda 下发：railOffset 是动画值，行内 graphicsLayer 绘制期
+                        // 才读（P3-68——旧版在组合期读，rail 每帧动画都把全部歌词行重组一遍）
+                        positionalAlphaProvider = {
+                            positionalFade(railOffset.value + (lineCenters[index] ?: 0f), stageHeightPx)
+                        },
                         onClick = { onSelect(index) },
                         modifier = Modifier.onGloballyPositioned { coords ->
                             lineCenters[index] = coords.positionInParent().y + coords.size.height / 2f
@@ -544,7 +613,7 @@ private fun LyricRail(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(horizontal = 30.dp)
-                .graphicsLayer { translationY = railOffset },
+                .graphicsLayer { translationY = railOffset.value },
         ) { measurables, constraints ->
             val gap = 20.dp.roundToPx()
             val placeables = measurables.map {
@@ -562,12 +631,12 @@ private fun LyricRail(
     }
 }
 
-/** 单行歌词：当前 24sp 粗体 + 强调色辉光；邻行 55% 白；远处 34% 白 + 微模糊；整行再乘位置衰减 */
+/** 单行歌词：当前 24sp 粗体 + 强调色辉光；邻行 55% 白；远处 34% 白 + 微模糊；整行再乘位置衰减（绘制期读） */
 @Composable
 private fun LyricLineRow(
     text: String,
     distance: Int,
-    positionalAlpha: Float,
+    positionalAlphaProvider: () -> Float,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -582,27 +651,34 @@ private fun LyricLineRow(
         1 -> 0.55f
         else -> 0.34f
     }
-    val alpha by animateFloatAsState(targetAlpha, GlassMotion.tweenLyric(), label = "lyricA")
+    // 命名必须避开 `alpha`：`graphicsLayer { }` 的接收者 GraphicsLayerScope 也有 alpha，
+    // 而局部委托属性优先级高于隐式接收者成员 —— 叫 alpha 会让下方 `alpha = ...` 变成
+    // 「给 val 赋值」编译错误（'val' cannot be reassigned）
+    val lineAlpha by animateFloatAsState(targetAlpha, GlassMotion.tweenLyric(), label = "lyricA")
     val glowPx = with(LocalDensity.current) { 24.dp.toPx() }
     val interactionSource = remember { MutableInteractionSource() }
 
     Text(
         text = text,
         fontSize = lerp(17f, 24f, p).sp,
-        fontWeight = if (p > 0.5f) FontWeight.Bold else FontWeight.Normal,
-        color = LocalGlassColors.current.textPrimary.copy(alpha = alpha * positionalAlpha),
+        // P3-67：字重随 p 连续插值（400→700），替代 >0.5 阈值瞬切——中段不再肉眼跳变
+        fontWeight = FontWeight(lerp(400f, 700f, p).roundToInt()),
+        // 位置衰减不再乘进文字/阴影颜色（那会组合期读动画值）：移到下方 graphicsLayer 绘制期乘，
+        // 总透明度数学上等价（alpha 可交换），rail 滚动动画期间本行不重组
+        color = LocalGlassColors.current.textPrimary.copy(alpha = lineAlpha),
         letterSpacing = lerp(0f, 0.2f, p).sp,
         lineHeight = lerp(24.65f, 34.8f, p).sp, // 17/24 × 1.45
         style = androidx.compose.ui.text.TextStyle(
             shadow = if (p > 0.01f) {
                 Shadow(
-                    color = palette.seed2.copy(alpha = 0.6f * p * positionalAlpha),
+                    color = palette.seed2.copy(alpha = 0.6f * p),
                     blurRadius = glowPx * p,
                 )
             } else null,
         ),
         modifier = modifier
             .then(if (distance > 1) Modifier.blur(0.4.dp) else Modifier)
+            .graphicsLayer { alpha = positionalAlphaProvider() }
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick),
     )
 }
@@ -712,12 +788,15 @@ private fun PlaybackOptionsSheet(
         // 当前歌曲操作：More 改挂播放选项后，歌曲信息/加入歌单等从这里二次进入
         // （modal 单槽 show 原位替换，SongActionsSheet 返回键/点 scrim 关闭行为不变）
         GroupLabel("当前歌曲")
+        // 打开面板时快照当前曲（P3-10）：面板挂着期间若自动切歌，「歌曲操作」的二级面板
+        // 不得跟着漂到新歌——remember 钉住面板生命周期（裸 val 会被秒级倒计时重组刷新）
+        val targetSong = remember { state.currentSong }
         SheetAction(
             icon = GlassIcons.More,
             label = "歌曲操作",
-            subtitle = state.currentSong.title,
+            subtitle = targetSong.title,
             onClick = {
-                modal.show { SongActionsSheet(visible = modal.visible, onDismiss = modal::requestDismiss, state = state, song = state.currentSong) }
+                modal.show { SongActionsSheet(visible = modal.visible, onDismiss = modal::requestDismiss, state = state, song = targetSong) }
             },
         )
         GroupLabel("定时关闭")
@@ -725,8 +804,9 @@ private fun PlaybackOptionsSheet(
             SheetAction(
                 icon = GlassIcons.Moon,
                 label = sleepTimerLabel(option),
-                subtitle = sleepTimerSubtitle(option, activeMode, remainingSec),
-                emphasized = option == activeMode,
+                // P3-47：「取消定时」只在真有定时时高亮；无定时时连「未开启」副标题也不给
+                subtitle = if (option == 0 && activeMode == 0) null else sleepTimerSubtitle(option, activeMode, remainingSec),
+                emphasized = option != 0 && option == activeMode,
                 onClick = {
                     state.setSleepTimer(option)
                     onDismiss()
@@ -757,5 +837,35 @@ private fun GroupLabel(text: String) {
         fontSize = 11.sp,
         letterSpacing = 0.3.sp,
         modifier = Modifier.padding(start = 6.dp, top = 10.dp, bottom = 4.dp),
+    )
+}
+
+/**
+ * 已播时长文本：把「10Hz 变化」的 state 读取隔离成极小组件。
+ *
+ * 为什么单独抽：`state.progressSec` 每 100ms 写一次，若在控制台函数体里读取，整条控制台
+ * （模式行 / 音量 / 播放键 / 队列入口……）都会每 tick 重组。进度轨已改为绘制期读，
+ * 而 Text 必须组合期排版、绕不开——那就把重组范围缩到「一张文本」。
+ */
+@Composable
+private fun ElapsedTimeText(state: AppState) {
+    Text(
+        state.progressSec.toInt().asTime(),
+        color = LocalGlassColors.current.textSecondary,
+        fontSize = 11.sp,
+    )
+}
+
+/**
+ * 总时长文本（P3-1）：与进度条 / 已播时长同口径读引擎真值 durationSec，替代扫描元数据
+ * song.duration——元数据缺失时扫描值兜底 1s，进度却按真实时长走，两个数字对不上。
+ * 同样抽成极小组件：durationSec 相关状态（队列/索引）变化只重组这张文本，不波及控制台。
+ */
+@Composable
+private fun TotalTimeText(state: AppState) {
+    Text(
+        state.durationSec.toInt().asTime(),
+        color = LocalGlassColors.current.textSecondary,
+        fontSize = 11.sp,
     )
 }

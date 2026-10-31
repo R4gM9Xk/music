@@ -27,6 +27,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.AuroraMiniPreview
+import com.local.music.core.ui.components.ChromeBottomInset
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassToggle
@@ -44,6 +45,7 @@ import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.EqPreset
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.SleepTimerOptions
+import com.local.music.core.ui.state.ThemeMode
 import com.local.music.core.ui.state.sleepTimerLabel
 import com.local.music.core.ui.state.sleepTimerSubtitle
 import com.local.music.core.ui.theme.GlassIcons
@@ -71,6 +73,9 @@ fun SettingsScreen(
     onInstallUpdate: () -> Unit = {},
     allFilesGranted: Boolean = false,
     onAllFilesAccess: () -> Unit = {},
+    // 音频权限（READ_MEDIA_AUDIO）：被拒后才在「曲库」组出现再引导行
+    audioDenied: Boolean = false,
+    onRequestAudioPermission: () -> Unit = {},
     // D2/D3：文件 IO 入口（SAF 选择器在 app 层持有，屏内只发起）
     onImportM3u: () -> Unit = {},
     onExportBackup: () -> Unit = {},
@@ -78,6 +83,15 @@ fun SettingsScreen(
     // E2：自启动引导（仅国产省电 ROM 显示该行）
     autoStartGuideSubtitle: String? = null,
     onAutoStartGuide: () -> Unit = {},
+    /**
+     * P1-②：设置快照读取失败（损坏 / 来自更新版本 / IO 异常）。
+     *
+     * 为 true 时宿主**冻结了存盘**（磁盘上的旧快照原样保留，不再被默认值覆盖），
+     * 所以必须让用户看见这件事——否则「改了设置、重启又回去了」会被当成又一个 bug。
+     * 同时给出唯一出口 [onRebuildFromCorrupt]：用户明确同意放弃旧快照后才会重新开始存盘。
+     */
+    corruptSnapshot: Boolean = false,
+    onRebuildFromCorrupt: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var scanning by remember { mutableStateOf(false) }
@@ -118,11 +132,38 @@ fun SettingsScreen(
         ) {
                 PageHeader(title = "设置")
 
+            // P1-②：快照读取失败时的显式横幅。放在最顶部——它是「本页所有改动都不会保存」
+            // 这种状态的前提，藏在任一分组下面都会让人先改了再发现白改。
+            if (corruptSnapshot) {
+                SectionHeader("设置未保存")
+                SettingsCard {
+                    // 纯说明行：不传 onClick（避免"可点但无反应"的假交互），
+                    // 尾部也不留箭头——它不是一个能进去的设置项
+                    SettingRow(
+                        GlassIcons.Book, "设置快照读取失败",
+                        "旧快照已保留在应用私有目录；当前改动不会写盘",
+                        onClick = null,
+                        trailing = {},
+                    )
+                    // 唯一出口：用户明确同意后才放弃旧快照重新开始存盘
+                    SheetAction(
+                        icon = GlassIcons.Trash,
+                        label = "放弃旧快照并重新开始",
+                        subtitle = "以当前显示的状态覆盖保存（不可撤销）",
+                        onClick = onRebuildFromCorrupt,
+                    )
+                }
+            }
+
             SectionHeader("外观")
             SettingsCard {
+                // 整行可点 + 内层开关双通道（GlassToggle 的 clickable 在内层会消费，不会双触发）
                 SettingRow(
-                    GlassIcons.Wave, "跟随封面取色", "极光背景取自当前专辑封面",
-                    trailing = { GlassToggle(state.followCover, onToggle = { state.followCover = it }) },
+                    GlassIcons.Wave, "跟随封面取色",
+                    // P2-6：副标题必须与三态真相一致——自定义色存在时封面取色被短路，开关说了不算
+                    if (state.customSeedArgb != null) "已被自定义主题色覆盖（点上方主题色可恢复）" else "极光背景取自当前专辑封面",
+                    onClick = { state.applyFollowCover(!state.followCover) },
+                    trailing = { GlassToggle(state.followCover, onToggle = state::applyFollowCover) },
                 )
                 RowDivider()
                 // F2 自定义主题色：三态（自定义 > 跟随封面 > 品牌靛紫），选中即生效
@@ -130,8 +171,9 @@ fun SettingsScreen(
                     GlassIcons.Wave, "主题色",
                     when {
                         state.customSeedArgb != null -> "自定义颜色（点击更换）"
-                        state.followCover -> "跟随封面 · 可改为自定义"
-                        else -> "品牌靛紫 · 可改为自定义"
+                        // P3-9/P2-2：不虚标「可改为自定义」——只有预设色板，如实说
+                        state.followCover -> "跟随封面 · 可选 10 种预设色"
+                        else -> "品牌靛紫 · 可选 10 种预设色"
                     },
                     onClick = {
                         modal.show {
@@ -150,7 +192,9 @@ fun SettingsScreen(
                                 )
                                 ThemeColorSwatches(
                                     seeds = AuroraPalette.PresetSeeds,
-                                    selected = state.customSeedArgb?.let { Color(it) },
+                                    // P2-5：高亮「当前生效色」三态折算（自定义 > 封面取色 > 品牌靛紫）——
+                                    // 旧实现只在用户自定义后才有高亮，跟随封面/品牌态 10 个色点全灰
+                                    selected = state.effectiveSeed,
                                     onSelect = { state.setCustomSeed(it.toArgb()) },
                                 )
                                 Spacer(Modifier.height(12.dp))
@@ -225,6 +269,14 @@ fun SettingsScreen(
                         }
                     },
                 )
+                RowDivider()
+                // P3-59：深浅色常驻入口（此前只有悬浮 Chrome 右上角的太阳图标一处，不可发现）
+                SettingRow(
+                    GlassIcons.Moon, "深色模式",
+                    if (state.themeMode == ThemeMode.Dark) "已开启" else "已关闭",
+                    onClick = { state.toggleTheme() },
+                    trailing = { GlassToggle(state.themeMode == ThemeMode.Dark, onToggle = { state.toggleTheme() }) },
+                )
             }
 
             SectionHeader("播放")
@@ -270,7 +322,8 @@ fun SettingsScreen(
                                         icon = GlassIcons.Moon,
                                         label = sleepTimerLabel(option),
                                         subtitle = sleepTimerSubtitle(option, activeMode, sleepRemainingSec),
-                                        emphasized = option == activeMode,
+                                        // P3-47（与播放页同款）：无定时时「取消定时」不高亮
+                                        emphasized = option != 0 && option == activeMode,
                                         onClick = {
                                             state.setSleepTimer(option)
                                             modal.requestDismiss()
@@ -284,15 +337,30 @@ fun SettingsScreen(
                 RowDivider()
                 SettingRow(
                     GlassIcons.Mic, "歌词", "优先读取本地 .lrc 歌词文件",
+                    onClick = { state.lyricEnabled = !state.lyricEnabled },
                     trailing = { GlassToggle(state.lyricEnabled, onToggle = { state.lyricEnabled = it }) },
                 )
             }
 
             SectionHeader("曲库")
             SettingsCard {
+                // 音频权限行：运行时弹窗被拒后应用内的唯一再引导入口。
+                // 旧实现的拒绝分支只做 abandonPendingPlayback + markLibrarySettled，曲库页呈现
+                // 空列表、设置页又只有「歌词文件访问」（MANAGE_EXTERNAL_STORAGE 那条），
+                // 想再授权只能靠用户自己摸进系统设置 → 应用内全程无引导。仅未授权时出现。
+                if (audioDenied) {
+                    SettingRow(
+                        GlassIcons.Mic, "音乐与音频访问",
+                        "未授权 · 点击授权后才能扫描本地曲库",
+                        onClick = onRequestAudioPermission,
+                    )
+                    RowDivider()
+                }
                 SettingRow(
                     GlassIcons.Folder, "扫描音乐",
-                    if (scanning) "扫描中…" else "已收录 ${state.library.size} 首",
+                    // P2-④：计数走可见曲库（visibleLibrary）而不是原始 library ——
+                    // 开着过滤时「已收录」若报全量（含已过滤的短音频），会与曲库页实际条数不符
+                    if (scanning) "扫描中…" else "已收录 ${state.visibleLibrary().size} 首",
                     onClick = {
                         if (!scanning) {
                             scanning = true
@@ -301,10 +369,13 @@ fun SettingsScreen(
                     },
                 )
                 RowDivider()
-                // B3 开关：默认滤除 <30s 音频；重扫由用户手动触发（subtitle 提示生效时机）
+                // B3 开关：滤除 <30s 音频。P2-④：过滤已下沉到 visibleLibrary() 输出层，
+                // 切换后**立即**影响曲库/文件夹/搜索，不再需要重扫（副标题同步改口径）
                 SettingRow(
                     GlassIcons.Folder, "扫描过滤",
-                    if (state.scanFilterShort) "已过滤短于 30 秒的音频 · 重扫后生效" else "收录全部音频 · 重扫后生效",
+                    if (state.scanFilterShort) "已过滤短于 30 秒的音频 · 立即生效" else "收录全部音频 · 立即生效",
+                    // P3-60：整行可点（此前只有尾部开关可点，命中区太小）
+                    onClick = { state.toggleScanFilter() },
                     trailing = { GlassToggle(state.scanFilterShort, onToggle = { state.toggleScanFilter() }) },
                 )
                 RowDivider()
@@ -314,7 +385,12 @@ fun SettingsScreen(
                     onClick = {
                         modal.show {
                             ModalSheet(modal, "过滤文件夹") {
-                                state.folderOptions().forEach { (folder, count) ->
+                                // P2-28：列表 = 当前曲库目录 ∪ 已排除的失效目录。旧实现只遍历
+                                // folderOptions()（当前曲库存在的目录），目录被移出/改名后其排除项
+                                // 从面板消失，永远无法取消——排除集只增不减
+                                val options = state.folderOptions()
+                                val orphans = state.excludedFolders.filter { f -> options.none { it.first == f } }
+                                options.forEach { (folder, count) ->
                                     val excluded = folder in state.excludedFolders
                                     SheetAction(
                                         icon = GlassIcons.Folder,
@@ -324,6 +400,23 @@ fun SettingsScreen(
                                         onClick = {
                                             if (excluded) state.excludedFolders.remove(folder) else state.excludedFolders.add(folder)
                                         },
+                                    )
+                                }
+                                orphans.forEach { folder ->
+                                    SheetAction(
+                                        icon = GlassIcons.Folder,
+                                        label = folder,
+                                        subtitle = "0 首 · 目录当前不存在",
+                                        emphasized = true,
+                                        onClick = { state.excludedFolders.remove(folder) },
+                                    )
+                                }
+                                if (state.excludedFolders.isNotEmpty()) {
+                                    SheetAction(
+                                        icon = GlassIcons.Folder,
+                                        label = "清空全部排除项",
+                                        subtitle = "共 ${state.excludedFolders.size} 个目录",
+                                        onClick = { state.excludedFolders.clear() },
                                     )
                                 }
                                 SheetAction(icon = GlassIcons.Down, label = "完成", onClick = modal::requestDismiss)
@@ -371,22 +464,35 @@ fun SettingsScreen(
 
             SectionHeader("关于")
             SettingsCard {
+                // P3-59：版本号常驻（旧实现挂在检查更新行的 Idle 分支里，检查中/失败后版本号就消失）
+                SettingRow(GlassIcons.Book, "当前版本", "v$currentVersionName")
+                RowDivider()
                 val updateState = update()
                 val updateSubtitle = when (updateState.status) {
-                    UpdateUiState.Status.Idle ->
-                        if (currentVersionName.isEmpty()) "检查新版本" else "当前 v$currentVersionName · 检查新版本"
+                    UpdateUiState.Status.Idle -> "检查新版本"
                     UpdateUiState.Status.Checking -> "正在检查…"
                     UpdateUiState.Status.UpToDate -> "已是最新版本"
                     UpdateUiState.Status.Available ->
                         "发现新版本 v${updateState.versionName}，点击更新"
                     UpdateUiState.Status.Downloading ->
-                        "下载中 ${(updateState.progress * 100).toInt()}%"
+                        // 总长未知（不定长响应，P3-50）：显示进度而非恒 0%
+                        if (updateState.indeterminate) "下载中…" else "下载中 ${(updateState.progress * 100).toInt()}%"
                     UpdateUiState.Status.ReadyToInstall ->
                         "已下载 v${updateState.versionName}，点击安装"
                     UpdateUiState.Status.Failed ->
-                        // 下载链路的失败由既态 copy 而来（versionName 已带上新版本），与检查失败区分
-                        if (updateState.versionName != null) "下载失败（${updateState.message ?: "网络异常"}），点击重试"
-                        else "检查失败（${updateState.message ?: "网络异常"}），点击重试"
+                        // P2-25：按失败阶段给准确文案——过去一律「下载失败」，检查失败也不例外；
+                        // 验签失败再给重试是死循环（同一份坏字节必然再失败），文案改引导发布页
+                        when (updateState.failStage) {
+                            UpdateUiState.FailStage.Verify ->
+                                "安装包签名与本机不一致，无法应用内更新，请到发布页手动下载安装（需先卸载旧版）"
+                            UpdateUiState.FailStage.Install -> "安装包已丢失，请重新下载"
+                            UpdateUiState.FailStage.Download ->
+                                "下载失败（${updateState.message ?: "网络异常"}），点击重试"
+                            // 未细分阶段沿用旧分流：进过下载链路（versionName 已带上新版本）→ 下载失败，否则检查失败
+                            else ->
+                                if (updateState.versionName != null) "下载失败（${updateState.message ?: "网络异常"}），点击重试"
+                                else "检查失败（${updateState.message ?: "网络异常"}），点击重试"
+                        }
                 }
                 SettingRow(
                     GlassIcons.Down, "检查更新", updateSubtitle,
@@ -418,7 +524,11 @@ fun SettingsScreen(
                                     if (current.status == UpdateUiState.Status.Downloading) {
                                         ProgressTrack(progress = current.progress, onSeek = {})
                                         Text(
-                                            "下载中 ${(current.progress * 100).toInt()}%，完成后自动打开安装程序",
+                                            if (current.indeterminate) {
+                                                "下载中，总大小未知，完成后自动打开安装程序"
+                                            } else {
+                                                "下载中 ${(current.progress * 100).toInt()}%，完成后自动打开安装程序"
+                                            },
                                             color = LocalGlassColors.current.textTertiary, fontSize = 11.5.sp,
                                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
                                         )
@@ -444,16 +554,21 @@ fun SettingsScreen(
                                     }
                                 }
                             }
-                            // 曾进入下载阶段的失败（versionName 已带上新版本）：重试直接重新下载，不再重新检查
+                            // P2-25：Failed 的重试行为按阶段定——验签失败**不给重试**（重下同一份
+                            // 坏字节必然再失败），交给上面的引导文案；其余沿用旧分流
+                            // （进过下载阶段的失败 versionName 已带上新版本：直接重新下载，不再重新检查）
                             UpdateUiState.Status.Failed ->
-                                if (update().versionName != null) onStartUpdate() else onCheckUpdate()
+                                if (update().failStage != UpdateUiState.FailStage.Verify) {
+                                    if (update().versionName != null) onStartUpdate() else onCheckUpdate()
+                                }
                             else -> onCheckUpdate()
                         }
                     },
                 )
             }
-            // 底部避让：悬浮 Chrome（迷你条+导航 ≈ 138dp）+ 手势条
-            Spacer(Modifier.navigationBarsPadding().height(146.dp))
+            // 底部避让：悬浮 Chrome 高度由 core/ui 的 ChromeBottomInset 单点定义，
+            // 三个主屏共用（原来各自硬编码 146.dp，Chrome 高度一改就得同步改三处）
+            Spacer(Modifier.navigationBarsPadding().height(ChromeBottomInset))
             }
     }
 }

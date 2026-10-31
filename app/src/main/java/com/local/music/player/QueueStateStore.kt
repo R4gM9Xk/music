@@ -1,6 +1,7 @@
 package com.local.music.player
 
 import android.content.Context
+import android.util.Log
 import com.local.music.core.ui.state.AppStateSnapshot
 import com.local.music.core.ui.state.SongSpec
 import org.json.JSONArray
@@ -24,6 +25,7 @@ object QueueStateStore {
 
     private const val FILE = "queue_state.json"
     private const val VERSION = 1
+    private const val TAG = "QueueStateStore"
 
     /** 服务端恢复所需的现场 */
     data class QueueState(
@@ -69,6 +71,10 @@ object QueueStateStore {
                 dst.writeText(json.toString())
                 tmp.delete()
             }
+        }.onFailure {
+            // 写失败要留痕：这条链的唯一消费者是「进程被杀后的系统续播」，
+            // 静默失败的表现是「用户重连蓝牙/点通知栏恢复时队列莫名清空」，无从排查
+            Log.e(TAG, "queue state write failed", it)
         }
     }
 
@@ -77,7 +83,11 @@ object QueueStateStore {
         val file = java.io.File(context.filesDir, FILE)
         if (!file.isFile) return@runCatching null
         val root = JSONObject(file.readText())
-        if (root.optInt("v") != VERSION) return@runCatching null
+        if (root.optInt("v") != VERSION) {
+            // 版本不符是「升级后的正常降级」，但要能看到——否则老现场永不恢复会被当成 bug
+            Log.w(TAG, "queue state version mismatch (v=${root.optInt("v")}, expect $VERSION); ignored")
+            return@runCatching null
+        }
         val arr = root.optJSONArray("songs") ?: return@runCatching null
         if (arr.length() == 0) return@runCatching null
         val specs = (0 until arr.length()).mapNotNull { i ->
@@ -102,10 +112,15 @@ object QueueStateStore {
             index = root.optInt("index", 0).coerceIn(0, specs.lastIndex),
             positionSec = root.optDouble("positionSec", 0.0).toFloat().coerceAtLeast(0f),
         )
+    }.onFailure {
+        // 损坏现场（半截 JSON / 编码异常）降级为 null 是既定策略，但要能在日志里区分
+        // 「本来就没有现场」（上面各类 return null，不报错）与「有文件但读坏了」
+        Log.e(TAG, "queue state read failed; falling back to empty", it)
     }.getOrNull()
 
     /** 清空现场（用户清空队列 / 退出登录等场景） */
     fun clear(context: Context) {
         runCatching { java.io.File(context.filesDir, FILE).delete() }
+            .onFailure { Log.e(TAG, "queue state clear failed", it) }
     }
 }

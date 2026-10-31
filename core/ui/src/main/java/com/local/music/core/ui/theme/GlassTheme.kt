@@ -241,7 +241,11 @@ fun GlassTheme(
         animationSpec = tween(GlassMotion.Palette, easing = GlassMotion.Curve),
         label = "themeFraction",
     )
-    // 深浅两套取色各自动画后按主题进度混合（浅色 = deep 系拉高明度的派生）
+    // 深浅两套取色各自动画后按主题进度混合（浅色 = deep 系拉高明度的派生）。
+    // 这里就应是「两层」：dark/light 各自 400ms 交叉渐变，再按 themeFraction 线性混合。
+    // 旧实现在 provides 处又套了一层 animatePalette(effectivePalette)：那是第三层级联，
+    // 让取色切换变成约 2×400ms 的拖尾，且与注释描述的两层设计不符（笔误）。
+    // 去掉后：切换总时长回到一个 tweenPalette（400ms），与 GlassColors 交叉渐变同步收束。
     val darkPalette = animatePalette(palette)
     val lightPalette = animatePalette(palette.light())
     val effectivePalette = lerpPalette(darkPalette, lightPalette, themeFraction)
@@ -250,7 +254,8 @@ fun GlassTheme(
     val glass = lerpGlassColors(darkGlass, lightGlass, themeFraction)
 
     CompositionLocalProvider(
-        LocalAuroraPalette provides animatePalette(effectivePalette),
+        // 直接提供混合结果：第三层动画是多余滞后（见上），不是设计意图
+        LocalAuroraPalette provides effectivePalette,
         LocalGlassColors provides glass,
         LocalIsDark provides (themeFraction < 0.5f),
     ) {

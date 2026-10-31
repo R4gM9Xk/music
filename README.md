@@ -1,51 +1,31 @@
-# project/ —— Gradle 工程骨架
+# project/ —— ColorOS 音乐（液态玻璃流 UI 复刻）
 
-**这是推断产物，不是原始构建脚本。**
+真实可构建的 Android 工程：`app` 壳 + `core:ui` 基础层 + 5 个 feature 模块。
 
-原 APK 只包含编译后的字节码，构建脚本（`build.gradle.kts`、`settings.gradle.kts`、
-`libs.versions.toml`）本身不会被打进 APK，因此**无法从反编译产物中直接恢复**。
+> 早期版本这里曾是一份「反编译骨架推断产物」说明（17 个推断模块、依赖关系靠 import 猜），
+> 其中 9 个 core 子模块只有一份自述「参考骨架」的 `build.gradle.kts`、没有任何源码，
+> 既不参与构建也不被任何模块引用，已整体删除。想要那份历史推断记录请翻 git 历史。
 
-本目录的内容是依据以下证据**反向推断**出来的：
-
-| 推断项 | 证据来源 | 可信度 |
-| --- | --- | --- |
-| `applicationId` / `minSdk` / `targetSdk` | APK 内 `AndroidManifest.xml` | **高**（打包事实） |
-| 依赖坐标与版本 | APK 内 `META-INF/*.version` + 源码常量 | **高 / 中**（见 `../docs/03-依赖清单.md`） |
-| 模块划分（17 个） | 反编译源码的包结构 | **中高**（分层清晰，但模块边界可能有出入） |
-| 模块间依赖 | 源码 `import` 关系自动分析 | **中**（存在少量噪声，见下） |
-| 各模块依赖的库 | 按模块职责推测 | **低**（仅为合理猜测，需按实际代码校正） |
-
-## 已知的推断噪声
-
-- **`:core:model` ↔ `:core:ui` 循环**：`core.model.BackupPayload` 与 `core.database` 都引用了
-  `com.local.music.core.ui.navigation.Routes`。反编译把多模块压平成一个包树后，这类"常量类被
-  下层引用"的情况会造成看似循环的依赖。原始工程中 `Routes` 很可能位于更底层的模块。
-- **`:core:database` 引用 `:core:ui`**：同上，仅因 `Routes` 一个类。
-- 各模块的**库依赖**是按职责猜的，不准确。要看真实用法请直接读 `../app/` 下的源码。
-
-## 目录
+## 模块
 
 ```
 project/
-├── settings.gradle.kts        17 个模块的 include 声明
+├── settings.gradle.kts        实际纳入构建的 7 个模块
 ├── build.gradle.kts           根脚本（插件声明）
-├── gradle.properties
-├── gradle/
-│   └── libs.versions.toml     117 条依赖坐标（含传递依赖）
-├── app/build.gradle.kts
+├── libs.versions.toml         依赖坐标与版本（gradle/libs.versions.toml）
+├── app/                       应用壳：MainActivity / GlassApp 导航宿主 / 播放服务 / 扫描 / 更新
 ├── core/
-│   ├── common/  model/  ui/  domain/  data/
-│   ├── database/  datastore/  datalocal/
-│   └── player/  coloros/
+│   └── ui/                    玻璃组件、极光背景、主题 token、图标、AppState
 └── feature/
-    ├── library/  player/  playlist/
-    └── search/  settings/  widget/
+    ├── library/               曲库（歌曲/专辑/艺术家/文件夹/流派/歌单 六 tab）
+    ├── player/                播放页（歌词主角）
+    ├── playlist/              歌单库 + 歌单详情
+    ├── search/                搜索
+    └── settings/              设置
 ```
 
 ## 怎么用
 
-把它当**阅读辅助**，不要当**构建输入**：
-
-- 想知道"这个应用分几层、谁依赖谁" → 看 `settings.gradle.kts` 和各模块 `build.gradle.kts` 顶部的注释。
-- 想知道"用了哪些库、什么版本" → 看 `../docs/03-依赖清单.md`（比 toml 更权威）。
-- 想真正编译 → 需要按 `../app/` 的源码逐个补齐模块依赖，工作量不小。
+- 想知道「应用分几层、谁依赖谁」→ 看 `settings.gradle.kts` 与各模块 `build.gradle.kts`。
+- 想知道「用了哪些库、什么版本」→ 看 `gradle/libs.versions.toml`。
+- 想真正编译 → 见 `release.sh`（本机固定使用 workbuddy-ai 下的 JDK 17 与 Gradle 8.13）。

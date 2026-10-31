@@ -40,12 +40,26 @@ data class DetailData(
     val art: ArtStyle,
     val tracks: List<DemoSong>,
     val cover: androidx.compose.ui.graphics.ImageBitmap? = null, // 真曲库首曲内嵌封面
+    /** 首曲封面地址：扫描不再预解码全库封面，详情页大图改为按需解码（ArtworkBitmapCache） */
+    val coverUri: String? = null,
 )
 
 object DemoCatalog {
     val FavoritesId = "__favorites"
     val RecentId = "__recent"
     val MostPlayedId = "__most_played"
+
+    /**
+     * 全部动态歌单 id（由 favorites / playedIds / playCounts **实时解析**生成，
+     * 不接受加歌、删除、重排）。
+     *
+     * 必须集中登记的原因：动态歌单的「不可写」判定散落在多个 UI 入口
+     * （加歌按钮、删除菜单项…），过去各处硬编码 `id == FavoritesId || id == RecentId`，
+     * 新增 MostPlayedId 时漏改其中两处，导致「最常播放」出现加歌无效（写入的叠加层
+     * 无人读取）与删除空跑（两个 deletePlaylist 分支都不进）两个缺陷。
+     * **新增动态歌单时把 id 加进这里即可，不要再逐处写 if。**
+     */
+    val dynamicIds: Set<String> = setOf(FavoritesId, RecentId, MostPlayedId)
 
     /** 初始进度 98s（01:38）时高亮第 4 行，对齐设计稿 */
     val lyrics = listOf(

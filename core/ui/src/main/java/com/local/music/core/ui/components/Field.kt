@@ -36,6 +36,12 @@ import com.local.music.core.ui.theme.auroraAccentColor
 /**
  * 玻璃输入框：GlassSurface 外壳 + BasicTextField（白字 / 强调色光标）。
  * 搜索页真输入、新建歌单命名共用；onSearch = 键盘搜索键回调。
+ *
+ * - imeAction（P3-76）：键盘动作键语义按调用方定（搜索=Search、命名=Done），
+ *   默认 Search 保持搜索页既有行为；动作键回调仍统一走 [onSearch]（命名场景它是"确认"）。
+ * - hint 走 decorationBox（P3-77）：旧实现 hint Text 与输入框并排叠在同一个 Box 里，
+ *   空值+聚焦时光标（width≈2dp）压在 hint 首字上；decorationBox 内 hint 与正文互斥排版，
+ *   光标画在 innerTextField 自己的层，不再穿透占位文本。
  */
 @Composable
 fun GlassTextField(
@@ -46,6 +52,7 @@ fun GlassTextField(
     leading: ImageVector? = GlassIcons.Search,
     autoFocus: Boolean = false,
     onSearch: (() -> Unit)? = null,
+    imeAction: ImeAction = ImeAction.Search,
 ) {
     val focusRequester = remember { FocusRequester() }
     GlassSurface(
@@ -66,10 +73,7 @@ fun GlassTextField(
                     tint = if (value.isEmpty()) LocalGlassColors.current.textSecondary else LocalGlassColors.current.textPrimary,
                 )
             }
-            Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
-                if (value.isEmpty() && hint.isNotEmpty()) {
-                    Text(hint, color = LocalGlassColors.current.textSecondary, fontSize = 14.sp, maxLines = 1)
-                }
+            Box(Modifier.weight(1f)) {
                 BasicTextField(
                     value = value,
                     onValueChange = onValueChange,
@@ -77,11 +81,26 @@ fun GlassTextField(
                     textStyle = TextStyle(color = LocalGlassColors.current.textPrimary, fontSize = 14.sp),
                     // 光标强调色用 auroraAccentColor()（浅色回退 seed）：seed3 过浅在浅色下近不可见
                     cursorBrush = SolidColor(auroraAccentColor()),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardOptions = KeyboardOptions(imeAction = imeAction), // P3-76：不再硬编码 Search
                     keyboardActions = KeyboardActions(onSearch = { onSearch?.invoke() }),
                     modifier = Modifier
                         .fillMaxWidth()
                         .focusRequester(focusRequester),
+                    // P3-77：hint 进 decorationBox 与正文互斥排版——空值+聚焦时光标不再压在
+                    // hint 首字上（旧实现两者叠在同一个 Box，光标恒画在文本层之上）
+                    decorationBox = { innerTextField ->
+                        Box(contentAlignment = Alignment.CenterStart) {
+                            if (value.isEmpty() && hint.isNotEmpty()) {
+                                Text(
+                                    hint,
+                                    color = LocalGlassColors.current.textSecondary,
+                                    fontSize = 14.sp,
+                                    maxLines = 1,
+                                )
+                            }
+                            innerTextField()
+                        }
+                    },
                 )
             }
         }

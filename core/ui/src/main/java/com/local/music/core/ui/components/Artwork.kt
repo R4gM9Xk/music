@@ -23,8 +23,10 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.local.music.core.ui.theme.AuroraPalette
@@ -101,7 +103,14 @@ enum class ArtStyle(
     ),
 }
 
-/** 封面：bitmap 非空画真封面（内嵌图），否则画渐变占位 + 装饰层；bordered = 1px 白 12% 描边 */
+/**
+ * 封面：优先画真封面，否则画渐变占位 + 装饰层；bordered = 1px 白 12% 描边。
+ *
+ * 位图来源两种（按优先级）：
+ * - [bitmap]：调用方手里已解好的位图（飞行覆盖层等需要「起飞瞬间几何冻结」的场景）
+ * - [artworkUri]：磁盘/内容 uri，**按需解码**并受 [ArtworkBitmapCache] 总字节上限约束——
+ *   曲库扫描不再预解码全库封面（几千首即数百 MB），只在真正要画的这一帧解一张 256px 缩略图
+ */
 @Composable
 fun ArtThumb(
     style: ArtStyle,
@@ -109,11 +118,15 @@ fun ArtThumb(
     shape: Shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
     bordered: Boolean = false,
     bitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    artworkUri: String? = null,
 ) {
+    // 只读缓存不复用 bitmap 参数语义：bitmap 优先（调用方已持有），其次按 uri 按需解码。
+    // getOrDecode 命中 LRU 时为纯查表，未命中才解码一次 256px 缩略图。
+    val resolved = bitmap ?: ArtworkBitmapCache.getOrDecode(artworkUri)
     Box(modifier.clip(shape)) {
-        if (bitmap != null) {
+        if (resolved != null) {
             androidx.compose.foundation.Image(
-                bitmap = bitmap,
+                bitmap = resolved,
                 contentDescription = null,
                 contentScale = androidx.compose.ui.layout.ContentScale.Crop,
                 modifier = Modifier.matchParentSize(),
@@ -152,35 +165,59 @@ fun WaveIndicator(
     color: Color = com.local.music.core.ui.theme.LocalGlassColors.current.textPrimary,
     playing: Boolean = true,
 ) {
-    val delays = listOf(0, 180, 360, 100, 280)
     Row(
-        modifier.height(14.dp),
+        modifier.height(WaveBoxHeight),
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.Bottom,
     ) {
         repeat(barCount) { i ->
+            // 动画值只在 graphicsLayer 的绘制期 lambda 里读，不在组合期读——
+            // 组合期读 State（原 `Modifier.height(h.dp)`）会让整个 Row 子树每帧重组并重新
+            // 测量/布局（无限动画 = 60fps 重组）。这里固定条高为最大值、改用 scaleY：
+            // graphicsLayer lambda 只随重绘执行，零重组零重测量。
+            // 视觉等价性：竖条是纯色不透明 2dp 圆角矩形，纵向缩放不改颜色与横向轮廓；
+            // transformOrigin(0.5f, 1f) 把原点钉在底边，缩放时顶边上下起伏，正是原来
+            // 「底对齐 + height 变化」的观感。唯一差异是 1dp 圆角随缩放纵向变扁，
+            // 在 4~13dp 高度区间不可辨，可接受。
             val h by if (playing) {
                 val t = rememberInfiniteTransition(label = "wave$i")
                 t.animateFloat(
-                    initialValue = 4f, targetValue = 13f,
+                    initialValue = WaveBarMinPx, targetValue = WaveBarMaxPx,
                     animationSpec = infiniteRepeatable(
-                        tween(550, delayMillis = delays[i % delays.size]), RepeatMode.Reverse,
+                        tween(550, delayMillis = WaveDelays[i % WaveDelays.size]), RepeatMode.Reverse,
                     ),
                     label = "h$i",
                 )
             } else {
-                androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(4f) }
+                androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(WaveBarMinPx) }
             }
             Box(
                 Modifier
                     .width(2.dp)
-                    .height(h.dp)
+                    .height(WaveBarMaxDp)
+                    .graphicsLayer {
+                        scaleY = h / WaveBarMaxPx
+                        transformOrigin = TransformOrigin(0.5f, 1f)
+                    }
                     .clip(androidx.compose.foundation.shape.RoundedCornerShape(1.dp))
                     .drawBehind { drawRect(color) },
             )
         }
     }
 }
+
+/** 波形条高度动画的相位偏移（ms）：等价 CSS 各条 animation-delay。
+ *  顶层 IntArray 而非组合内 listOf：原实现在组合体里每帧重建一个 List（无限动画下
+ *  每帧一次分配），提为常量后彻底消除。 */
+private val WaveDelays = intArrayOf(0, 180, 360, 100, 280)
+
+/** 波形容器高度（Row 高度）与竖条满高：原 14dp / 13dp */
+private val WaveBoxHeight = 14.dp
+private val WaveBarMaxDp = 13.dp
+
+/** 竖条动画值的像素上下界（4dp~13dp 的表达）：scaleY = 动画值 / 满高 */
+private const val WaveBarMinPx = 4f
+private const val WaveBarMaxPx = 13f
 
 // ── 演示数据（与设计稿同文案）──────────────────────────────
 
@@ -215,7 +252,13 @@ data class DemoSong(
     val dateAddedSec: Long = 0,
 ) {
     val subtitle get() = "$artist · $album"
-    val duration: String get() = "%d:%02d".format(durationSec / 60, durationSec % 60)
+    /** 时长显示串：统一走 [asTime]（P3-26）——旧实现 `"%d:%02d"` 分钟不补零，
+     *  同一行内与 asTime() 的 `"%02d:%02d"`（补零两位分钟）口径不同，
+     *  9 分以内的歌会出现 "3:25" vs "03:25" 两种宽度（列表右对齐时尤显跳眼）。
+     *  Locale.US 固定数字字形：`"%d".format()` 走默认 locale，
+     *  在 ar-EG / fa-IR 等区域会输出本地化数字（如 ٣:٢٥），与 AppState 的格式串口径不一致 */
+    val duration: String
+        get() = durationSec.asTime()
 }
 
 object DemoData {
@@ -234,4 +277,7 @@ object DemoData {
     val songs: List<DemoSong> get() = emptyList()
 }
 
-fun Int.asTime(): String = "%02d:%02d".format(this / 60, this % 60)
+/** 秒数 → mm:ss 显示串（进度文本/倒计时共用）。
+ *  同 [DemoSong.duration]，固定 Locale.US：默认 locale 会输出本地化数字字形，
+ *  而这里是纯数值展示（不是给用户看的本地化量词），必须跨区域稳定。 */
+fun Int.asTime(): String = String.format(java.util.Locale.US, "%02d:%02d", this / 60, this % 60)

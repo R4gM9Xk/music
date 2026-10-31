@@ -17,7 +17,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -43,19 +43,30 @@ internal fun GlassColors.fill(level: GlassLevel): Color = when (level) {
     GlassLevel.Lo -> lo
 }
 
-/** 顶部高光线：left/right 8%，1px，transparent → 白55% → transparent */
-private fun Modifier.glassTopLine(color: Color): Modifier = drawBehind {
-    val y = 0.5f
-    drawLine(
-        brush = Brush.horizontalGradient(
-            listOf(Color.Transparent, color, Color.Transparent),
-            startX = size.width * 0.08f,
-            endX = size.width * 0.92f,
-        ),
-        start = Offset(size.width * 0.08f, y),
-        end = Offset(size.width * 0.92f, y),
-        strokeWidth = 1.dp.toPx(),
+/**
+ * 顶部高光线：left/right 8%，1px，transparent → 白55% → transparent。
+ *
+ * 用 drawWithCache 而不是 drawBehind：玻璃卡在滚动/动画里会频繁重绘，而这条线的 Brush
+ * 只依赖 (color, width) —— 宽度在 cache 块里已知，颜色变了 cache 自然失效重算，
+ * 帧间复用同一个 Brush，不再每帧 new 一个 horizontalGradient。
+ */
+private fun Modifier.glassTopLine(color: Color): Modifier = drawWithCache {
+    val startX = size.width * 0.08f
+    val endX = size.width * 0.92f
+    val brush = Brush.horizontalGradient(
+        listOf(Color.Transparent, color, Color.Transparent),
+        startX = startX,
+        endX = endX,
     )
+    val strokeWidth = 1.dp.toPx()
+    onDrawBehind {
+        drawLine(
+            brush = brush,
+            start = Offset(startX, 0.5f),
+            end = Offset(endX, 0.5f),
+            strokeWidth = strokeWidth,
+        )
+    }
 }
 
 /** 按压回弹：180ms scale(.92)，统一弹簧曲线（CSS :active 的 Compose 等价） */
@@ -77,6 +88,10 @@ fun Modifier.pressScale(
  * 玻璃面板：填充 + 高光描边 + 顶部亮线 + 柔和投影。
  * （backdrop-filter 的跨版本近似：半透明填充 + saturate 视觉补偿由极光底色保证；
  *   滚动列表内禁用实时模糊是规范面板的性能预算要求）
+ *
+ * 契约（P3-75）：onLongClick 必须与 onClick **同时**提供——只传 onLongClick 时点击事件
+ * 会被 combinedClickable 消费（onClick 兜底为空 lambda），卡片看起来"点不动"却吞掉了点击，
+ * 上层列表的点击滚动/透传全被截断。
  */
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
@@ -96,9 +111,19 @@ fun GlassSurface(
         .clip(shape)
     // 模糊必须落在 clip(shape) 之后：hazeEffect 的背景涂抹以其矩形节点 bounds 为界，
     // 不裁形的话毛玻璃会溢出胶囊/卡片的圆角（白色矩形框）
-    if (blur != null) m = m.glassHaze(blur)
+    //
+    // P3-78 双重填充修复：haze tint（HazeGlass.glassHaze）已上过一层 glass.fill(level) 色，
+    // 旧实现 blur 面板在 tint 之上又无条件 .background(glass.fill(level))，同一层色叠两次
+    // → 带 blur 的玻璃比不带 blur 的亮近一倍。现在有 blur 时填充交给 haze tint 承担；
+    // 但 LocalHazeState 为 null 时 glassHaze 是 no-op（HazeGlass.kt 退化路径），
+    // 此时必须回退到普通 background，否则整块面板变透明（底色直接透出）。
+    var hazed = false
+    if (blur != null && LocalHazeState.current != null) {
+        m = m.glassHaze(blur)
+        hazed = true
+    }
+    if (!hazed) m = m.background(glass.fill(level))
     m = m
-        .background(glass.fill(level))
         .border(1.dp, glass.strokeSoft, shape)
         .glassTopLine(glass.topLine)
     if (onClick != null || onLongClick != null) {

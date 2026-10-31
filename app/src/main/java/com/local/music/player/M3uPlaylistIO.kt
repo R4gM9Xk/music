@@ -13,7 +13,8 @@ import java.io.File
  * 纯本地播放器用绝对路径最实用——同设备换播放器可直接用；跨设备由对方播放器自行匹配。
  *
  * 导入：按路径经「f<绝对路径>」id 体系匹配（id 前缀 f 后即文件绝对路径），
- * 未命中项汇总返回给 UI 提示（不静默丢弃）。
+ * 路径两侧先归一化（file:// 前缀 / 反斜杠 / /sdcard 与 legacy 别名 → /storage/emulated/0），
+ * 编码先 UTF-8、检出乱码按 GBK 重解；未命中项与相对路径分别汇总返回给 UI 提示（不静默丢弃）。
  */
 object M3uPlaylistIO {
 
@@ -42,31 +43,48 @@ object M3uPlaylistIO {
         return ExportResult(songs.size, songs.size)
     }
 
-    /** 导入结果：命中的曲目 id（按文件内顺序去重）+ 未命中行（供 UI 汇总提示） */
+    /** 导入结果：命中的曲目 id（按文件内顺序去重）+ 未命中行 + 相对路径行（供 UI 汇总提示）。
+     *  [ignored] 与 [unmatched] 的区别：unmatched 是「库里找不到的绝对路径」（歌曲可能
+     *  尚未入库/已被移动），ignored 是「本来就是相对路径」（无法与本机曲库对位，语义上
+     *  不是未命中，统计未命中率时不应计入）。带默认值：既有构造点不改也编译。 */
     data class ImportResult(
         val matchedIds: List<String>,
         val unmatched: List<String>,
         val title: String?,
+        val ignored: List<String> = emptyList(),
     )
 
     /**
-     * 解析 M3U/M3U8：[library] 是当前曲库（用绝对路径建索引）。
-     * 支持 #EXTM3U/#PLAYLIST 头、#EXTINF 行、注释行（# 开头）、空行、相对路径（忽略）。
+     * 解析 M3U/M3U8：[library] 是当前曲库（索引与查找两侧都过 [normalizePath] 归一）。
+     * 支持 #EXTM3U/#PLAYLIST 头、#EXTINF 行、注释行（# 开头）、空行；
+     * 相对路径（既不以 / 开头、也不含盘符冒号）归入 ignored（P3-71：与注释语义一致，
+     * 不计入 unmatched——它不是「没匹配上」，是「根本无法对位」）。
      */
     fun import(context: Context, uri: Uri, library: List<DemoSong>): ImportResult {
-        val text = context.contentResolver.openInputStream(uri)?.use {
-            it.readBytes().toString(Charsets.UTF_8)
+        val text = context.contentResolver.openInputStream(uri)?.use { stream ->
+            // P3-70：先按 UTF-8 解，若出现 U+FFFD（非法序列的替换符）说明多半是 GBK 编码的
+            // 旧歌单（国内播放器导出常见），按 GBK 重解兜底；仍失败则退回 UTF-8 结果。
+            // 不能直接 toString(UTF_8) 完事：GBK 中文经该解码全是乱码，路径对不上曲库
+            val bytes = stream.readBytes()
+            val utf8 = bytes.toString(Charsets.UTF_8)
+            if (utf8.contains('\uFFFD')) {
+                runCatching { bytes.toString(charset("GBK")) }.getOrDefault(utf8)
+            } else {
+                utf8
+            }
         } ?: error("无法读取所选文件")
         return parse(text, library)
     }
 
     /** 纯解析（可单测）：从文本还原曲目 id 列表 */
     fun parse(text: String, library: List<DemoSong>): ImportResult {
-        // 路径 → 曲目（id = "f" + 绝对路径）
-        val byPath = library.associateBy { pathOf(it) }
+        // 路径 → 曲目（id = "f" + 绝对路径）；索引侧同样归一（P2-21），
+        // 否则库里存 /storage/emulated/0/... 而歌单写 /sdcard/... 时逐字匹配必失配
+        val byPath = library.associateBy { normalizePath(pathOf(it)) }
         var title: String? = null
         val matched = LinkedHashSet<String>()
-        val unmatched = mutableListOf<String>()
+        val unmatched = LinkedHashSet<String>() // P3-34：同一缺失路径在歌单里重复出现时，提示不该重复计数
+        val ignored = LinkedHashSet<String>()
         text.lineSequence().forEach { raw ->
             val line = raw.trim().removePrefix("\uFEFF")
             when {
@@ -76,13 +94,39 @@ object M3uPlaylistIO {
                 line.startsWith("#EXTINF", ignoreCase = true) -> Unit // 时长/标题仅展示用，匹配靠下一行路径；若日后取显示文本，须按「首个逗号」分隔（其后全部归显示文本），含逗号标题才不会截断
                 line.startsWith("#") -> Unit // 其他注释
                 else -> {
-                    val song = byPath[line]
-                    if (song != null) matched += song.id else unmatched += line
+                    // P2-21：归一后匹配——/sdcard、/storage/emulated/legacy、反斜杠分隔符、
+                    // file:// 前缀都是同一文件的不同写法，逐字匹配会全部失配
+                    val normalized = normalizePath(line)
+                    val song = byPath[normalized]
+                    if (song != null) {
+                        matched += song.id
+                    } else if (isRelativePath(normalized)) {
+                        ignored += line // 相对路径：无法对位本机曲库，与「绝对路径但未命中」分开统计
+                    } else {
+                        unmatched += line
+                    }
                 }
             }
         }
-        return ImportResult(matched.toList(), unmatched, title)
+        return ImportResult(matched.toList(), unmatched.toList(), title, ignored.toList())
     }
+
+    /**
+     * P2-21 路径归一：M3U 是纯文本歌单，同一文件的路径写法五花八门——
+     *   /sdcard/...（/sdcard 是 /storage/emulated/0 的符号链接别名）
+     *   /storage/emulated/legacy/...（旧版多用户主存储别名）
+     *   Windows 编辑器写出的反斜杠分隔符、file:// URI 前缀
+     * 逐字匹配对以上全部失配，导入「基本不可用」的根因即此。索引与查找**两侧**都过此函数。
+     */
+    private fun normalizePath(raw: String): String = raw.trim()
+        .removePrefix("file://")
+        .replace('\\', '/') // 反斜杠 → 斜杠
+        .replace(Regex("^/sdcard/"), "/storage/emulated/0/") // 符号链接写法
+        .replace(Regex("^/storage/emulated/legacy/"), "/storage/emulated/0/")
+
+    /** 相对路径判定：不以 / 开头（非 POSIX 绝对）且不含 `:`（无 Windows 盘符）→ 无法与本机曲库对位 */
+    private fun isRelativePath(normalized: String): Boolean =
+        !normalized.startsWith("/") && !normalized.contains(':')
 
     /** 曲目的文件路径：id = "f" + 绝对路径；无 mediaUri 的条目用 id 兜底 */
     private fun pathOf(song: DemoSong): String =
@@ -91,11 +135,43 @@ object M3uPlaylistIO {
     /** 单行化：\n/\r 压成空格并 trim——M3U 行结构不容忍换行（#EXTINF 显示文本与路径行写出前统一走这里） */
     private fun oneLine(s: String): String = s.replace(Regex("[\\r\\n]+"), " ").trim()
 
-    /** 从 content uri 猜文件名（导入时给新歌单取名用） */
+    /**
+     * 导出时建议的文件名（SAF `ACTION_CREATE_DOCUMENT` 的默认名）。
+     *
+     * 歌单名完全由用户输入（新建与重命名都不限制字符），而 `/ \ : * ? " < > |` 是非法或需转义的
+     * 文件名字符：原实现直接 `"$title.m3u8"` 交给 SAF，部分 ROM 的文件选择器会拒绝，或把名字截断到
+     * 第一个 `/` 之后（用户看到半截名）。这里统一替换成下划线，空名回退固定名。
+     * P3-73 再加两道：长度截到 80 字符（文件名过长部分 ROM/云盘同步静默失败或截断），
+     * 且避开 Windows 保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9——Windows 共享此文件时无法创建），
+     * 追加下划线使其合法。
+     */
+    fun suggestedFileName(title: String): String {
+        val safe = title
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_") // 文件名非法字符
+            .replace(Regex("[\\u0000-\\u001F]"), "_") // 控制字符（含换行）
+            .trim()
+            .trim('.') // 以点结尾时部分 ROM/传输工具会丢扩展名
+            .take(80)
+            .trim()
+            .trim('.') // take 截断可能又以点/空格结尾，再清一次
+        val base = safe.ifEmpty { "歌单" }
+        // Windows 保留设备名（大小写不敏感，含「保留名.任意后缀」形态，如 CON.m3u8）：
+        // 主名追加下划线规避（CON → CON_），这是资源管理器/部分 SAF 实现认可的合法名
+        val reserved = Regex("^(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$")
+        val stem = base.substringBeforeLast('.')
+        val fixed = if (reserved.matches(stem)) "${stem}_" else stem
+        val ext = if ('.' in base) "." + base.substringAfterLast('.') else ""
+        return "$fixed$ext.m3u8"
+    }
+
+    /** 从 content uri 猜文件名（导入时给新歌单取名用）；P3-72：剥掉 .m3u/.m3u8 扩展名——
+     *  歌单标题不该带文件后缀（兜底名 fallbackNameOf 本来就剥了，两者应一致） */
     fun displayNameOf(context: Context, uri: Uri): String? = runCatching {
         context.contentResolver.query(uri, null, null, null, null)?.use { c ->
             val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-            if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+            val name = if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+            // 纯 ".m3u" 这类剥完为空的极端名保留原样，避免返回空串标题
+            name?.let { n -> n.substringBeforeLast('.').takeIf { it.isNotEmpty() } ?: n }
         }
     }.getOrNull()
 

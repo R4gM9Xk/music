@@ -33,9 +33,21 @@ NOTES_JSON="$(json_str "$NOTES")"
 echo "── [1/6] 版本号 → $VER (versionCode 自增)"
 GRADLE_FILE="app/build.gradle.kts"
 NEW_CODE=$(( $(grep -oE 'versionCode = [0-9]+' "$GRADLE_FILE" | grep -oE '[0-9]+') + 1 ))
-# 版本号已改动后任一步失败（含构建/哈希/写清单/推送）→ 还原 build.gradle.kts，避免脏工作区+跳号；
-# 提交推送成功后触发时工作区与索引一致，为无害 no-op
-trap 'git checkout -- "$GRADLE_FILE"' EXIT
+# 失败回滚：旧实现用 `git checkout -- app/build.gradle.kts`，那是**文件级全量回滚**，
+# 会连开发者在 build.gradle.kts 里手工改过的内容（临时 versionName / 加依赖 / 调 signingConfig）
+# 一起静默丢弃。改为「先整份备份到临时文件，失败时原样拷回」：
+# 既不碰手工改动，也不依赖 sed 反向替换的正确性。
+GRADLE_BACKUP="$(mktemp "${TMPDIR:-/tmp}/gradle.kts.XXXXXX")"
+cp "$GRADLE_FILE" "$GRADLE_BACKUP"
+GRADLE_DIRTY=1   # 版本号已改写、尚未提交 → 需要回滚
+restore_gradle() {
+    [[ "${GRADLE_DIRTY:-0}" == "1" ]] || { rm -f "$GRADLE_BACKUP"; return 0; }
+    if [[ -f "$GRADLE_BACKUP" ]]; then
+        cp "$GRADLE_BACKUP" "$GRADLE_FILE"   # 整份还原，手工改动一并保留
+    fi
+    rm -f "$GRADLE_BACKUP"
+}
+trap restore_gradle EXIT
 sed -i "s/versionCode = [0-9]*/versionCode = $NEW_CODE/" "$GRADLE_FILE"
 sed -i "s/versionName = \"[^\"]*\"/versionName = \"$VER\"/" "$GRADLE_FILE"
 echo "    versionCode=$NEW_CODE versionName=$VER"
@@ -66,14 +78,30 @@ cp "$APK" apk/app-release.apk
 
 echo "── [5/6] 提交推送"
 git add update.json apk/app-release.apk "$GRADLE_FILE"
+PRE_PUSH_HEAD=$(git rev-parse HEAD)
 git commit -m "release v$VER" --quiet
-git push origin main --quiet
-
-echo "── [6/6] 清单自检（非 2xx 视为发版失败）"
-CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://gh-proxy.com/https://raw.githubusercontent.com/$REPO/main/update.json" || true)
-if [[ ! "$CODE" =~ ^2[0-9][0-9]$ ]]; then
-    echo "    自检失败：gh-proxy 返回 HTTP $CODE（检查推送是否生效/代理是否可用）" >&2
+# push 失败时必须回滚本地 commit：否则重跑脚本会基于「已自增的 versionCode」再 +1 → 跳号，
+# 且上一轮「没发出去」的 APK/update.json 会以半个版本的状态堆在历史里。
+# 用 --soft 回滚（保留工作区内容），随后 EXIT trap 把 build.gradle.kts 整份还原。
+if ! git push origin main --quiet; then
+    echo "    推送失败：回滚本地 commit（避免重跑跳号）" >&2
+    git reset --soft "$PRE_PUSH_HEAD" >/dev/null 2>&1 || true
+    git restore --staged update.json apk/app-release.apk "$GRADLE_FILE" >/dev/null 2>&1 || \
+        git reset -q update.json apk/app-release.apk "$GRADLE_FILE" >/dev/null 2>&1 || true
     exit 1
 fi
-echo "    完成 ✅ 清单 HTTP $CODE"
+# 推送成功：版本号改动已进历史，EXIT trap 不必再还原
+GRADLE_DIRTY=0
+
+echo "── [6/6] 清单自检（仅告警，不判失败）"
+# 注意：此处 commit+push **已经成功**，发版事实上已完成。自检只是「顺手看一眼代理是否可取到
+# 新清单」，检查对象是第三方代理（gh-proxy）的可用性与缓存刷新——代理抖动、限流、CDN 未刷新
+# 都会失败。过去这里 exit 1，导致发版成功却报「发版失败」，运维重跑直接踩跳号。
+# 因此自检失败只告警，退出码保持 0。
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://gh-proxy.com/https://raw.githubusercontent.com/$REPO/main/update.json" 2>/dev/null || true)
+if [[ ! "$CODE" =~ ^2[0-9][0-9]$ ]]; then
+    echo "    ⚠️  自检未通过：gh-proxy 返回「${CODE:-无响应}」" >&2
+    echo "       推送已成功，发版已完成；代理可能抖动/限流或 CDN 尚未刷新，稍后再验证即可。" >&2
+fi
+echo "    完成 ✅ 清单 HTTP ${CODE:-?}"
 echo "    手机端：打开应用 → 设置 → 检查更新 → 立即更新"
