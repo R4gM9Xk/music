@@ -47,6 +47,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -54,9 +55,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.roundToInt
 import com.local.music.core.ui.theme.GlassMotion
+import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.LocalGlassColors
-import com.local.music.core.ui.theme.LocalIsDark
+import com.local.music.core.ui.theme.LocalThemeFraction
 import com.local.music.core.ui.theme.auroraAccentColor
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
@@ -100,12 +103,12 @@ class ModalState {
     /**
      * 打开面板（同刻只保有一个：再 show 即原位替换，与旧单可见面板语义一致）。
      *
-     * 已知取舍（P3-69）：面板**已打开**（visible=true）时再次 [show] 换内容是原位硬切——
-     * visible 值不变，GlassSheet 的 MutableTransitionState 不产生状态变化，新旧内容之间
-     * 不播任何过渡。退场中途重开则不同：visible 翻回 true 会从退场中间态反向播入场。
-     * 要做「旧内容退场 → 新内容入场」需给 content 引入代际 key（新旧两棵子树并存各自
-     * 动画），牵动宿主清理时机与嵌套子面板的退场信号语义，风险大于收益——保守保留硬切。
-     * **需产品决策**：若要求二次打开必须播入场，应立项做 contentKey 方案，勿在本文件顺手改。
+     * 原位替换（P3-69）：面板**已打开**（visible=true）时再次 [show]，宿主会换用新 content
+     * lambda —— 旧 GlassSheet 节点离场、新节点全新组合（visibilityState 初值 false），
+     * 新面板播一次入场动画，旧内容不做退场（单树切换，无新旧并存期）。若要求「旧退场 →
+     * 新入场」的双树交叉需引入 content 代际 key，牵动宿主清理时机与嵌套子面板的退场信号
+     * 语义——维持单树，登记为已知取舍。
+     * 退场中途重开则不同：visible 翻回 true 会从退场中间态反向播入场。
      */
     fun show(content: @Composable () -> Unit) {
         this.content = content
@@ -241,16 +244,20 @@ fun GlassSheet(
     // 「知道退场动画真的跑完了」的公开入口（isIdle 且 targetState=false）。宿主据此清 content，
     // 取代「按 tweenPage 时长 delay」——delay 与动画不同源（起表差一帧 / 退场掉帧 /
     // 动效强度乘数变化），会先于动画结束，导致退场最后 1-2 帧被截断。
-    // 初值取当前 visible（与 AnimatedVisibility(visible) 重载内部一致）：面板首次组合时
-    // visible 已是 true，两态相等即 idle → 打开时不播入场、直接呈现，保持既有观感不变。
-    val visibilityState = remember { MutableTransitionState(visible) }
+    // 初值恒 false（不再取当前 visible）：首组合 visible=true 时两态不等 → 播放开场
+    // 上滑渐入（:227 契约）。旧实现初值取 visible 使首组合即 idle，打开=1 帧硬切且与
+    // 有退场无入场不对称；连带修掉子面板切换（ActionsSheet 互斥 GlassSheet）时
+    // 「主面板渐隐 + 子面板瞬现」的双 scrim 叠闪——现在主退场与子入场交叉，scrim 之和近似恒定。
+    // 原位替换语义（P3-69，modal.show 换内容）：旧面板即刻离场、新面板播入场——
+    // 仍是单树切换（不引 contentKey 双子树），无退场残留。
+    val visibilityState = remember { MutableTransitionState(false) }
     visibilityState.targetState = visible
     val onExitFinished = LocalSheetExitFinished.current
     // 只有「先真的可见过、现在退场跑完」才算一次退场结束：
     // - 初次组合就是 visible=false 的嵌套子面板（动作面板里 sub 未选中的那些）一上来
     //   就是 idle + target=false，若只看这个组合会立刻误报一次退场；
     // - 入场结束时 idle + target=true，也必须不报（否则宿主会把刚打开的面板清掉）。
-    var hasBeenVisible by remember { mutableStateOf(visible) }
+    var hasBeenVisible by remember { mutableStateOf(false) }
     LaunchedEffect(visibilityState.isIdle, visibilityState.currentState, visibilityState.targetState) {
         if (!visibilityState.isIdle) {
             hasBeenVisible = true
@@ -295,8 +302,13 @@ fun GlassSheet(
                     blur = GlassLevel.Md,
                 ) {
                     // 模态面板是最高层级：在玻璃压底之上再加一层近不透明内衬（深浅主题各配，
-                    // 浅色黑衬会蒙灰、压不住背景透入）
-                    val veil = if (LocalIsDark.current) Color.Black.copy(alpha = 0.32f) else Color.White.copy(alpha = 0.62f)
+                    // 浅色黑衬会蒙灰、压不住背景透入）。A1-03：按主题进度连续插值，
+                    // 旧实现按 LocalIsDark 阈值黑白硬切，主题渐变中点面板衬底「啪」一下变色
+                    val veil = lerp(
+                        Color.Black.copy(alpha = 0.32f),
+                        Color.White.copy(alpha = 0.62f),
+                        LocalThemeFraction.current,
+                    )
                     Column(
                         Modifier
                             .fillMaxWidth()
@@ -361,7 +373,7 @@ fun SheetAction(
         Box(
             Modifier
                 .size(32.dp)
-                .clip(RoundedCornerShape(10.dp))
+                .clip(RoundedCornerShape(R.Thumb10.dp))
                 .background(glass.md),
             contentAlignment = Alignment.Center,
         ) {
@@ -381,7 +393,8 @@ fun SheetAction(
             )
             if (subtitle != null) {
                 Spacer(Modifier.height(2.dp))
-                Text(subtitle, color = LocalGlassColors.current.textTertiary, fontSize = 11.5.sp)
+                // subtitle 含路径/歌名拼接，窄屏会换行：补 LHMicro 行高
+                Text(subtitle, color = LocalGlassColors.current.textTertiary, fontSize = 11.sp, lineHeight = 14.sp)
             }
         }
     }
@@ -421,9 +434,11 @@ fun QueueSheet(
     val density = LocalDensity.current
     val accent = auroraAccentColor()
     val glass = LocalGlassColors.current
-    val rowPx = with(density) { SongRowHeight.toPx() }.toInt()
+    // 定位数学全程 Float（A2-04）：rowPx/labelPx 先 toInt 再乘索引会让截断误差随行数
+    // 线性放大（66dp×2.75 密度每行丢 0.5px，500 行 ≈250px≈1.4 行）——乘完再取整
+    val rowPx = with(density) { SongRowHeight.toPx() }
     // 段头标签（已播放/正在播放）近似高度：定位公式要计入，否则当前曲定位偏低
-    val labelPx = with(density) { 34.dp.toPx() }.toInt()
+    val labelPx = with(density) { 34.dp.toPx() }
     // 空队列时 lastIndex=-1，coerceIn(0,-1) 会抛 IAE（冷启动默认屏=Player，权限拒/无音频即触发）
     val safeIndex = if (queue.isEmpty()) 0 else currentIndex.coerceIn(0, queue.lastIndex)
     // 长拖中自动切歌会推进 currentIndex：onMove 换算必须读实时值，否则松手提交时用的是
@@ -431,13 +446,16 @@ fun QueueSheet(
     val liveSafeIndex by rememberUpdatedState(safeIndex)
     LaunchedEffect(visible, currentIndex) {
         if (!visible) return@LaunchedEffect
+        // 用户正在滚动/拖拽时跳过跟随（A2-03）：自动切歌不该把浏览中的视口无动画拽走，
+        // 下一次 currentIndex 变化会重试；打开面板的首次定位不受影响（此时无人滚动）
+        if (scrollState.isScrollInProgress) return@LaunchedEffect
         // 等面板完成布局（maxValue>0）后按行高定位
         withTimeoutOrNull(500) {
             while (scrollState.maxValue <= 0) withFrameNanos { }
         }
         // 当前曲上方内容 = 前段行 + 段头标签；目标停在当前曲上一行（无前段则顶到 0）
         val above = safeIndex * rowPx + (if (safeIndex > 0) 2 else 1) * labelPx
-        val target = (above - rowPx).coerceIn(0, scrollState.maxValue)
+        val target = (above - rowPx).roundToInt().coerceIn(0, scrollState.maxValue)
         scrollState.scrollTo(target)
     }
     GlassSheet(
@@ -449,7 +467,7 @@ fun QueueSheet(
             // 结果是一个孤立的「正在播放」标签 + 大片空白（曲库未装载/权限被拒时点队列即可见）。
             Text(
                 "队列是空的 · 去曲库挑一首开始播放",
-                color = glass.textTertiary, fontSize = 13.sp,
+                color = glass.textTertiary, fontSize = 13.sp, lineHeight = 18.sp,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth().padding(vertical = 32.dp),
             )

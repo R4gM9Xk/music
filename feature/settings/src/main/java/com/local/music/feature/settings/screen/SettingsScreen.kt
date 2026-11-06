@@ -49,9 +49,11 @@ import com.local.music.core.ui.state.ThemeMode
 import com.local.music.core.ui.state.sleepTimerLabel
 import com.local.music.core.ui.state.sleepTimerSubtitle
 import com.local.music.core.ui.theme.GlassIcons
+import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.GlassIntensity
 import com.local.music.core.ui.theme.MotionIntensity
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 import kotlinx.coroutines.delay
 
 /**
@@ -109,11 +111,16 @@ fun SettingsScreen(
 
     // 定时关闭行副标题：每秒读一次剩余秒数做倒计时（分钟档到点后 effectiveSleepTimerMode 按期限归零）
     var sleepRemainingSec by remember { mutableIntStateOf(0) }
+    // A3-06：循环按剩余秒数有界化——旧实现 while(true) 在未开定时（deadline=0 常驻态）时
+    // 也每秒空转唤醒，开启后到点也不停。remaining 为 null（未开启）或 0（到期）即退出
     LaunchedEffect(state.sleepTimerDeadlineMs) {
         while (true) {
-            sleepRemainingSec = state.sleepTimerRemainingSec() ?: 0
+            val remaining = state.sleepTimerRemainingSec() ?: break
+            sleepRemainingSec = remaining
+            if (remaining <= 0) break
             delay(1000)
         }
+        sleepRemainingSec = 0
     }
     val sleepActiveMode = state.effectiveSleepTimerMode()
     val sleepSubtitle = when {
@@ -134,7 +141,16 @@ fun SettingsScreen(
 
             // P1-②：快照读取失败时的显式横幅。放在最顶部——它是「本页所有改动都不会保存」
             // 这种状态的前提，藏在任一分组下面都会让人先改了再发现白改。
-            if (corruptSnapshot) {
+            // A3-07：横幅出现/消失走展开+渐变——旧实现 if 硬切，页首内容一帧被顶开/塌缩
+            androidx.compose.animation.AnimatedVisibility(
+                visible = corruptSnapshot,
+                enter = androidx.compose.animation.expandVertically(
+                    androidx.compose.animation.core.tween(GlassMotion.Page, easing = GlassMotion.Curve),
+                ) + androidx.compose.animation.fadeIn(GlassMotion.tweenPage()),
+                exit = androidx.compose.animation.shrinkVertically(
+                    androidx.compose.animation.core.tween(GlassMotion.Page, easing = GlassMotion.Curve),
+                ) + androidx.compose.animation.fadeOut(GlassMotion.tweenPage()),
+            ) {
                 SectionHeader("设置未保存")
                 SettingsCard {
                     // 纯说明行：不传 onClick（避免"可点但无反应"的假交互），
@@ -183,7 +199,7 @@ fun SettingsScreen(
                                 AuroraMiniPreview(
                                     palette = previewSeed?.let { AuroraPalette.fromSeed(it) } ?: state.palette,
                                 )
-                                Spacer(Modifier.height(14.dp))
+                                Spacer(Modifier.height(16.dp))
                                 Text(
                                     "预设色板",
                                     color = LocalGlassColors.current.textTertiary,
@@ -516,7 +532,7 @@ fun SettingsScreen(
                                             current.changelog,
                                             color = LocalGlassColors.current.textSecondary,
                                             fontSize = 13.sp,
-                                            lineHeight = 20.sp,
+                                            lineHeight = 18.sp, // GlassType.LHBody：旧 20sp=1.54× 超出 1.27–1.4 规范区间
                                             modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
                                         )
                                     }
@@ -529,7 +545,7 @@ fun SettingsScreen(
                                             } else {
                                                 "下载中 ${(current.progress * 100).toInt()}%，完成后自动打开安装程序"
                                             },
-                                            color = LocalGlassColors.current.textTertiary, fontSize = 11.5.sp,
+                                            color = LocalGlassColors.current.textTertiary, fontSize = 11.sp, lineHeight = 14.sp, // GlassType.LHMicro
                                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
                                         )
                                     } else {
@@ -579,7 +595,7 @@ private fun SettingsCard(content: @Composable () -> Unit) {
     GlassSurface(
         modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
         level = GlassLevel.Md,
-        shape = RoundedCornerShape(18.dp),
+        shape = RoundedCornerShape(R.Card18.dp),
     ) {
         Column { content() }
     }

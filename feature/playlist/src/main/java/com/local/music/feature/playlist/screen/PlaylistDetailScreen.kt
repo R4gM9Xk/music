@@ -33,6 +33,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -71,6 +72,7 @@ import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 
@@ -122,7 +124,7 @@ fun PlaylistDetailScreen(
 
     fun playAll(shuffle: Boolean) {
         state.playCollection(data.tracks, data.title, shuffle)
-        state.screen = GlassScreen.Player
+        state.openPlayer()
     }
     val flight = LocalPlayerFlight.current
 
@@ -152,7 +154,7 @@ fun PlaylistDetailScreen(
                     GlassSurface(
                         modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
                         level = GlassLevel.Md,
-                        shape = RoundedCornerShape(18.dp),
+                        shape = RoundedCornerShape(R.Card18.dp),
                     ) {
                         Column(Modifier.padding(vertical = 6.dp)) {
                             // 拖拽域 = 自建歌单的 addedTracks 序；列表随页面滚动（autoscroll 关闭：
@@ -179,7 +181,7 @@ fun PlaylistDetailScreen(
                             if (data.tracks.isEmpty()) EmptyTracksHint()
                         }
                     }
-                    Spacer(Modifier.height(18.dp))
+                    Spacer(Modifier.height(16.dp))
                 }
             } else {
                 // 不可重排分支：真懒加载。原先 repeat(data.tracks.size) 一次性组合全部行
@@ -201,7 +203,7 @@ fun PlaylistDetailScreen(
                                 modifier = Modifier.fillMaxWidth()
                                     .padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
                                 level = GlassLevel.Md,
-                                shape = RoundedCornerShape(18.dp),
+                                shape = RoundedCornerShape(R.Card18.dp),
                             ) {
                                 Column(Modifier.padding(vertical = 6.dp)) { EmptyTracksHint() }
                             }
@@ -244,8 +246,8 @@ fun PlaylistDetailScreen(
                             }
                         }
                     }
-                    // 底部避让（与原实现同值）
-                    item(key = "detail-bottom-inset") { Spacer(Modifier.height(18.dp)) }
+                    // 底部避让（原 18，归 16 刻度）
+                    item(key = "detail-bottom-inset") { Spacer(Modifier.height(16.dp)) }
                 }
             }
 
@@ -253,8 +255,15 @@ fun PlaylistDetailScreen(
             // graphicsLayer alpha 只隐不卸——keepOnDispose 的迷你条飞行几何保持冻结；
             // ModalState 语义保持「退场动画结束（content 清空）后 Chrome 才复位」，
             // 面板滑出全程 Chrome 保持让位
+            // A3-08：让位 alpha 走 tweenPage 渐变——旧实现 0/1 硬切，与面板 360ms 进出场
+            // 节奏脱节（SearchScreen 同款；animateFloatAsState 只在此低频状态变化时重组）
+            val chromeAlpha by androidx.compose.animation.core.animateFloatAsState(
+                targetValue = if (modal.isOpen) 0f else 1f,
+                animationSpec = com.local.music.core.ui.theme.GlassMotion.tweenPage(),
+                label = "detailChromeAlpha",
+            )
             GlassChrome(
-                modifier = Modifier.graphicsLayer { alpha = if (modal.isOpen) 0f else 1f },
+                modifier = Modifier.graphicsLayer { alpha = chromeAlpha },
                 song = state.currentSong,
                 playing = state.playing,
                 // 进度以 lambda 下钻：本屏 body 不再读 progressFraction，播放进度每 100ms 变化
@@ -275,10 +284,10 @@ fun PlaylistDetailScreen(
                     val f = flight
                     if (f != null && !f.isActive) {
                         // 传来源屏：退出飞行按 entrySource 回详情，不再硬编码曲库（P2-14）
-                        f.beginEntry(state.currentSong, state.detailNavSelected, { state.screen = it }, GlassScreen.Detail)
+                        f.beginEntry(state.currentSong, state.detailNavSelected, { state.openPlayer() }, GlassScreen.Detail)
                     } else {
                         f?.abort()
-                        state.screen = GlassScreen.Player
+                        state.openPlayer()
                     }
                 },
                 onPlayPause = state::togglePlayPause,
@@ -375,9 +384,9 @@ private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
             data.art,
             Modifier
                 .size(132.dp)
-                .shadow(18.dp, RoundedCornerShape(24.dp))
-                .border(1.dp, Color.White.copy(alpha = 0.28f), RoundedCornerShape(24.dp)),
-            RoundedCornerShape(24.dp),
+                .shadow(18.dp, RoundedCornerShape(R.Card24.dp))
+                .border(1.dp, Color.White.copy(alpha = 0.28f), RoundedCornerShape(R.Card24.dp)),
+            RoundedCornerShape(R.Card24.dp),
             bitmap = data.cover,
             artworkUri = data.coverUri,
         )
@@ -466,7 +475,7 @@ private fun DetailTrackRow(
         }),
         onClick = {
             state.playSong(track, tracks, title)
-            state.screen = GlassScreen.Player
+            state.openPlayer()
         },
     )
 }
@@ -508,7 +517,11 @@ private fun Modifier.detailCardSegment(isFirst: Boolean, isLast: Boolean): Modif
     return this
         .clip(shape)
         .background(glass.md)
-        .drawBehind {
+        // A3-09：几何量与 Brush/Stroke 全部进 drawWithCache——旧 drawBehind 每次绘制都
+        // new 一个 horizontalGradient（Shader 级分配）+ Stroke，滚动/面板动画期间首段
+        // 持续重绘时累积 GC 压力，违背 Glass.kt glassTopLine 的既定规约。
+        // cache 块在尺寸/玻璃配色变化时才重算，帧间复用
+        .drawWithCache {
             val radius = corner.toPx()
             val strokeW = 1.dp.toPx()
             val half = strokeW / 2f // 描边内缩半像素：与 Modifier.border 被 clip 后的观感一致
@@ -518,36 +531,38 @@ private fun Modifier.detailCardSegment(isFirst: Boolean, isLast: Boolean): Modif
             val arcSize = Size(arcR * 2f, arcR * 2f)
             val stroke = Stroke(strokeW)
             val strokeColor = glass.strokeSoft
+            // 顶部高光线：与 GlassSurface 的 glassTopLine 同参数，只在首段画一次（否则每行一道）
+            val topLineBrush = Brush.horizontalGradient(
+                listOf(Color.Transparent, glass.topLine, Color.Transparent),
+                startX = w * 0.08f,
+                endX = w * 0.92f,
+            )
+            onDrawBehind {
+                // 左右竖边：首/末段从圆角之后起画（圆角那段由下面的弧线负责），中段通高
+                val sideTop = if (isFirst) half + arcR else 0f
+                val sideBottom = if (isLast) h - half - arcR else h
+                drawLine(strokeColor, Offset(half, sideTop), Offset(half, sideBottom), strokeW)
+                drawLine(strokeColor, Offset(w - half, sideTop), Offset(w - half, sideBottom), strokeW)
 
-            // 左右竖边：首/末段从圆角之后起画（圆角那段由下面的弧线负责），中段通高
-            val sideTop = if (isFirst) half + arcR else 0f
-            val sideBottom = if (isLast) h - half - arcR else h
-            drawLine(strokeColor, Offset(half, sideTop), Offset(half, sideBottom), strokeW)
-            drawLine(strokeColor, Offset(w - half, sideTop), Offset(w - half, sideBottom), strokeW)
-
-            if (isFirst) {
-                // 上圆角（左上 180°→270°、右上 270°→360°）+ 顶边
-                drawArc(strokeColor, 180f, 90f, false, Offset(half, half), arcSize, style = stroke)
-                drawArc(strokeColor, 270f, 90f, false, Offset(w - half - arcR * 2f, half), arcSize, style = stroke)
-                drawLine(strokeColor, Offset(half + arcR, half), Offset(w - half - arcR, half), strokeW)
-                // 顶部高光线：与 GlassSurface 的 glassTopLine 同参数，只在首段画一次（否则每行一道）
-                drawLine(
-                    brush = Brush.horizontalGradient(
-                        listOf(Color.Transparent, glass.topLine, Color.Transparent),
-                        startX = w * 0.08f,
-                        endX = w * 0.92f,
-                    ),
-                    start = Offset(w * 0.08f, 0.5f),
-                    end = Offset(w * 0.92f, 0.5f),
-                    strokeWidth = strokeW,
-                )
-            }
-            if (isLast) {
-                // 下圆角（左下 90°→180°、右下 0°→90°）+ 底边
-                val bottomTop = h - half - arcR * 2f
-                drawArc(strokeColor, 90f, 90f, false, Offset(half, bottomTop), arcSize, style = stroke)
-                drawArc(strokeColor, 0f, 90f, false, Offset(w - half - arcR * 2f, bottomTop), arcSize, style = stroke)
-                drawLine(strokeColor, Offset(half + arcR, h - half), Offset(w - half - arcR, h - half), strokeW)
+                if (isFirst) {
+                    // 上圆角（左上 180°→270°、右上 270°→360°）+ 顶边
+                    drawArc(strokeColor, 180f, 90f, false, Offset(half, half), arcSize, style = stroke)
+                    drawArc(strokeColor, 270f, 90f, false, Offset(w - half - arcR * 2f, half), arcSize, style = stroke)
+                    drawLine(strokeColor, Offset(half + arcR, half), Offset(w - half - arcR, half), strokeW)
+                    drawLine(
+                        brush = topLineBrush,
+                        start = Offset(w * 0.08f, 0.5f),
+                        end = Offset(w * 0.92f, 0.5f),
+                        strokeWidth = strokeW,
+                    )
+                }
+                if (isLast) {
+                    // 下圆角（左下 90°→180°、右下 0°→90°）+ 底边
+                    val bottomTop = h - half - arcR * 2f
+                    drawArc(strokeColor, 90f, 90f, false, Offset(half, bottomTop), arcSize, style = stroke)
+                    drawArc(strokeColor, 0f, 90f, false, Offset(w - half - arcR * 2f, bottomTop), arcSize, style = stroke)
+                    drawLine(strokeColor, Offset(half + arcR, h - half), Offset(w - half - arcR, h - half), strokeW)
+                }
             }
         }
 }

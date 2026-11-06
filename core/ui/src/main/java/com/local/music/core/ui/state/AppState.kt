@@ -234,6 +234,89 @@ class AppState {
             else -> 0
         }
 
+    /**
+     * 播放页的来源页。播放页是**盖在内容之上的覆盖层**（不是路由里的一屏），
+     * 其下层始终渲染这一页 —— 于是收起播放页时下层已经是正确的那一页，
+     * 不需要任何页面切换动画：播放页下滑离场，来源页原地显现。
+     * 这也让「返回目标」天然正确（详情进就回详情、搜索进就回搜索）。
+     */
+    var playerOrigin by mutableStateOf(GlassScreen.Library)
+        private set
+
+    /**
+     * 打开播放页：记下来源页供收起时原路落回。
+     * 已在播放页时直接返回 —— 不能把 playerOrigin 覆盖成 Player（否则收起无处可回）。
+     */
+    fun openPlayer() {
+        if (screen == GlassScreen.Player) return
+        playerOrigin = screen
+        screen = GlassScreen.Player
+    }
+
+    /** 收起播放页：落回来源页。非播放页态调用为 no-op（防止误改导航） */
+    fun closePlayer() {
+        if (screen != GlassScreen.Player) return
+        screen = playerOrigin
+    }
+
+    /**
+     * 导航态快照：`screen` / `detail` / `detailReturn` / `playerOrigin` 四项。
+     *
+     * 为什么需要它：AppState 是 `remember { AppState() }` 而不是 ViewModel/Saveable，Activity
+     * 重建（改系统字号、显示大小 —— `fontScale`/`density` 不在 manifest 的 configChanges 里，
+     * 必重建）会把它整个丢掉。而 `screen` 这些又不是「设置」，不该进 DataStore 快照
+     * （那是跨进程持久化的语义，重启后回到上次那一页反而是骚扰）。两者之间正好缺一层：
+     * **只活在这一次任务栈里**的瞬态导航。这层交给宿主的 `rememberSaveable` 承载，
+     * 重建后原样还回来。
+     *
+     * 真机后果（P2-26）：在播放页改一下字号 → 被弹回曲库首页，正在看的详情/搜索词
+     * 一并丢失，用户毫无心理准备。
+     *
+     * 返回纯可序列化的基本类型集合（String + 下标），宿主侧无需给 GlassScreen/DetailTarget
+     * 写 Saver，也不会因为将来枚举增删而让恢复逻辑编译不过：解析失败一律回落默认值。
+     */
+    fun navigationState(): List<String> = listOf(
+        screen.name,
+        detail.kind.name,
+        detail.id,
+        detailReturn.name,
+        playerOrigin.name,
+        // 搜索词也要带：真机报告点名「正在看的详情/**搜索词**一并丢失」，而搜索页的
+        // 输入框读的就是 state.searchQuery（SearchScreen.kt:66）。只恢复 screen=Search
+        // 而词是空串，用户看到的仍是一个空搜索页 —— 症状没修掉一半。
+        searchQuery,
+    )
+
+    /**
+     * 还原 [navigationState] 的结果。宿主只在**重建**后调用一次（首次组合不调，否则会把
+     * 默认值写回去）；任何一项解析不出来就保留该项当前值，整体不会把导航搞成半截状态。
+     *
+     * 这里刻意**直接写 screen 而不是走 openPlayer/closePlayer**：那些函数带「只在合法前置态
+     * 下才生效」的守卫（防止误改导航），而恢复时本来就要无条件回到上次那一页。
+     *
+     * 长度用 `>=` 而不是 `==`：将来再加字段时，旧版本存下的短列表仍能按位还原已认识的项，
+     * 不会因为强校验整份作废（那正是上一版容易被「加一个字段就静默失效」卡住的地方）。
+     */
+    fun restoreNavigationState(saved: List<String>) {
+        if (saved.size < 5) return
+        val target = saved[0].toScreenOrNull() ?: return
+        // detail 的 kind 解析失败时保留现有 detail（不拿半个目标覆盖，否则详情页会显示错内容）
+        saved[1].toDetailKindOrNull()?.let { kind -> detail = DetailTarget(kind, saved[2]) }
+        saved[3].toScreenOrNull()?.let { detailReturn = it }
+        saved[4].toScreenOrNull()?.let { playerOrigin = it }
+        saved.getOrNull(5)?.let { searchQuery = it }
+        // 恢复到播放页时 playerOrigin 必须是个「能退出去」的页：历史上它是 Player 的坏数据
+        // 会让 closePlayer 原地打转。还原时兜一刀，代价为零。
+        if (playerOrigin == GlassScreen.Player) playerOrigin = GlassScreen.Library
+        screen = target
+    }
+
+    private fun String.toScreenOrNull(): GlassScreen? =
+        GlassScreen.entries.firstOrNull { it.name == this }
+
+    private fun String.toDetailKindOrNull(): DetailTarget.Kind? =
+        DetailTarget.Kind.entries.firstOrNull { it.name == this }
+
     // ── 真曲库 / 播放引擎 ─────────────────────────────────
     var engine: PlayerEngine? = null
         private set
@@ -467,6 +550,10 @@ class AppState {
     /** 注入播放引擎（GlassApp 的 MediaController 连接成功后调用）：先同步服务现状，再补发暂存意图 */
     fun attachPlayer(engine: PlayerEngine) {
         this.engine = engine
+        // 新引擎 = 新的服务连接：服务端定时器属于上一个连接（Activity 重建时它其实还活着，
+        // 但也可能是服务真的重建过、协程已经没了），代次 +1 让 syncEngineModes 的重武装判重
+        // 失效，从而按**剩余时间**补发一次（见 sleepTimerArmed）。
+        engineGeneration++
         engine.onPlayingChanged = { isPlaying ->
             // 仅在引擎驱动真实播放时回流；演示模式（stopAndClear 之后）的 false 回调不打断定时器
             if (engineLoadedUri != null) {
@@ -493,6 +580,9 @@ class AppState {
             playbackError = message
             playing = false
             engineLoadedUri = null
+            // 引擎侧出错（含断连）时服务端的定时协程已不可信：清掉武装戳，
+            // 让下一次 syncEngineModes 按剩余时间重发（见 onEngineDisconnected 注释）
+            onEngineDisconnected()
             scheduleSave()
         }
         // 服务为权威：读回现有曲目 / 进度 / 播放态（重新打开界面时服务可能仍在播）
@@ -538,6 +628,15 @@ class AppState {
             if (index < 0) return
             queue = serviceSongs
         }
+        // **引擎现场必须在这里回写**：engineLoadedUri 是「引擎里装着的正是当前这首」的唯一凭据，
+        // togglePlayPause / seekTo / tick / effectiveDurationSec 全拿它判「引擎是否在驱动当前曲」。
+        // 旧实现只改 queueIndex，于是后台完播自动切歌后凭据仍停在**上一首**的 uri：
+        // 用户回来第一次点暂停被判成「尚未装载」→ 走 startCurrent() 从头重播（真机 P0 实锤），
+        // 同时 effectiveDurationSec 因 uri 不等而回退扫描时长（元数据缺失曲的进度条卡在 1 秒、歌词停在首行）。
+        // 写回放在分支外：这条回调本身就是「引擎当前曲 = mediaId」的权威声明，
+        // 与「索引有没有变」无关（setMediaItems 引发的 PLAYLIST_CHANGED 同曲上报也要落实凭据），
+        // 挂在 index != queueIndex 里就等于把事实绑定到副作用上，迟早再漏一处。
+        queue.getOrNull(index)?.let { engineLoadedUri = it.mediaUri }
         if (index != queueIndex) {
             queueIndex = index
             progressSec = 0f
@@ -547,14 +646,102 @@ class AppState {
         }
     }
 
-    /** 循环 / 随机 / 均衡器 / 播放速度 → 服务端播放器（切换即时下发；
+    /** 循环 / 随机 / 均衡器 / 播放速度 / 定时关闭 → 服务端播放器（切换即时下发；
      *  attachPlayer / prepareResume / startCurrent / restore 都经此补同步，速度随队列装载重下发） */
     private fun syncEngineModes(eng: PlayerEngine) {
         eng.setRepeatMode(repeatMode == RepeatMode.All, repeatMode == RepeatMode.One)
         eng.setShuffleMode(shuffleOn)
         eng.setEqPreset(eqPreset.name)
         eng.setPlaybackSpeed(playbackSpeed)
+        // 定时关闭也在这里收敛：服务端定时器不持久化（服务重建即丢），而本方法恰好是
+        // attachPlayer 与 restore 两条恢复路径的公共出口——不在公共出口补，就得两处各写一遍，
+        // 而「漏写一处」正是 P1-3 的成因（restore 早于 attachPlayer 时 engine==null，整行 no-op）。
+        val minutes = sleepTimerMinutesForEngine() ?: return
+        val stamp = engineGeneration to if (minutes > 0) sleepTimerDeadlineMs else 0L
+        if (sleepTimerArmed == stamp) return
+        eng.setSleepTimer(minutes)
+        sleepTimerArmed = stamp
+        // 播完档的撤销是一次性的：发过 0 就清标记，否则后续每次 syncEngineModes 都会重发。
+        if (minutes == 0) sleepTimerNeedsCancel = false
     }
+
+    /**
+     * 引擎断连回调（宿主在 [PlayerEngine.onError] 里转发）。
+     *
+     * 为什么必须清武装戳：服务进程被系统杀掉后重启（低内存回收、用户强停），
+     * MediaController 会重连，但 **attachPlayer 不一定再被调用**（Activity 若还活着，
+     * 宿主不会重建 controller）。此时 engineGeneration 不变、(代次, deadline) 判重戳
+     * 仍等于上次值 → `syncEngineModes` 认为「已武装」而不补发，而服务端的定时协程
+     * 随旧进程一起没了 → UI 显示定时还在，到点却不停。清掉这枚戳，
+     * 下一次任何 syncEngineModes（切歌/恢复）就会按剩余时间重发。
+     */
+    fun onEngineDisconnected() {
+        sleepTimerArmed = null
+    }
+
+    /** 已下发到服务端的定时：当时的引擎代次 + 对应 deadline（0 = 已撤销）。
+     *
+     *  **为什么必须记这一笔**：本方法在每次 startCurrent / 切歌 / 恢复时都会走到，而重发
+     *  只能精确到整分钟（协议就是 delay(N 分钟)）。无脑重发时每切一首歌都会用「当前剩余
+     *  整分钟数」重建服务端协程，而剩余时间几乎总带零头——截断后的新截止只会比原截止更早，
+     *  连切十首就能把 15 分钟的定时明显提前掐掉，等于把「延长整档」换成了「逐次缩短」。
+     *  按 (代次, deadline) 判重后，只有「换了引擎（Activity 重建后 attachPlayer 新建的
+     *  MediaControllerEngine）」与「用户真的重设定时」两种情况才下发，重发次数因此恰好
+     *  等于重建次数。
+     *
+     *  存代次而不存引擎实例：旧引擎随 Activity 销毁已经 release，被这里强引用着会把它
+     *  （连同 MediaController）一直吊在内存里，白白拖住服务连接。 */
+    private var sleepTimerArmed: Pair<Int, Long>? = null
+
+    /** 引擎代次：attachPlayer 每注入一个新引擎 +1，用作「服务端定时器属于哪一次连接」的身份。
+     *  与 sleepTimerArmed 配套，见其注释。 */
+    private var engineGeneration = 0
+
+    /**
+     * 服务端此刻还应武装的分钟数；null = 本次不触碰服务端定时器状态。
+     *
+     * **必须按剩余时间而不是原始档位重发**：Activity 重建（改字号/显示大小，manifest 未吞
+     * fontScale/density）时服务端协程还活着、倒计时还在走，若把 15 分钟整档再发一次，
+     * 等于把用户的 15 分钟定时悄悄延长成一整档（真机实测延长 3.5 分钟）——用户感知就是
+     * 「到点不停」。已过期则必须显式下发 0：服务端协程早已到点，留着不撤会让下一次
+     * 「看起来没开定时」的播放莫名停住。
+     *
+     * 取整语义 = **向上取整**（ceil），并明确接受「最多晚 59 秒」：分钟档协议只能表达整分钟，
+     * 想让服务端**不晚于**原截止就必须向下取整（floor），但那会在「剩余 50 秒」时得到 0，
+     * 而 0 的语义是「撤销定时」——直接变成「定时提前消失」，比晚 59 秒更糟。
+     * 所以这里选 ceil：宁可最多晚不到一分钟（用户几乎无感），也不能丢定时。
+     * （旧注释曾写「截断只会早停」，与代码的 coerceAtLeast(1) 相反，已按实际语义更正。）
+     *
+     * 播完档（-1/-2）返回 null 而不是 0：它的真值只活在服务端一个**无时间戳**的旗标里，
+     * 进程重启后 AppState 侧按设计丢弃（见 restore 注释），此时下发 0 会把用户仍然需要的
+     * 定时悄悄撤掉。但**Activity 重建**（服务进程还活着、旗标还在）是另一回事——
+     * 那种情况必须显式撤销，否则旗标悬空会让当前曲自然播完后莫名暂停，
+     * 见 [sleepTimerNeedsCancel]。
+     */
+    private fun sleepTimerMinutesForEngine(): Int? {
+        // Activity 重建时快照里的播完档被 restore 丢弃 → sleepTimerMode 已是 0，
+        // 走不到下面的分支。用独立标记表达「服务端可能还挂着播完档，需要撤销一次」。
+        if (sleepTimerNeedsCancel) return 0
+        if (sleepTimerMode <= 0) return null
+        if (effectiveSleepTimerMode() == 0) return 0 // 已过期：显式撤销
+        val remainMs = (sleepTimerDeadlineMs - System.currentTimeMillis()).coerceAtLeast(0L)
+        if (remainMs <= 0L) return 0
+        // ceil：见 KDoc 里的取舍说明（宁可晚 <60s，也不能因 floor 得到 0 而丢掉定时）
+        return ((remainMs + 59_999L) / 60_000L).toInt()
+    }
+
+    /**
+     * 服务端可能还挂着「播完当前首/队列」旗标，需要在下次 [syncEngineModes] 时下发一次 0。
+     *
+     * 为什么需要这个独立标记：播完档不进快照（跨进程无法复原），于是 restore 时
+     * `sleepTimerMode` 落到 0，`sleepTimerMinutesForEngine()` 会返回 null（「不触碰」）。
+     * 但 Activity 重建时**服务进程是活的**，`stopAfterCurrent`/`stopAtQueueEnd` 原样保留 ——
+     * 不主动撤销就是一个孤儿旗标：用户改个字号，回来听歌，当前曲自然播完的瞬间被莫名暂停，
+     * 而 UI 上「定时关闭」显示未开启。 [attachPlayer] 的 onPlayingChanged 里已经踩过同一个坑
+     * （「归零必须同时下发服务端」），这里是它的续集。
+     */
+    private var sleepTimerNeedsCancel = false
+
 
     // ── 持久化：快照 / 恢复 / 存盘调度 ────────────────────
 
@@ -720,6 +907,11 @@ class AppState {
             else -> 0
         }
         sleepTimerDeadlineMs = if (sleepTimerMode > 0) snapshot.sleepTimerDeadlineMs else 0L
+        // 播完档（-1/-2）不持久化、这里必然落到 0，但**服务进程可能还活着**（Activity 重建
+        // 是常态：改字号/显示大小都走这条路），它的 stopAfterCurrent/stopAtQueueEnd 旗标仍在。
+        // 不撤销就是孤儿旗标 —— 用户回来听歌，当前曲自然播完被莫名暂停，而 UI 显示「未开启」。
+        // 记一笔，让 syncEngineModes 下发一次 0 收掉它。
+        sleepTimerNeedsCancel = snapshot.sleepTimerMode < 0
         // 互斥语义归一：旧备份可能同时有 followCover=true 与 customSeedArgb 非空
         if (customSeedArgb != null) followCover = false
         excludedFolders.clear()
@@ -751,9 +943,10 @@ class AppState {
         currentSongIdPending = snapshot.currentSongId
         hydrated = true // 恢复完成：允许存盘
         // restore 可能晚于 attachPlayer 到达：循环/随机/EQ/速度就地补同步到服务端（否则引擎停留在默认模式）
+        // 定时关闭的重武装也走这里（syncEngineModes 内），按剩余时间而不是快照里的原始档位下发：
+        // 快照里的 mode 是「用户当初选的档位」，deadline 才是真实截止——用 mode 重发等于把
+        // 已经走掉的那段时间还回去（真机 F5：15 分钟定时被重置成整 15 分钟）。
         engine?.let { syncEngineModes(it) }
-        // 分钟档定时随快照恢复后，把服务端定时器重新武装（服务端定时器不持久化，必须重下发）
-        if (sleepTimerMode > 0) engine?.setSleepTimer(sleepTimerMode)
         // 播放现场不在此处应用：演示 id 不提前解析（防止消费掉真实快照），
         // 统一等 loadLibrary（真曲库装载）后由 applyPendingPlayback 收敛
     }
@@ -1250,12 +1443,18 @@ class AppState {
         scheduleSave()
     }
 
-    /** 定时关闭：下发服务端（服务端权威到点暂停）+ 记录本地回显状态。不持久化（重启失效合理） */
+    /** 定时关闭：下发服务端（服务端权威到点暂停）+ 记录本地回显状态。
+     *  分钟档随快照 v9 持久化（Activity 重建后仍能回显，见 restore），播完档不持久化
+     *  （它的真值只是服务端一个无时间戳的旗标，跨进程无法复原，存了就是假回显）。 */
     fun setSleepTimer(modeMinutes: Int) {
         engine?.setSleepTimer(modeMinutes)
         sleepTimerMode = modeMinutes
         sleepTimerDeadlineMs = if (modeMinutes > 0) System.currentTimeMillis() + modeMinutes * 60_000L else 0L
-        scheduleSave() // v9：随快照持久化，Activity 重建后仍能回显
+        // 与 syncEngineModes 的判重戳对齐：本函数刚刚亲手下发过一次，若不同步记下这次
+        // (代次, deadline)，紧接着的任意一次 syncEngineModes（切歌/恢复都会走）会认为
+        // 「还没下发过」而按剩余分钟数再发一遍——服务端协程被重建，倒计时被截断几十秒。
+        if (engine != null) sleepTimerArmed = engineGeneration to sleepTimerDeadlineMs
+        scheduleSave()
     }
 
     /** 生效中的定时模式（面板高亮 / 设置副标题用）：分钟档过了期限视为结束——
@@ -1555,6 +1754,10 @@ class AppState {
 
     /** 进详情并记录返回来源（从详情里再进详情保持原来源） */
     fun openDetail(target: DetailTarget) {
+        // 从播放页覆盖层打开详情（长按歌曲 → 查看专辑/艺术家）时，详情要接管整个屏幕，
+        // 必须先把播放页收起，否则 playerOrigin 会被记成 Player —— 之后 closePlayer
+        // 会落回 Player（自己），详情页再也退不出去。
+        if (screen == GlassScreen.Player) screen = playerOrigin
         if (screen != GlassScreen.Detail) detailReturn = screen
         detail = target
         screen = GlassScreen.Detail

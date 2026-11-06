@@ -15,10 +15,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,6 +45,7 @@ import com.local.music.core.ui.components.LocalPlayerFlight
 import com.local.music.core.ui.components.PlaylistCard
 import com.local.music.core.ui.components.SectionHeader
 import com.local.music.core.ui.components.SongActionsSheet
+import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.components.SongRow
 import com.local.music.core.ui.components.pressScale
 import com.local.music.core.ui.state.AppState
@@ -76,6 +80,11 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
     val listedSongs = remember(results) { results.distinctBy { it.id } }
     // 展开态跟随查询词重置（remember 以 query 为 key，换词自动收起）
     var showAllAlbums by remember(query) { mutableStateOf(false) }
+    // A2-06：换查询词重置滚动位置——历史态/结果态/空态三态共用一个 LazyColumn，滚动位置
+    // 不重置会让新结果从旧偏移处展示（index 未超界时看不出换了内容），结果变少时被 clamp
+    // 跳到尾部。每键归零与主流搜索一致（输入即新查询）
+    val resultListState = rememberLazyListState()
+    LaunchedEffect(query) { resultListState.scrollToItem(0) }
     val flight = LocalPlayerFlight.current
     // 模态面板宿主（GlassApp 根层）；Chrome 让位同读此状态
     val modal = LocalModalState.current
@@ -91,7 +100,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
             Row(
                 Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 14.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp), // 与 GlassTabs 筛选行同族同距（原 10）
             ) {
                 GlassTextField(
                     value = query,
@@ -120,6 +129,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                 Modifier
                     .weight(1f)
                     .hazeSource(hazeState),
+                state = resultListState,
             ) {
                 if (query.isBlank()) {
                     // P2-8：无历史时不再渲染「最近搜索」标题，给一条居中的空态提示占位
@@ -155,7 +165,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         item(key = "search-empty") {
                             Text(
                                 "没有找到「${query.trim()}」相关内容",
-                                color = LocalGlassColors.current.textTertiary, fontSize = 14.sp,
+                                color = LocalGlassColors.current.textTertiary, fontSize = 13.sp,
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier.fillMaxWidth().padding(top = 56.dp),
                             )
@@ -193,7 +203,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                                     state.addSearchHistory(query)
                                     // 队列口径同展示序列：与用户看到的列表一致
                                     state.playSong(song, listedSongs, "搜索")
-                                    state.screen = GlassScreen.Player
+                                    state.openPlayer()
                                 },
                             )
                         }
@@ -212,7 +222,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                                 val expandInteraction = remember { MutableInteractionSource() }
                                 Text(
                                     if (showAllAlbums) "收起" else "全部 ${albums.size} 张专辑",
-                                    color = auroraAccentColor(), fontSize = 12.5.sp, fontWeight = FontWeight.Medium,
+                                    color = auroraAccentColor(), fontSize = 13.sp, fontWeight = FontWeight.Medium,
                                     modifier = Modifier
                                         .padding(start = 20.dp, end = 20.dp, bottom = 14.dp)
                                         .pressScale(expandInteraction, pressed = 0.92f)
@@ -224,13 +234,19 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         }
                     }
                 }
-                item(key = "search-bottom-inset") { Spacer(Modifier.height(18.dp)) }
+                item(key = "search-bottom-inset") { Spacer(Modifier.height(16.dp)) } // 原 18，归 16 刻度
             }
             // 单曲面板打开时 Chrome 让位（与 PlayerScreen 控制台同策略）：
             // graphicsLayer alpha 只隐不卸——keepOnDispose 的迷你条飞行几何保持冻结；
-            // ModalState 语义保持「退场动画结束（content 清空）后 Chrome 才复位」
+            // ModalState 语义保持「退场动画结束（content 清空）后 Chrome 才复位」。
+            // A3-08：让位 alpha 走 tweenPage 渐变——旧实现 0/1 硬切，与面板 360ms 进出场节奏脱节
+            val chromeAlpha by animateFloatAsState(
+                targetValue = if (modal.isOpen) 0f else 1f,
+                animationSpec = GlassMotion.tweenPage(),
+                label = "searchChromeAlpha",
+            )
             GlassChrome(
-                modifier = Modifier.graphicsLayer { alpha = if (modal.isOpen) 0f else 1f },
+                modifier = Modifier.graphicsLayer { alpha = chromeAlpha },
                 song = state.currentSong,
                 playing = state.playing,
                 // 进度以 lambda 下钻：本屏 body 不再读 progressFraction，播放进度每 100ms 变化
@@ -253,11 +269,11 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         // 注意第 4 参 source 不是函数类型，尾 lambda 只能写在括号内
                         f.beginEntry(
                             state.currentSong, 0,
-                            { state.screen = it }, GlassScreen.Search,
+                            { state.openPlayer() }, GlassScreen.Search,
                         )
                     } else {
                         f?.abort()
-                        state.screen = GlassScreen.Player
+                        state.openPlayer()
                     }
                 },
                 onPlayPause = state::togglePlayPause,

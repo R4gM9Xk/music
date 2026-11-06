@@ -36,7 +36,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.background
@@ -45,6 +51,7 @@ import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.auroraAccentColor
 
 /**
@@ -77,7 +84,7 @@ fun PageHeader(
     ) {
         Text(title, color = LocalGlassColors.current.textPrimary, fontSize = 30.sp, fontWeight = FontWeight.Bold,
             letterSpacing = (-0.6).sp)
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             if (action2Icon != null && onAction2 != null) {
                 GlassIconButton(
                     onClick = onAction2,
@@ -117,7 +124,7 @@ fun GlassSearchBox(
     GlassSurface(
         modifier = modifier.fillMaxWidth().height(44.dp),
         level = GlassLevel.Md,
-        shape = RoundedCornerShape(22.dp),
+        shape = RoundedCornerShape(R.Full),
         onClick = onClick,
     ) {
         Row(
@@ -128,7 +135,7 @@ fun GlassSearchBox(
             Icon(GlassIcons.Search, null, Modifier.size(18.dp),
                 tint = if (placeholder) LocalGlassColors.current.textSecondary else LocalGlassColors.current.textPrimary)
             Text(
-                text, fontSize = 14.sp,
+                text, fontSize = 15.sp,
                 color = if (placeholder) LocalGlassColors.current.textSecondary else LocalGlassColors.current.textPrimary,
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
@@ -156,24 +163,28 @@ fun GlassTabs(
         tabs.forEachIndexed { index, label ->
             val on = index == selected
             val interactionSource = remember { MutableInteractionSource() }
+            // A3-02：选中态的填充/描边/文字色/投影四项全走 tweenHover——旧实现 if(on) 直接换
+            // Modifier 链，四者瞬变（投影突现突失最扎眼）。0dp 投影等价无投影
+            val bg by animateColorAsState(if (on) palette.seed else glass.lo, GlassMotion.tweenHover(), label = "tabBg$index")
+            val borderColor by animateColorAsState(
+                if (on) Color.Transparent else glass.strokeSoft, GlassMotion.tweenHover(), label = "tabBorder$index",
+            )
+            val textColor by animateColorAsState(
+                if (on) Color.White else LocalGlassColors.current.textSecondary, GlassMotion.tweenHover(), label = "tabText$index",
+            )
+            val shadowElevation by animateDpAsState(if (on) 6.dp else 0.dp, GlassMotion.tweenHover(), label = "tabShadow$index")
             Box(
                 Modifier
                     .pressScale(interactionSource, pressed = 0.95f)
-                    .then(
-                        // .tab.on：box-shadow 0 6px 16px seed 45%
-                        if (on) {
-                            Modifier.shadow(
-                                6.dp, RoundedCornerShape(50), clip = false,
-                                ambientColor = palette.seed.copy(alpha = 0.45f),
-                                spotColor = palette.seed.copy(alpha = 0.45f),
-                            )
-                        } else {
-                            Modifier
-                        },
+                    // .tab.on：box-shadow 0 6px 16px seed 45%（elevation 动画，颜色恒定）
+                    .shadow(
+                        shadowElevation, RoundedCornerShape(50), clip = false,
+                        ambientColor = palette.seed.copy(alpha = 0.45f),
+                        spotColor = palette.seed.copy(alpha = 0.45f),
                     )
                     .clip(RoundedCornerShape(50))
-                    .background(if (on) palette.seed else glass.lo)
-                    .border(1.dp, if (on) Color.Transparent else glass.strokeSoft, RoundedCornerShape(50))
+                    .background(bg)
+                    .border(1.dp, borderColor, RoundedCornerShape(50))
                     .clickable(interactionSource = interactionSource, indication = null) { onSelect(index) }
                     .semantics {
                         // 读屏语义：tab 角色 + 选中态（与 Chrome.kt 底导航 GlassNavBar 同款）
@@ -184,7 +195,7 @@ fun GlassTabs(
             ) {
                 Text(
                     label, fontSize = 13.sp,
-                    color = if (on) Color.White else LocalGlassColors.current.textSecondary,
+                    color = textColor,
                     fontWeight = if (on) FontWeight.Medium else FontWeight.Normal,
                 )
             }
@@ -237,7 +248,7 @@ fun SongRow(
     ) {
         ArtThumb(
             song.art, Modifier.size(48.dp),
-            RoundedCornerShape(if (squareThumb) 8.dp else 12.dp),
+            RoundedCornerShape(R.Thumb10.dp),
             bordered = true,
             // coverBitmap 恒为 null（扫描不再预解码全库）；真封面经 artworkUri 按需解码
             bitmap = song.coverBitmap,
@@ -254,39 +265,70 @@ fun SongRow(
             Text(song.subtitle, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        if (playing) {
-            WaveIndicator(barCount = 4, playing = wavePlaying)
-        } else if (selected) {
-            Text("已选", fontSize = 12.sp, color = auroraAccentColor(), fontWeight = FontWeight.Medium)
-        } else if (onRemoveClick != null) {
-            // P3-74：onRemoveClick 优先（队列行不需要菜单，只要移除——与 KDoc 承诺一致，
-            // 队列行同时误传两个回调时不再被"更多"按钮抢先占位）
-            Box(
-                Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable(interactionSource = actionInteractionSource, indication = null, onClick = onRemoveClick)
-                    .semantics { contentDescription = "从队列移除" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(GlassIcons.MinusCircle, null, Modifier.size(16.dp),
-                    tint = LocalGlassColors.current.textFaint)
+        // A3-03：尾槽随播放/选中/操作态交叉淡化（tweenHover）——旧实现 if 硬换，
+        // 波形瞬现瞬消、时长文字与之硬替。targetState 收敛为槽位标识，
+        // 只有槽位变化才触发过渡（同一槽位内的参数变化走各自内部逻辑）
+        AnimatedContent(
+            targetState = when {
+                playing -> "wave"
+                selected -> "selected"
+                onRemoveClick != null -> "remove"
+                onMoreClick != null -> "more"
+                else -> "trailing"
+            },
+            transitionSpec = {
+                fadeIn(GlassMotion.tweenHover()) togetherWith fadeOut(GlassMotion.tweenHover())
+            },
+            label = "songRowTail",
+            contentAlignment = Alignment.CenterEnd,
+        ) { tail ->
+            when (tail) {
+                "wave" -> {
+                    WaveIndicator(barCount = 4, playing = wavePlaying)
+                }
+                "selected" -> {
+                    Text("已选", fontSize = 12.sp, color = auroraAccentColor(), fontWeight = FontWeight.Medium)
+                }
+                "remove" -> {
+                    Box(
+                        Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(R.Thumb10.dp))
+                            .clickable(
+                                interactionSource = actionInteractionSource,
+                                indication = null,
+                                onClick = onRemoveClick ?: {},
+                            )
+                            .semantics { contentDescription = "从队列移除" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(GlassIcons.MinusCircle, null, Modifier.size(16.dp),
+                            tint = LocalGlassColors.current.textTertiary)
+                    }
+                }
+                "more" -> {
+                    Box(
+                        Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(R.Thumb10.dp))
+                            .clickable(
+                                interactionSource = actionInteractionSource,
+                                indication = null,
+                                onClick = onMoreClick ?: {},
+                            )
+                            .semantics { contentDescription = "更多操作" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(GlassIcons.More, null, Modifier.size(16.dp),
+                            tint = LocalGlassColors.current.textTertiary)
+                    }
+                }
+                else -> {
+                    if (trailing != null) {
+                        Text(trailing, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary)
+                    }
+                }
             }
-        } else if (onMoreClick != null) {
-            // "更多"是独立触点：不再吞进整行的播放点击
-            Box(
-                Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable(interactionSource = actionInteractionSource, indication = null, onClick = onMoreClick)
-                    .semantics { contentDescription = "更多操作" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(GlassIcons.More, null, Modifier.size(16.dp),
-                    tint = LocalGlassColors.current.textFaint)
-            }
-        } else if (trailing != null) {
-            Text(trailing, fontSize = 12.sp, color = LocalGlassColors.current.textFaint)
         }
     }
 }
@@ -350,7 +392,7 @@ fun SettingRow(
     onClick: (() -> Unit)? = null,
     trailing: @Composable () -> Unit = {
         Icon(GlassIcons.ChevronRight, null, Modifier.size(16.dp),
-            tint = LocalGlassColors.current.textFaint)
+            tint = LocalGlassColors.current.textTertiary)
     },
 ) {
     val glass = LocalGlassColors.current
@@ -358,7 +400,17 @@ fun SettingRow(
     Row(
         modifier
             .fillMaxWidth()
-            .then(if (onClick != null) Modifier.clickable(interactionSource, indication = null, onClick = onClick) else Modifier)
+            // A2-08：有 onClick 时补按压回弹——旧实现 indication=null 且无 pressScale，
+            // 设置页全部行按下零反馈，与 SheetAction/SongRow 的玻璃按压语言断裂
+            .then(
+                if (onClick != null) {
+                    Modifier
+                        .pressScale(interactionSource, pressed = 0.98f)
+                        .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+                } else {
+                    Modifier
+                },
+            )
             .padding(horizontal = 16.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -366,16 +418,16 @@ fun SettingRow(
         Box(
             Modifier
                 .size(32.dp)
-                .clip(RoundedCornerShape(10.dp))
+                .clip(RoundedCornerShape(R.Thumb10.dp))
                 .background(glass.md),
             contentAlignment = Alignment.Center,
         ) {
             Icon(icon, null, Modifier.size(18.dp), tint = LocalGlassColors.current.textPrimary)
         }
         Column(Modifier.weight(1f)) {
-            Text(title, color = LocalGlassColors.current.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(title, color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(2.dp))
-            Text(subtitle, color = LocalGlassColors.current.textTertiary, fontSize = 11.5.sp)
+            Text(subtitle, color = LocalGlassColors.current.textTertiary, fontSize = 11.sp)
         }
         trailing()
     }

@@ -17,9 +17,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -31,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.auroraAccentColor
 
 /**
@@ -58,7 +62,7 @@ fun GlassTextField(
     GlassSurface(
         modifier = modifier.fillMaxWidth().height(44.dp),
         level = GlassLevel.Md,
-        shape = RoundedCornerShape(22.dp),
+        shape = RoundedCornerShape(R.Full),
     ) {
         Row(
             Modifier
@@ -78,7 +82,7 @@ fun GlassTextField(
                     value = value,
                     onValueChange = onValueChange,
                     singleLine = true,
-                    textStyle = TextStyle(color = LocalGlassColors.current.textPrimary, fontSize = 14.sp),
+                    textStyle = TextStyle(color = LocalGlassColors.current.textPrimary, fontSize = 15.sp),
                     // 光标强调色用 auroraAccentColor()（浅色回退 seed）：seed3 过浅在浅色下近不可见
                     cursorBrush = SolidColor(auroraAccentColor()),
                     keyboardOptions = KeyboardOptions(imeAction = imeAction), // P3-76：不再硬编码 Search
@@ -90,12 +94,20 @@ fun GlassTextField(
                     // hint 首字上（旧实现两者叠在同一个 Box，光标恒画在文本层之上）
                     decorationBox = { innerTextField ->
                         Box(contentAlignment = Alignment.CenterStart) {
-                            if (value.isEmpty() && hint.isNotEmpty()) {
+                            // A3-05：hint 随输入淡出/清空淡入（tweenHover）——旧实现 if 硬切，
+                            // Material3 占位符自带 fade 而此处没有
+                            val hintAlpha by androidx.compose.animation.core.animateFloatAsState(
+                                targetValue = if (value.isEmpty()) 1f else 0f,
+                                animationSpec = com.local.music.core.ui.theme.GlassMotion.tweenHover(),
+                                label = "hintAlpha",
+                            )
+                            if (hintAlpha > 0f && hint.isNotEmpty()) {
                                 Text(
                                     hint,
                                     color = LocalGlassColors.current.textSecondary,
-                                    fontSize = 14.sp,
+                                    fontSize = 15.sp,
                                     maxLines = 1,
+                                    modifier = Modifier.graphicsLayer { alpha = hintAlpha },
                                 )
                             }
                             innerTextField()

@@ -19,8 +19,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.util.lerp
 import com.local.music.core.ui.theme.LocalAuroraPalette
-import com.local.music.core.ui.theme.LocalIsDark
+import com.local.music.core.ui.theme.LocalThemeFraction
 
 /** CSS ease-in-out 曲线（cubic-bezier(0.42, 0, 0.58, 1)） */
 private val CssEaseInOut = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
@@ -43,8 +44,11 @@ private val CssEaseInOut = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
 @Composable
 fun AuroraBackground(modifier: Modifier = Modifier) {
     val palette = LocalAuroraPalette.current
-    // 明暗策略跟随主题标记（带滞回），不用动画中的颜色判亮度——过渡中途混合模式会翻转
-    val isLight = !LocalIsDark.current
+    // A1-03：明暗连续值（0=深色端 1=浅色端）。旧实现按 LocalIsDark 阈值布尔取 blend/暗角，
+    // 主题 400ms 渐变中点 Screen↔Multiply 硬切、暗角 0.35↔0.10 跳变——「带滞回」只能防抖，
+    // 防不了渐变中点的突跳。深浅两端语义不变：0f=深色（Screen 提亮、暗角 35%），1f=浅色
+    val themeFraction = LocalThemeFraction.current
+    val isLight = themeFraction >= 1f
 
     val transition = rememberInfiniteTransition(label = "aurora")
     // CSS ease-in-out = cubic-bezier(0.42, 0, 0.58, 1)；alternate 往返
@@ -73,9 +77,9 @@ fun AuroraBackground(modifier: Modifier = Modifier) {
                 end = Offset(w * 0.85f, h),
             )
             // 底部径向暗角：radial-gradient(80% 50% at 50% 110%, 黑35%, transparent 70%)；
-            // 浅色模式收敛为轻影
+            // 深浅按主题进度连续插值（A1-03）：0.35（深）→ 0.10（浅），不再中点跳变
             val vignetteBrush = Brush.radialGradient(
-                0f to Color.Black.copy(alpha = if (isLight) 0.10f else 0.35f),
+                0f to Color.Black.copy(alpha = lerp(0.35f, 0.10f, themeFraction)),
                 0.7f to Color.Transparent,
                 1f to Color.Transparent,
                 center = Offset(w / 2f, h * 1.1f),
@@ -94,6 +98,9 @@ fun AuroraBackground(modifier: Modifier = Modifier) {
             val seedBrush = blobBrush(palette.seed)
             val seed2Brush = blobBrush(palette.seed2)
             val blend = if (isLight) BlendMode.Multiply else BlendMode.Screen
+            // A1-03：主题过渡期（0<fraction<1）双 pass 交叉混合——Screen 按 (1-f) 加权 +
+            // Multiply 按 f 加权，混合模式随进度连续过渡；稳态（f=0/1）单 pass 零额外开销
+            val blendTransitioning = themeFraction > 0.01f && themeFraction < 0.99f
 
             // 固定几何（px）：半径基准与 CSS 定位偏移
             val r1 = px(170)
@@ -116,14 +123,26 @@ fun AuroraBackground(modifier: Modifier = Modifier) {
                 drawRect(baseBrush)
 
                 // 光源：径向渐变的柔边圆近似 46px 高斯模糊；深色 Screen 提亮、浅色 Multiply 染色。
-                // 圆心/半径每帧变 → 由画布变换表达，Brush 仍是上面缓存的单位空间对象
+                // 圆心/半径每帧变 → 由画布变换表达，Brush 仍是上面缓存的单位空间对象。
+                // 主题过渡期双 pass：Screen×(1-f) 与 Multiply×f 叠加，混合模式随进度连续变化
                 fun blob(brush: Brush, center: Offset, radiusPx: Float) {
                     withTransform({
                         translate(center.x, center.y)
                         scale(radiusPx, radiusPx, pivot = Offset.Zero)
                     }) {
                         // 单位圆 × 变换 = 直径 2r 的圆；brush 的 radius=1 同步放大成 r
-                        drawCircle(brush = brush, radius = 1f, center = Offset.Zero, blendMode = blend)
+                        if (blendTransitioning) {
+                            drawCircle(
+                                brush = brush, radius = 1f, center = Offset.Zero,
+                                blendMode = BlendMode.Screen, alpha = 1f - themeFraction,
+                            )
+                            drawCircle(
+                                brush = brush, radius = 1f, center = Offset.Zero,
+                                blendMode = BlendMode.Multiply, alpha = themeFraction,
+                            )
+                        } else {
+                            drawCircle(brush = brush, radius = 1f, center = Offset.Zero, blendMode = blend)
+                        }
                     }
                 }
 

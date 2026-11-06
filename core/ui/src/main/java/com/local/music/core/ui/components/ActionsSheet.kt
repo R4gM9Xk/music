@@ -37,6 +37,7 @@ import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.songFormatText
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.auroraAccentColor
 
 /**
@@ -171,23 +172,23 @@ private fun PlaylistPickRow(playlist: DemoPlaylist, added: Boolean, onClick: () 
     Row(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(R.Card14.dp))
             .pressScale(interactionSource, pressed = 0.98f)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
             .padding(horizontal = 6.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        ArtThumb(playlist.art, Modifier.size(40.dp), RoundedCornerShape(10.dp), bordered = true)
+        ArtThumb(playlist.art, Modifier.size(40.dp), RoundedCornerShape(R.Thumb10.dp), bordered = true)
         Column(Modifier.weight(1f)) {
             Text(
                 playlist.title, color = LocalGlassColors.current.textPrimary, fontSize = 15.sp,
                 fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
-            Text(playlist.meta, color = LocalGlassColors.current.textTertiary, fontSize = 11.5.sp)
+            Text(playlist.meta, color = LocalGlassColors.current.textTertiary, fontSize = 11.sp)
         }
         if (added) {
-            Text("已添加", color = LocalGlassColors.current.textFaint, fontSize = 11.5.sp)
+            Text("已添加", color = LocalGlassColors.current.textTertiary, fontSize = 11.sp)
         }
     }
 }
@@ -221,8 +222,8 @@ private fun InfoRow(label: String, value: String) {
         Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(label, color = LocalGlassColors.current.textTertiary, fontSize = 13.sp, modifier = Modifier.width(72.dp))
-        Text(value, color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        Text(label, color = LocalGlassColors.current.textTertiary, fontSize = 13.sp, lineHeight = 18.sp, modifier = Modifier.width(72.dp))
+        Text(value, color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, lineHeight = 18.sp, modifier = Modifier.weight(1f))
     }
 }
 
@@ -372,6 +373,7 @@ fun CollectionActionsSheet(
             "「$title」将从歌单列表移除，歌单内的 ${tracks.size} 首曲目关系一并清除，此操作不可撤销。",
             color = LocalGlassColors.current.textSecondary,
             fontSize = 13.sp,
+            lineHeight = 18.sp, // GlassType.LHBody：body 13sp 多行段落 1.38×
             modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
         )
         Spacer(Modifier.height(4.dp))
@@ -437,13 +439,14 @@ fun AddSongsSheet(
             onValueChange = { query = it },
             hint = "搜索歌曲或艺术家",
         )
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(12.dp))
         if (songs.isEmpty()) {
             // 空态：曲库未装载 / 搜索无结果
             Box(Modifier.fillMaxWidth().height(120.dp), contentAlignment = Alignment.Center) {
                 Text(
                     if (query.isBlank()) "曲库还没有歌曲" else "没有匹配「${query.trim()}」的歌曲",
                     color = LocalGlassColors.current.textTertiary, fontSize = 13.sp,
+                    lineHeight = 18.sp, // GlassType.LHBody
                 )
             }
         } else {
@@ -466,7 +469,7 @@ fun AddSongsSheet(
                 }
             }
         }
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(12.dp))
         SheetAction(
             icon = GlassIcons.Plus,
             label = "添加 ${selected.size} 首",

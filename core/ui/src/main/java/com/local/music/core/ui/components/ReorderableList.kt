@@ -1,6 +1,5 @@
 package com.local.music.core.ui.components
 
-import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -72,7 +71,6 @@ fun ReorderableColumn(
     var touchInRow by remember { mutableFloatStateOf(0f) }
     var scrollStart by remember { mutableFloatStateOf(0f) }
     var listTopInContent by remember { mutableFloatStateOf(0f) }
-    var contentHeightPx by remember { mutableIntStateOf(0) }
 
     // 拖拽起点时的 dataVersion 快照：松手提交前与实时值比对，变了就放弃本次提交。
     // 手势协程的重启（pointerInput key 含 dataVersion）与状态更新在极端时序下可能让
@@ -170,7 +168,6 @@ fun ReorderableColumn(
     Column(
         modifier.onGloballyPositioned {
             listTopInContent = it.positionInParent().y
-            contentHeightPx = it.size.height
         },
     ) {
         repeat(count) { index ->
@@ -188,8 +185,10 @@ fun ReorderableColumn(
                 }
                 val rowShift by animateFloatAsState(
                     targetValue = shift,
-                    // 让位补间随动效强度档位缩放（旧实现硬编码 150ms，设置页的「克制/增强」对它无效）
-                    animationSpec = tween((150 * GlassMotion.scale).toInt().coerceAtLeast(1)),
+                    // 让位补间随动效强度档位缩放（旧实现硬编码 150ms，设置页的「克制/增强」对它无效）；
+                    // A2-05：曲线统一 GlassMotion.Curve——旧实现漏 easing 落到默认 FastOutSlowIn，
+                    // 与全 App「唯一缓动曲线」的约束不符
+                    animationSpec = tween((150 * GlassMotion.scale).toInt().coerceAtLeast(1), easing = GlassMotion.Curve),
                     label = "reorderShift$index",
                 )
                 Box(
@@ -277,13 +276,13 @@ fun ReorderableColumn(
                                             scope.launch {
                                                 // 手写帧循环而非 Animatable(tween)：Animatable.snapTo
                                                 // 是挂起函数，初值写入与 settleRow 无法保证同帧；
-                                                // 缓动取 FastOutSlowIn（tween 的默认曲线）与邻居让位一致
+                                                // 缓动与邻居让位同曲线（A2-05：GlassMotion.Curve，全 App 唯一缓动）
                                                 val t0 = withFrameNanos { it }
                                                 while (settleGen == gen && settleRow >= 0) {
                                                     val now = withFrameNanos { it }
                                                     val fraction =
                                                         ((now - t0) / 1_000_000f / SETTLE_MS()).coerceIn(0f, 1f)
-                                                    val eased = FastOutSlowInEasing.transform(fraction)
+                                                    val eased = GlassMotion.Curve.transform(fraction)
                                                     settleValue = settleFrom * (1f - eased)
                                                     if (fraction >= 1f) {
                                                         settleRow = -1

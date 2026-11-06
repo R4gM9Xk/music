@@ -1,4 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 暴露路径：应用内更新包（filesDir/update/app-update.apk）。
+
+  注意：**不要**为了媒体会话封面把 covers/ 加进来。改动前试过用
+  content://<pkg>.fileprovider/covers/... 替代私有 file:// 路径下发 artworkUri，
+  实测系统侧直接拒绝：
+    Permission Denial: opening provider androidx.core.content.FileProvider
+      from ProcessRecord{... :com.android.systemui ...} that is not exported from UID ...
+  MediaMetadata 里的 uri 是纯数据，media3 转发时不带（也无法带）FLAG_GRANT_READ_URI_PERMISSION，
+  而 provider 改成 exported 等于把封面目录对整个系统开放。封面改走「内嵌小 JPEG」
+  （CoverArtBitmap），见该文件注释。
+-->
 <paths>
     <files-path name="update" path="update/" />
 </paths>

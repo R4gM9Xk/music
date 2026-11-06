@@ -3,7 +3,6 @@ package com.local.music.player
 import android.content.Intent
 import android.app.PendingIntent
 import android.media.audiofx.Equalizer
-import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import androidx.media3.common.AudioAttributes
@@ -167,7 +166,7 @@ class MusicPlaybackService : MediaSessionService() {
                             if (specs != null) {
                                 insertWithShuffleFix(
                                     args.getInt(KEY_INDEX, 0),
-                                    specs.map { it.toMediaItem() },
+                                    specs.map { it.toMediaItem() }.withArtwork(specs, 0),
                                     args.getString(KEY_PIN_MODE, PIN_NEXT) == PIN_LAST,
                                 )
                             }
@@ -224,8 +223,8 @@ class MusicPlaybackService : MediaSessionService() {
     private fun buildResumptionState(): MediaSession.MediaItemsWithStartPosition? {
         val state = QueueStateStore.read(this) ?: return null
         if (state.specs.isEmpty()) return null
-        val items = state.specs.map { it.toMediaItem() }
-        val index = state.index.coerceIn(0, items.lastIndex)
+        val index = state.index.coerceIn(0, (state.specs.size - 1).coerceAtLeast(0))
+        val items = state.specs.map { it.toMediaItem() }.withArtwork(state.specs, index)
         val positionMs = (state.positionSec * 1000f).toLong().coerceAtLeast(0L)
         return MediaSession.MediaItemsWithStartPosition(items, index, positionMs)
     }
@@ -255,6 +254,17 @@ class MusicPlaybackService : MediaSessionService() {
         exo.setShuffleOrder(ShuffleOrder.DefaultShuffleOrder(sequence.toIntArray(), System.nanoTime()))
     }
 
+    /**
+     * 构造 MediaItem。**刻意不下发 artworkUri**（F2）：
+     * 它指向应用私有 cache 的 file:// 路径，系统进程读不到——真机稳定刷
+     * `EACCES: .../Android/data/&lt;pkg&gt;/cache/covers/ 下的 png`、模拟器刷 ENOENT，
+     * 每次切歌都刷一片。控制中心/锁屏之所以看着正常，是因为它们走通知的 bitmap 通道
+     * （media3 在**本进程内**解码），与 metadata 那条无关；真正拿不到封面的是
+     * 车载 / 手表 / 第三方「正在播放」面板这类只读 metadata 的下游。
+     *
+     * 封面改由 [withArtwork] 内嵌小 JPEG，原因见 CoverArtBitmap 类注释
+     * （content:// 走不通：metadata 是纯数据，带不了 grant flag，实测 SecurityException）。
+     */
     private fun SongSpec.toMediaItem(): MediaItem =
         MediaItem.Builder()
             .setMediaId(id)
@@ -264,10 +274,46 @@ class MusicPlaybackService : MediaSessionService() {
                     .setTitle(title)
                     .setArtist(artist)
                     .setAlbumTitle(album)
-                    .setArtworkUri(artworkUri?.let(Uri::parse))
                     .build(),
             )
             .build()
+
+    /**
+     * 给队首到当前曲附近的一小段内嵌封面（F2）。
+     *
+     * 为什么不整队内嵌：单张压到 ~5–15KB，千首队列仍会撞 Binder 的 1MB 事务上限，
+     * 届时 setMediaItems 整个失败、播放直接不可用——比没有封面严重得多。
+     * 系统面板/通知显示的永远是**当前曲**封面，所以只覆盖 [startIndex] 起的一段即可。
+     */
+    private fun List<MediaItem>.withArtwork(specs: List<SongSpec>, startIndex: Int): List<MediaItem> {
+        var budget = CoverArtBitmap.BUDGET_BYTES
+        val art = HashMap<String, ByteArray>()
+        val order = ((startIndex until specs.size) + (0 until startIndex))
+            .take(CoverArtBitmap.MAX_ATTEMPTS)
+        for (i in order) {
+            val spec = specs.getOrNull(i) ?: continue
+            if (art.containsKey(spec.id)) continue
+            val bytes = CoverArtBitmap.smallJpeg(this@MusicPlaybackService, spec.artworkUri) ?: continue
+            // **装不下就整轮停手，不能 continue**：写成 continue 时只要剩余预算还>0
+            // 却小于单张尺寸，退出条件就永不成立，会把队列剩下的每一首都完整解码+压缩
+            // 一遍再丢弃 —— 千首队列近千次无用解码（单张 8~20ms）。本函数由
+            // buildResumptionState / shuffle 插入命令在服务主线程调用，同样会卡住。
+            if (bytes.size > budget) break
+            budget -= bytes.size
+            art[spec.id] = bytes
+        }
+        if (art.isEmpty()) return this
+        return map { item ->
+            val bytes = art[item.mediaId] ?: return@map item
+            item.buildUpon()
+                .setMediaMetadata(
+                    item.mediaMetadata.buildUpon()
+                        .setArtworkData(bytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+                        .build(),
+                )
+                .build()
+        }
+    }
 
     /** 按预设名应用频段增益（5 段增益表 → 实际频段数线性重采样）；Off = 关闭音效 */
     private fun applyEqPreset(presetName: String?) {

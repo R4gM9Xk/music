@@ -1,6 +1,6 @@
 package com.local.music.player
 
-import android.net.Uri
+import android.content.Context
 import android.os.Bundle
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -20,7 +20,12 @@ import com.local.music.core.ui.state.SongSpec
  * 整条队列经 setMediaItems 下发（稳定 mediaId），循环 / 随机用播放器原生模式；
  * 全部调用异步转发，播放状态经 Player.Listener 回流 AppState。
  */
-class MediaControllerEngine(private val controller: MediaController) : PlayerEngine {
+class MediaControllerEngine(
+    private val controller: MediaController,
+    /** 封面解码用的 Context（`CoverArtBitmap.smallJpeg` 需读 externalCacheDir 下的封面文件）。
+     *  只在构造 MediaItem 时用，传 applicationContext 即可，不持有 Activity。 */
+    private val context: Context,
+) : PlayerEngine {
 
     override var onPlayingChanged: ((Boolean) -> Unit)? = null
     override var onFormatChanged: ((SongFormat?) -> Unit)? = null
@@ -119,10 +124,63 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
                     .setTitle(title)
                     .setArtist(artist)
                     .setAlbumTitle(album)
-                    .setArtworkUri(artworkUri?.let(Uri::parse))
+                    // **刻意不下发 artworkUri**（F2）：它指向应用私有 cache 的 file:// 路径，
+                    // 系统进程读不到（真机 EACCES / 模拟器 ENOENT，每次切歌刷屏）。
+                    // 封面改由 [withArtwork] 内嵌小 JPEG，见 CoverArtBitmap 类注释。
                     .build(),
             )
             .build()
+
+    /**
+     * 给队首到当前曲附近的一小段内嵌封面（F2）。
+     *
+     * 为什么内嵌而不是给 uri：私有 cache 的 file:// 系统进程读不到（EACCES），
+     * FileProvider content:// 也读不到（metadata 是纯数据，带不了 grant flag，实测
+     * SecurityException）。内嵌字节是唯一能真正到达系统进程的形式。
+     *
+     * 为什么按预算裁剪：单张压到 ~5–15KB，但千首队列 × 10KB 仍会撞 Binder 的 1MB
+     * 事务上限 —— 届时 setMediaItems 整个失败、播放直接不可用，比没有封面严重得多。
+     * 只给 [startIndex] 起的一小段：系统面板与通知显示的都是**当前曲**封面，
+     * 而当前曲在装载时必然落在这段窗口内。
+     *
+     * 从 startIndex 起而不是 0：从歌单/搜索结果进播放时当前曲可能在队列很靠后，
+     * 只从 0 开始会漏掉真正要显示的那首。
+     */
+    private fun List<MediaItem>.withArtwork(specs: List<SongSpec>, startIndex: Int): List<MediaItem> {
+        var budget = CoverArtBitmap.BUDGET_BYTES
+        val art = HashMap<String, ByteArray>()
+        // 优先级：当前曲 → 其后 → 其前（面板先显示当前曲，随后是「下一首」）。
+        // **必须封顶尝试次数**：预算只有 256KB（能装几十首），而队列可达上千首。
+        // 见下面 `if (bytes.size > budget) break` 的注释 —— 两者合起来才保证 O(容量) 而不是 O(队列)。
+        val order = ((startIndex until specs.size) + (0 until startIndex))
+            .take(CoverArtBitmap.MAX_ATTEMPTS)
+        for (i in order) {
+            val spec = specs.getOrNull(i) ?: continue
+            if (art.containsKey(spec.id)) continue
+            val bytes = CoverArtBitmap.smallJpeg(context, spec.artworkUri) ?: continue
+            // **装不下就整轮停手，不能 continue**：这是一个曾经踩过的性能坑 ——
+            // 写成 continue 时，只要剩余预算还大于 0 却小于单张尺寸，`budget <= 0` 的
+            // 退出条件就永远不成立，循环会把队列里**剩下的每一首**都完整解码 + JPEG 压缩
+            // 一遍再丢弃。千首队列 = 近千次无用解码（单张 8~20ms）→ 主线程阻塞十几秒，
+            // 而本函数由 loadQueue（AppState.startCurrent / prepareResume）在 UI 线程调用
+            // → ANR。bytes.size 随下标的推进不会再变小（都走同一套压缩档位），
+            // 所以「这一张装不下」等价于「后面同样装不下」，直接 break 无损。
+            if (bytes.size > budget) break
+            budget -= bytes.size
+            art[spec.id] = bytes
+        }
+        if (art.isEmpty()) return this
+        return map { item ->
+            val bytes = art[item.mediaId] ?: return@map item
+            item.buildUpon()
+                .setMediaMetadata(
+                    item.mediaMetadata.buildUpon()
+                        .setArtworkData(bytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+                        .build(),
+                )
+                .build()
+        }
+    }
 
     /**
      * 断连检测：MediaController.Listener 只能在 Builder 注册，而引擎拿到的是成品 controller，
@@ -144,11 +202,12 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
 
     /** 整条队列下发给服务端播放器：起始位置随 setMediaItems 原子下发（独立 seekTo 会在装载窗口被丢弃） */
     override fun loadQueue(specs: List<SongSpec>, startIndex: Int, startSec: Float, autoPlay: Boolean) {
-        val items = specs.map { it.toMediaItem() }
+        val idx = startIndex.coerceIn(0, (specs.size - 1).coerceAtLeast(0))
+        val items = specs.map { it.toMediaItem() }.withArtwork(specs, idx)
         val startPositionMs = if (startSec > 0f) (startSec * 1000).toLong() else C.TIME_UNSET
         controller.setMediaItems(
             items,
-            /* startIndex = */ startIndex.coerceIn(0, (items.size - 1).coerceAtLeast(0)),
+            /* startIndex = */ idx.coerceIn(0, (items.size - 1).coerceAtLeast(0)),
             /* startPositionMs = */ startPositionMs,
         )
         controller.prepare()
@@ -268,9 +327,10 @@ class MediaControllerEngine(private val controller: MediaController) : PlayerEng
                         )
                     },
                 )
-            }.onFailure { controller.addMediaItems(index, specs.map { it.toMediaItem() }) }
+            }.onFailure { controller.addMediaItems(index, specs.map { it.toMediaItem() }.withArtwork(specs, 0)) }
         } else {
-            controller.addMediaItems(index, specs.map { it.toMediaItem() })
+            // 追加插入：新项就是「下一首播放」的目标，自然可以带封面；预算取当前曲之后一段
+            controller.addMediaItems(index, specs.map { it.toMediaItem() }.withArtwork(specs, 0))
         }
     }
 

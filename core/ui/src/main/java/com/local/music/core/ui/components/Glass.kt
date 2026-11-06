@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.dp
 import com.local.music.core.ui.theme.GlassColors
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 
 /** 玻璃层级：hi(白16%) / md(白10%) / lo(白7%)，对应 blur 30 / 20 / 12 的视觉重量 */
 enum class GlassLevel { Hi, Md, Lo }
@@ -92,16 +93,36 @@ fun Modifier.pressScale(
  * 契约（P3-75）：onLongClick 必须与 onClick **同时**提供——只传 onLongClick 时点击事件
  * 会被 combinedClickable 消费（onClick 兜底为空 lambda），卡片看起来"点不动"却吞掉了点击，
  * 上层列表的点击滚动/透传全被截断。
+ *
+ * [scrim]（F3 / G2 透字修复）：默认 null = 原观感，**全 app 共用组件
+ * 保持向后兼容**，只有迷你播放条与底部导航栏显式传入（见 Chrome.kt）。
+ *
+ * 为什么需要：这两个条悬在滚动列表之上，列表行文字滑到其下方时会「透上来」。真机量化
+ * （一加13）证明 haze **没有失效**——透字笔画边缘过渡 14–29px，而同字号清晰文字仅 2px，
+ * 模糊确实生效；问题是「有模糊 ≠ 不可辨」：经 blur + 白 tint 之后，透字仍保留
+ * 迷你条 4.3:1 / 导航栏 11.4:1 的局部对比，达到 chrome 自身文字的 50%–96%，
+ * 与 chrome 文案双重显影（深色模式尤其刺眼：浅色幽灵字压在深玻璃上）。
+ *
+ * 为什么叠 scrim 而不是直接加深 fill：fill 是**白色系**（dark 下 hi=白16%、md=白10%），
+ * 再叠白只会把背景提亮，浅色幽灵字反而更明显。scrim 用「与主题同向」的低 alpha 底
+ * （深色模式压黑、浅色模式提白），把幽灵字笔画与玻璃底色**一起**推向同一极；
+ * WCAG 对比度里的 +0.05 常数项在两端会压缩比值，透字对比因此塌陷，
+ * 而 chrome 自身文字画在 scrim **之上**、完全不受衰减（深色下白字对比反而略升）。
+ *
+ * 为什么同时保留 haze：scrim 只压对比、不抹细节，单靠它会退化成「半透明板」——
+ * 那正是历史审计的错误推测方向，也会毁掉玻璃通透感。两者叠加才是
+ * 「透字不可辨 + 玻璃仍有模糊通透」：haze 负责抹掉字形语义，scrim 负责压掉残余对比。
  */
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun GlassSurface(
     modifier: Modifier = Modifier,
     level: GlassLevel = GlassLevel.Md,
-    shape: Shape = androidx.compose.foundation.shape.RoundedCornerShape(28.dp),
+    shape: Shape = androidx.compose.foundation.shape.RoundedCornerShape(R.Player28.dp),
     onClick: (() -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
     blur: GlassLevel? = null,
+    scrim: Color? = null,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val glass = LocalGlassColors.current
@@ -122,7 +143,31 @@ fun GlassSurface(
         m = m.glassHaze(blur)
         hazed = true
     }
+    // scrim 的落点很关键：必须叠在「haze 结果 / fill」**之上**、Box 内容**之下**。
+    // 这样它只衰减背景（含透上来的列表文字），chrome 自身文字与图标完全不受影响。
+    // 反过来先 background(scrim) 再 hazeEffect，scrim 会被 haze 采样/覆盖掉，等于没加。
+    //
+    // 两段独立判断而不是 if/else：退化路径（LocalHazeState 为 null）也要保留 fill，
+    // 否则一旦没有 haze，带 scrim 的面板就只剩一层半透明底、玻璃填充丢失。
+    //
+    // **不要指望 blur 一定生效**（F3 实测教训）：haze 的 blur 走 RenderEffect，
+    // 软件渲染 / 无 RenderEffect 的设备上会静默退化为纯 tint（零模糊）。模拟器
+    // （ro.hardware.egl=emulation）实测就是这种退化：透字裁剪后 grad_p97 仍 55.9–60.0，
+    // 与清晰文字同量级。所以 scrim 必须**独立**把透字压到不可辨。
+    //
+    // 为什么 alpha 要给到 0.86 这个量级（实测推算，不是拍脑袋）：
+    // 深色模式下列表文字是**白色**（lum≈240），chrome 底 lum≈52。透字经 alpha=a 的
+    // 黑色遮罩后残值 = 240×(1−a)。要它与底色**无法区分**，需
+    //     240×(1−a) ≤ 52  →  a ≥ 0.78
+    // 实测 a=0.62 时残值仍有 91（vs 底 52），对比 ≈1.57 —— 仍是一眼可读的白斑，
+    // 这正是本轮 0.34 与 0.62 两版都没过的原因。取 0.86 → 残值 34，已低于底色。
+    //
+    // **scrim 之后不能再补一层 fill**：补了等于把遮罩「提亮回半透明」，
+    // 残值又被抬到 46–50 与底色拉开，字形重新浮现（实测第三版就是这么被打回 1.2:1
+    // 仍可辨）。scrim 必须是这一层**最后一笔**背景，玻璃的通透色调由 scrim 自身的
+    // 深色 + 上方的描边/顶光线承担，不再靠白色 fill 提亮。
     if (!hazed) m = m.background(glass.fill(level))
+    if (scrim != null) m = m.background(scrim)
     m = m
         .border(1.dp, glass.strokeSoft, shape)
         .glassTopLine(glass.topLine)

@@ -18,6 +18,10 @@ val LocalHazeState = compositionLocalOf<HazeState?> { null }
 /**
  * 玻璃面板挂接背景真模糊（haze 1.6）：读取 [LocalHazeState]，无状态时退化为普通玻璃。
  * blur 半径按玻璃层级 26/20/12dp（对齐设计稿 blur 30/20/12 的视觉重量），tint 复用玻璃填充色。
+ *
+ * （曾经试过给 chrome 层加「磨砂加重系数」，后来撤掉了：scrim alpha 到 0.80 之后，
+ * 模糊结果对最终像素的可见贡献只剩 20%，加大半径肉眼不可辨，只是白烧 GPU。
+ * 真正的可读性保障在 [com.local.music.core.ui.theme.GlassColors.chromeScrim]。）
  */
 @Composable
 fun Modifier.glassHaze(level: GlassLevel): Modifier {

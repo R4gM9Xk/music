@@ -81,6 +81,24 @@ class PlayerFlight(private val scope: CoroutineScope) {
     var started by mutableStateOf(false)
         private set
 
+    /**
+     * 退出起飞的 snap 尚未落地（见 [beginExit]）。snapTo 是 suspend、在协程首帧才生效，
+     * 而被中止的飞行会把 t 残留在任意中间值——落地前的头一两帧里，替身几何若照读 raw t
+     * 会画在半途位置再瞬移到播放页端。此标记为 true 期间 [displayT] 强制返回 1，
+     * 与「等待期强制 0」构成进出两个方向对称的首帧防线。
+     */
+    var exitSnapPending by mutableStateOf(false)
+        private set
+
+    /**
+     * 下层后退层缩放注入点（GlassApp 持有 recede 动画值）。播放页盖在 tab 页上时，
+     * Chrome 仍组合在 0.96 后退层里，其 trackFlight 注册的是**缩放后**的 root 坐标；
+     * 而 [beginExit] 的飞行落点必须对齐接管瞬间（recede 已归零）的真身——
+     * 据此把缩放空间量到的迷你条端点还原成未缩放几何。Chrome 不在组合中
+     * （详情/搜索来源）时端点本就是未缩放的冻结值，provider 应返回 1。
+     */
+    var backingScaleProvider: () -> Float = { 1f }
+
     /** 起飞瞬间的歌曲快照：飞行中切歌不换图 */
     var songSnapshot by mutableStateOf<DemoSong?>(null)
         private set
@@ -115,31 +133,75 @@ class PlayerFlight(private val scope: CoroutineScope) {
 
     val isActive: Boolean get() = phase != Phase.Idle
 
+    /**
+     * 飞行几何/样式的显示 t：**仅限布局期/绘制期 lambda 调用**（每帧变化，组合期读会逐帧重组）。
+     * - 进入等待期强制 0：替身原地按迷你条形态绘制（起飞前样式不被残留 t 污染）
+     * - 退出 snap 未落地强制 1：替身第一帧就落在播放页端几何（残 t 不再把首帧画在半途）
+     * 全部 alpha 公式与替身层共用本函数，保证同一帧内几何与透明度读的是同一个 t。
+     */
+    fun displayT(): Float = when {
+        phase == Phase.Entering && !started -> 0f
+        phase == Phase.Exiting && exitSnapPending -> 1f
+        else -> t.value
+    }
+
     /** 非共享组（图中没有的按键等）：原地由虚到实；Idle 时必须全显（t 停在 0/1 不代表开合度） */
     fun softAlpha(): Float = when (phase) {
         Phase.Idle -> 1f
-        else -> ((t.value - 0.15f) / 0.85f).coerceIn(0f, 1f)
+        else -> ((displayT() - 0.15f) / 0.85f).coerceIn(0f, 1f)
     }
 
-    /** 播放页共享真身：进入飞行期让位替身（等待期即隐身），收尾 12% 交叉淡入；退出等待期仍可见 */
+    /**
+     * 播放页共享真身（大封面 / 控制台根层）：进入飞行期让位替身（等待期即隐身），收尾 12% 交叉淡入；
+     * 退出**起飞端按时间等效窗口渐出**——旧实现直接回 0，真实控制台（含非共享的心形/进度/时间/
+     * 随机/上一首/循环）在点收起的那一帧整块消失、副标题瞬间被替身的短文本换掉（录屏帧 132→133 实证）。
+     * 窗口取路径 50% 而非对称的 12%：飞行缓动起步快、收尾慢，12% 路径在起飞端只相当于 ~28ms
+     * （依旧近似硬切），50% 才等效于进场端 12% 慢尾巴的 ~165ms 手感；替身按互补曲线渐入（见 Overlay）。
+     */
     fun playerSharedAlpha(): Float = when {
         phase == Phase.Idle -> 1f
-        phase == Phase.Entering -> if (!started) 0f else ((t.value - 0.88f) / 0.12f).coerceIn(0f, 1f)
-        else -> if (started) 0f else 1f
+        phase == Phase.Entering -> if (!started) 0f else ((displayT() - 0.88f) / 0.12f).coerceIn(0f, 1f)
+        else -> ((displayT() - 0.5f) / 0.5f).coerceIn(0f, 1f)
+    }
+
+    /**
+     * 播放页控制台**共享子元素**（歌名/歌者/播放/下一首）的透明度：进入期与 [playerSharedAlpha]
+     * 同窗渐入；退出期恒 1——真身控制台根层已按 12% 窗渐出，子元素若再乘同一系数会平方衰减
+     * （中点 0.25），与替身交叉淡化时亮度凹陷加深，交给根层一层曲线即可。
+     */
+    fun playerSharedInnerAlpha(): Float = when {
+        phase == Phase.Entering && started -> ((displayT() - 0.88f) / 0.12f).coerceIn(0f, 1f)
+        else -> 1f
     }
 
     /** 迷你条共享真身：进入期 Chrome 已卸载（不参与）；退出期最后 12% 淡入接位 */
     fun miniSharedAlpha(): Float = when {
         phase == Phase.Idle -> 1f
         phase == Phase.Entering -> 0f
-        else -> if (!started) 0f else ((0.12f - t.value) / 0.12f).coerceIn(0f, 1f)
+        else -> if (!started) 0f else ((0.12f - displayT()) / 0.12f).coerceIn(0f, 1f)
     }
 
     /** 导航胶囊：进入期由覆盖层替身负责（Chrome 已卸载）；退出期与迷你条真身同窗淡入接位 */
     fun navAlpha(): Float = when (phase) {
         Phase.Idle -> 1f
-        Phase.Entering -> 1f - t.value
-        else -> ((0.12f - t.value) / 0.12f).coerceIn(0f, 1f)
+        Phase.Entering -> 1f - displayT()
+        else -> ((0.12f - displayT()) / 0.12f).coerceIn(0f, 1f)
+    }
+
+    /**
+     * 下层内容在飞行期的透明度：进入 1→0（来源页让位给飞行替身），退出 0→1（先于播放页落定）。
+     *
+     * 为什么需要：播放页改为**覆盖层**后，下层恒渲染 playerOrigin 且不换屏 ——
+     * 旧结构靠 AnimatedContent 的 `fadeOut(tweenFlight)` 让来源页在飞行期淡出，
+     * 新结构没有换屏就不会触发。若不补这条曲线，飞行替身会一直画在**全不透明的来源页**
+     * 之上，收尾播放页变不透明时整屏内容一次性硬切。
+     *
+     * 退出段的 /0.6 对齐旧结构「库页以 0.6×Flight 时长淡入接管」的口径。
+     */
+    fun baseContentAlpha(): Float = when (phase) {
+        Phase.Idle -> 1f
+        Phase.Entering -> (1f - displayT()).coerceIn(0f, 1f)
+        else -> ((1f - displayT()) / 0.6f).coerceIn(0f, 1f)
     }
 
     /**
@@ -174,19 +236,10 @@ class PlayerFlight(private val scope: CoroutineScope) {
         snapshot = mini
         navigate(GlassScreen.Player)
         entryJob = scope.launch {
-            if (awaitRects(FlightKeys.playerKeys) == null) {
-                // 对端 rect 超时未到：放弃飞行，播放页已按通用过渡呈现
-                if (gen != generation) return@launch // 已被中止/被新飞行接管：不碰状态
-                phase = Phase.Idle
-                entryShowCover = false // 中止不得残留封面模式，否则歌词偏好被卡住
-                songSnapshot = null
-                snapshot = null
-                started = false
-                return@launch
-            }
-            if (gen != generation) return@launch
             // 几何闸门：等播放页根布局达到全屏（Chrome 卸载与 AnimatedContent 首帧测量存在竞态，
-            // 中间态会出现半高控制台/零矩形），就绪后**重新快照**（等待期间 rect 已更新）
+            // 中间态会出现半高控制台/零矩形），就绪后**重新快照**（等待期间 rect 已更新）。
+            // 旧实现在闸门前还有一次 awaitRects——它只兜「rects 永不到齐」的超时中止，而其后
+            // 的 awaitRects(600ms) 覆盖同一情形，平白让替身多静止 ~2 帧（主观「点了没反应」）。
             val settled = withTimeoutOrNull(600) {
                 while (true) {
                     val app = rects[FlightKeys.AppRoot]
@@ -257,6 +310,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
             songSnapshot = null
             snapshot = null
             started = false
+            exitSnapPending = false
             entrySource = null
             navigate(target)
             return
@@ -276,8 +330,15 @@ class PlayerFlight(private val scope: CoroutineScope) {
         }
         songSnapshot = song
         phase = Phase.Exiting
-        snapshot = player + mini
+        // 迷你条端点还原：Chrome 在播放页打开期间组合在 0.96 后退层内（tab 来源时），
+        // rects 注册的是缩放后几何；飞行落点必须对齐接管瞬间（recede 已归零）的真身。
+        // 旧实现直接用缩放坐标当端点，落地替身比真身小 ~4%、高 ~10dp——收尾交叉淡入
+        // 时两套几何叠画，迷你条「落地前最后一瞬还在缩小」。
+        snapshot = player + unscaleMini(mini)
         started = true
+        // snapTo(1f) 在协程首帧才生效（与 beginEntry 的 snapTo(0) 同一时序盲区）：
+        // 落地前替身几何强制按 t=1 绘制，防中止残留的中间 t 把退出首帧画在半途
+        exitSnapPending = true
         // **entryShowCover 不能在起飞时清**（P2-⑤ 回归的根因）：
         // 它决定 PlayerScreen 的 showLyrics，而 showLyrics 驱动 modeT ——
         // 若在这里同步清掉，PlayerScreen 下一帧重组就会看到 showLyrics 由 false 翻 true，
@@ -290,6 +351,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
         val gen = ++generation
         exitJob = scope.launch {
             t.snapTo(1f)
+            exitSnapPending = false // snap 落地：替身几何恢复读真实 t
             val flip = launch {
                 snapshotFlow { t.value }.first { it <= 0.15f }
                 // 代际校验：飞行已被中止时不得翻页（否则把用户从新页面拽回曲库）
@@ -325,6 +387,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
         songSnapshot = null
         snapshot = null
         started = false
+        exitSnapPending = false
         entrySource = null
     }
 
@@ -349,6 +412,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
             songSnapshot = null
             snapshot = null
             started = false
+            exitSnapPending = false
             entrySource = null
             // t 复位需 suspend：放到协程里，不阻塞尺寸变化回调。
             // **代际守卫**：若复位队列期间用户立刻发起新的飞行（beginExit 要 t=1），
@@ -372,6 +436,27 @@ class PlayerFlight(private val scope: CoroutineScope) {
     private fun rectsSnapshot(keys: List<String>): Map<String, Rect>? =
         keys.mapNotNull { k -> rects[k]?.let { k to it } }.toMap()
             .takeIf { it.size == keys.size }
+
+    /**
+     * 把缩放空间量到的迷你条端点还原成未缩放几何（[beginExit] 落点对齐接管瞬间真身）。
+     * 后退层的缩放以上一层中心为轴（graphicsLayer 默认 Center pivot），反向变换即
+     * 各边坐标按同一中心除以 scale；端点本就未缩放时 provider 返回 1，原样返回。
+     */
+    private fun unscaleMini(mini: Map<String, Rect>): Map<String, Rect> {
+        val scale = backingScaleProvider()
+        if (scale == 1f || scale <= 0f) return mini
+        val root = rects[FlightKeys.AppRoot] ?: return mini
+        val cx = root.center.x
+        val cy = root.center.y
+        val out = HashMap<String, Rect>(mini.size)
+        mini.forEach { (key, r) ->
+            out[key] = Rect(
+                cx + (r.left - cx) / scale, cy + (r.top - cy) / scale,
+                cx + (r.right - cx) / scale, cy + (r.bottom - cy) / scale,
+            )
+        }
+        return out
+    }
 
     /** 等一组 rect 全部注册**且连续两帧一致**（首帧布局可能仍是旧几何，如 Chrome 卸载前的压缩框）；
      *  超时放弃飞行走兜底切屏 */

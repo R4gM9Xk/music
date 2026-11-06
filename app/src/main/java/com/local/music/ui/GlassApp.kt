@@ -13,14 +13,17 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -46,6 +49,9 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
@@ -56,6 +62,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.util.lerp
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
@@ -79,9 +86,12 @@ import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.ThemeMode
 import com.local.music.core.ui.theme.GlassMotion
+import com.local.music.core.ui.theme.LibraryOrigin
+import com.local.music.core.ui.theme.LocalLibraryOrigin
 import com.local.music.core.ui.theme.GlassTheme
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.MotionIntensity
+import com.local.music.core.ui.theme.R
 import com.local.music.feature.library.screen.LibraryScreen
 import com.local.music.feature.player.screen.PlayerScreen
 import com.local.music.feature.playlist.screen.PlaylistDetailScreen
@@ -118,9 +128,24 @@ import kotlinx.coroutines.withContext
 @Composable
 fun GlassApp() {
     val context = LocalContext.current
-    val state = remember { AppState() }
+    // 导航态跨 Activity 重建保活（P2-26）。
+    //
+    // 为什么不用 AppState 的 DataStore 快照：那是**跨进程持久化**，重启应用后回到上次那一页
+    // 反而是骚扰；而纯 remember 又撑不过重建。中间这层「只活在本次任务栈」的状态正是
+    // rememberSaveable 的语义。真机症状：在播放页改系统字号（fontScale 不在 manifest 的
+    // configChanges 里 → 必重建）→ 被弹回曲库首页，正在看的详情/搜索词一并丢失。
+    //
+    // 顺序**必须**是「先取回 savable，再造 AppState」：还原要在构造时同步做完，
+    // 不能放进 LaunchedEffect —— 下面还有一条 effect 会在每次导航变化时把当前值写回
+    // savedNav，两者同帧竞争时谁先跑取决于声明顺序，写回先跑就把待还原的值冲掉了。
+    // 首次组合 savedNav 为 null（无还原），重建后才有值。
+    val savedNav = rememberSaveable { mutableStateOf<List<String>?>(null) }
+    val state = remember {
+        AppState().also { s -> savedNav.value?.let { s.restoreNavigationState(it) } }
+    }
     val scope = rememberCoroutineScope()
     val store = remember { SettingsStore(context) }
+
     // 播放现场写盘串行器（C4）：单线程 + 后写覆盖先写，避免 tick 高频写乱序
     val queueStateExecutor = remember {
         java.util.concurrent.Executors.newSingleThreadExecutor { r ->
@@ -361,6 +386,13 @@ fun GlassApp() {
             .drop(1)
             .collect { state.scheduleSave() }
     }
+    // 导航态 → rememberSaveable（P2-26）。只在导航四项真的变化时重跑：
+    // 阅读这四个 state 就会建立快照订阅，其余状态（进度/播放态每 100ms 变）不会触发。
+    // 写回自身这一份是纯值拷贝，不反写 AppState，因此不存在回环。
+    LaunchedEffect(state.screen, state.detail, state.detailReturn, state.playerOrigin) {
+        val nav = state.navigationState()
+        if (savedNav.value != nav) savedNav.value = nav
+    }
     // 退后台立即落盘：防抖 500ms 窗口内进程被杀会丢最近一次修改；
     // 回前台刷新所有文件访问态——用户在系统页授权后回来时自动重扫曲库拾取歌词
     val activity = context as? ComponentActivity
@@ -479,7 +511,7 @@ fun GlassApp() {
             {
                 val controller = runCatching { future.get() }.getOrNull()
                 if (controller != null) {
-                    state.attachPlayer(MediaControllerEngine(controller))
+                    state.attachPlayer(MediaControllerEngine(controller, context.applicationContext))
                 } else {
                     state.reportEngineFailure("播放服务连接失败，无法播放本地音频")
                 }
@@ -624,7 +656,9 @@ fun GlassApp() {
         when {
             modalState.isOpen -> modalState.requestDismiss()
             state.screen == GlassScreen.Detail -> state.backFromDetail()
-            state.screen == GlassScreen.Player -> flight.beginExit(state.currentSong) { state.screen = it }
+            // 播放页收起走 closePlayer（回 playerOrigin），而不是飞行算出的 entrySource：
+            // 覆盖层模型下「来源页」由 AppState 单点持有，两者语义相同但前者永远正确
+            state.screen == GlassScreen.Player -> flight.beginExit(state.currentSong) { state.closePlayer() }
             else -> state.screen = GlassScreen.Library
         }
     }
@@ -644,7 +678,27 @@ fun GlassApp() {
             glassIntensity = state.glassLevel,
         ) {
             val appHazeState = rememberHazeState()
-            CompositionLocalProvider(LocalHazeState provides appHazeState) {
+            // 真曲库无封面占位走极光派生色；演示内容保留设计稿色（R8 #10/#11）
+            val origin = if (state.realLibraryLoaded) LibraryOrigin.Live else LibraryOrigin.Demo
+            CompositionLocalProvider(LocalHazeState provides appHazeState, LocalLibraryOrigin provides origin) {
+                // 播放页是**盖在内容之上的覆盖层**，不是路由里的一屏。
+                // 下层始终渲染「播放页的来源页」（playerOrigin），于是收起时无需页面切换动画。
+                val playerOpen = state.screen == GlassScreen.Player
+                val baseScreen = if (playerOpen) state.playerOrigin else state.screen
+                // 下层随播放页升起而后退，营造纵深（0 = 正常，1 = 完全后退）
+                val recede by animateFloatAsState(
+                    targetValue = if (playerOpen) 1f else 0f,
+                    animationSpec = GlassMotion.tweenSheet(),
+                    label = "playerRecede",
+                )
+                // 退出飞行的迷你条端点修正（见 PlayerFlight.backingScaleProvider）：播放页盖在
+                // tab 页上时 Chrome 仍组合在 0.96 后退层里，其 trackFlight 注册的是**缩放后**
+                // 的 root 坐标；飞行落点必须对齐接管瞬间（recede 已归零）的真身，据此在
+                // beginExit 内把端点还原。Chrome 不在组合中（详情/搜索来源）时端点本就是
+                // 未缩放的冻结值，返回 1 保持原样。
+                flight.backingScaleProvider = {
+                    if (state.playerOrigin in TAB_SCREENS) lerp(1f, RecedeScale, recede) else 1f
+                }
                 // 根尺寸变化失效：configChanges 吞掉旋转/分屏/自由窗口，组合不重建，只能在此感知。
                 // remember 上次尺寸跳过首组合的初值回调，尺寸真变化才取消飞行并清空 rect
                 // 注册表（防 keepOnDispose 冻结的迷你条旧几何把替身带向旧坐标）
@@ -682,10 +736,29 @@ fun GlassApp() {
                 ) {
                     AuroraBackground()
 
-                    Box(Modifier.fillMaxSize()) {
-                        // 内容区：三个主屏（曲库/发现/我的）按 tab 顺序整屏左右平移，其余页淡入上移。
+                    // 后退层：内容 + chrome 一起随播放页升起而后退（缩放由 recede 驱动）。
+                    // hazeSource 的父层被缩放会让模糊采样产生约 4% 偏移，只在 420ms 过渡期存在
+                    // 且作用于一个正被覆盖的模糊迷你条，视觉不可辨（方案「已知代价」③）。
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                val s = lerp(1f, RecedeScale, recede)
+                                scaleX = s
+                                scaleY = s
+                            },
+                    ) {
+                        // 内容区：三个主屏（曲库/歌单/设置）按 tab 顺序整屏左右平移，其余页淡入上移。
                         // 恒全高——Chrome 悬浮在根层后绘，显隐不再挤占布局（飞行两端/模态开合零 reflow）
-                        Box(Modifier.fillMaxSize().hazeSource(appHazeState)) {
+                        //
+                        // baseContentAlpha：飞行期让位给飞行替身。旧结构靠 AnimatedContent 换屏时的
+                        // fadeOut 实现，覆盖层结构下不再换屏，必须显式补这条曲线（见 Flight 注释）。
+                        Box(
+                            Modifier
+                                .fillMaxSize()
+                                .hazeSource(appHazeState)
+                                .graphicsLayer { alpha = flight.baseContentAlpha() },
+                        ) {
                             if (!state.librarySettled) {
                                 // 启动收敛中（曲库缓存/首扫未到）：不渲染任何演示内容
                                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -696,7 +769,10 @@ fun GlassApp() {
                                     )
                                 }
                             } else AnimatedContent(
-                            targetState = state.screen,
+                            // 播放页是覆盖层（见下方 playerOpen），不进这层 AnimatedContent。
+                            // 下层始终渲染「播放页的来源页」：收起播放页时下层已经是正确的那一页，
+                            // 无需任何页面切换动画 —— 播放页离场，来源页原地显现。
+                            targetState = baseScreen,
                             transitionSpec = {
                                 when {
                                     // 共享元素飞行·进入：播放页元素自理（EnterTransition.None），旧 tab 页淡出
@@ -740,7 +816,10 @@ fun GlassApp() {
                             label = "screen",
                             ) { target ->
                                 when (target) {
-                                    GlassScreen.Player -> PlayerScreen(state)
+                                    // 播放页由根层覆盖层渲染（见下方 AnimatedVisibility），
+                                    // 不进内容层：它盖在内容之上，而不是与之平级的一屏。
+                                    // baseScreen 永不等于 Player，此分支仅为穷尽性而存在。
+                                    GlassScreen.Player -> Unit
                                     // 音频权限被拒时曲库页给出空态 + 应用内「去授权」入口
                                     // （否则拒绝后只剩一片空白，用户不知道该怎么救）
                                     GlassScreen.Library -> LibraryScreen(
@@ -834,9 +913,18 @@ fun GlassApp() {
                         }
                         // 底部 Chrome（迷你条 + 导航）：悬浮于根层、与内容区同层后绘——
                         // 显隐只控组合不控布局，内容区恒全高，飞行两端/模态开合/tab 切换均无 reflow。
-                        // 飞行期不组合：进入时随 screen=Player 卸载（替身按冻结 mini 几何原地无缝接位），
-                        // 退出时等 t=0.15 翻页才随 Library 出现（迷你条/胶囊由真身曲线淡入接位）
-                        if (state.screen in TAB_SCREENS && state.librarySettled && !modalState.isOpen) {
+                        //
+                        // 飞行期条件与旧结构等价：
+                        // - **进入期不组合**：覆盖层里有「导航胶囊渐隐替身」按 entryNavSelected
+                        //   原地绘制，Chrome 若还在就会在替身下再画一个真胶囊（双份重叠）。
+                        //   旧结构靠 screen=Player 让这个条件自然失效，现在 baseScreen 恒为来源页。
+                        // - **退出期组合**：miniSharedAlpha / navAlpha 只在最后 12% 淡入，
+                        //   与替身接位；不组合的话迷你条与胶囊会在飞行结束时整块pop出来。
+                        // 注意这里只读 phase（低频），不读 t.value —— 后者每帧变，会让整个
+                        // GlassApp 每帧重组。淡入淡出交给 Chrome 内部的 graphicsLayer lambda。
+                        if (baseScreen in TAB_SCREENS && state.librarySettled && !modalState.isOpen &&
+                            flight.phase != PlayerFlight.Phase.Entering
+                        ) {
                             GlassChrome(
                                 song = state.currentSong,
                                 playing = state.playing,
@@ -845,7 +933,7 @@ fun GlassApp() {
                                 progressProvider = { state.progressFraction },
                                 // 空曲库时迷你条不渲染播放/下一首（否则是可点但无反应的死按钮）
                                 hasSongs = state.hasSongs,
-                                navSelected = when (state.screen) {
+                                navSelected = when (baseScreen) {
                                     GlassScreen.Playlist -> 1
                                     GlassScreen.Settings -> 2
                                     else -> 0
@@ -858,7 +946,7 @@ fun GlassApp() {
                                     }
                                 },
                                 onOpenPlayer = {
-                                    val navSelected = when (state.screen) {
+                                    val navSelected = when (baseScreen) {
                                         GlassScreen.Playlist -> 1
                                         GlassScreen.Settings -> 2
                                         else -> 0
@@ -868,9 +956,9 @@ fun GlassApp() {
                                     // navigate(目标屏)，用户落进播放页后被弹回曲库（约 100-225ms 后）。
                                     if (flight.isActive) {
                                         flight.abort()
-                                        state.screen = GlassScreen.Player
+                                        state.openPlayer()
                                     } else {
-                                        flight.beginEntry(state.currentSong, navSelected, { state.screen = it }, state.screen)
+                                        flight.beginEntry(state.currentSong, navSelected, { state.openPlayer() }, baseScreen)
                                     }
                                 },
                                 onPlayPause = state::togglePlayPause,
@@ -879,14 +967,76 @@ fun GlassApp() {
                             )
                         }
 
-                        // ── 模态面板宿主：全 App GlassSheet 的唯一挂载点 ──
-                        // 内容区 hazeSource 的兄弟层（z 序在 Chrome 之后）：面板玻璃不再位于
-                        // app 级源子树内（铁律①），scrim 全屏盖住内容与各屏自绘 Chrome，
-                        // 消费的模糊源统一为 app 级（appHazeState）。
-                        // 飞行期不渲染：结构性保证「飞行期无面板」（旧设计=屏内 sheet 随屏卸载）
-                        if (!flight.isActive) {
-                            ModalSheetHost(modalState)
+                        // 模态面板宿主已移到播放页覆盖层之后（见下方），此处不再挂载。
+                    } // ← 后退层结束（内容 + Chrome 同受 recede 缩放）
+
+                    // 压暗层：播放页升起时渐显，强化「下层后退」的纵深。
+                    // **recede 只在绘制阶段读**（drawBehind 的 lambda）：它是动画值，
+                    // 若在组合期读（如 if (recede > 0f)），420ms 过渡期每一帧都会重组整个
+                    // GlassApp（含曲库列表/Chrome/覆盖层），纯属浪费；这里只失效绘制。
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .drawBehind {
+                                val a = 0.28f * recede
+                                if (a > 0f) drawRect(Color.Black, alpha = a)
+                            },
+                    )
+
+                    // ── 播放页覆盖层 ──
+                    // 盖在内容之上，而不是与之平级的一屏。自带极光背景：否则整屏透明，
+                    // 会透视到下层曲库（下层此刻仍在渲染来源页）。
+                    //
+                    // 与旧实现的关键差异：旧结构里播放页是 AnimatedContent 的一屏，
+                    // 进出必然伴随「换屏」——下层页面被销毁重建，于是收起时下层要重排、
+                    // 返回目标要靠 entrySource 猜。现在下层恒为 playerOrigin 且不被销毁，
+                    // 收起即「播放页离场、来源页原地显现」，无换屏、无重排。
+                    AnimatedVisibility(
+                        visible = playerOpen,
+                        modifier = Modifier.fillMaxSize(),
+                        // 进入/退出都走整屏升降（方案语义）；共享元素飞行可用时由飞行接管，
+                        // 此处只做「无飞行兜底」——两条转场语言不能同时对同一动作生效
+                        enter = if (flight.isActive) {
+                            EnterTransition.None
+                        } else {
+                            fadeIn(GlassMotion.tweenSheet()) +
+                                slideInVertically(GlassMotion.tweenSheet()) { it }
+                        },
+                        exit = if (flight.isActive) {
+                            ExitTransition.None
+                        } else {
+                            fadeOut(GlassMotion.tweenPage()) +
+                                slideOutVertically(GlassMotion.tweenPage()) { it }
+                        },
+                    ) {
+                        Box(Modifier.fillMaxSize()) {
+                            // 覆盖层自带极光（否则整屏透明会透视到下层曲库），
+                            // 但**透明度必须跟播放页内容的揭示曲线同步**（softAlpha）：
+                            // 飞行期播放页是「先不可见、随 t 渐显」的，极光若一上来就不透明，
+                            // 点击瞬间背景会从根层极光硬换成覆盖层极光（两份漂移相位不同）→ 闪一下。
+                            // 跟着 softAlpha：起飞时透出根层极光（与旧结构连续），
+                            // 随播放页内容一起显影；收起时反向淡出，下层曲库重新露出来。
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer { alpha = flight.softAlpha() },
+                            ) {
+                                AuroraBackground()
+                            }
+                            PlayerScreen(state)
                         }
+                    }
+
+                    // ── 模态面板宿主：全 App GlassSheet 的唯一挂载点 ──
+                    // **必须挂在播放页覆盖层之后**（z 序最高）：播放页的「播放选项」
+                    // 与「歌曲操作」也经 modal.show 打开，宿主若在覆盖层之下，
+                    // 面板会被整屏播放页盖住 —— 点了没反应。
+                    // 同时它不在后退层内，面板玻璃不受 recede 缩放影响（本就该全屏正立）。
+                    // 内容区 hazeSource 的兄弟层：面板玻璃不在 app 级源子树内（铁律①），
+                    // 消费的模糊源统一为 app 级（appHazeState）。
+                    // 飞行期不渲染：结构性保证「飞行期无面板」（旧设计=屏内 sheet 随屏卸载）
+                    if (!flight.isActive) {
+                        ModalSheetHost(modalState)
                     }
 
                     // 顶部提示区：IO 结果（导出/导入/备份）与播放错误共用同一个纵向栈。
@@ -921,8 +1071,9 @@ fun GlassApp() {
                         }
                     }
 
-                    // 共享元素飞行覆盖层：6 个替身（玻璃/封面/歌名/作者/播放/下一首），纯绘制不挡触摸
-                    PlayerFlightOverlay(flight, playing = state.playing)
+                    // 共享元素飞行覆盖层：6 个替身（玻璃/封面/歌名/作者/播放/下一首）+ 迷你进度线，
+                    // 纯绘制不挡触摸。进度传取值函数（10Hz 变，绘制期读，不牵动重组）
+                    PlayerFlightOverlay(flight, playing = state.playing, progressProvider = { state.progressFraction })
                 }
             }
         }
@@ -932,6 +1083,9 @@ fun GlassApp() {
 /** 底部 Chrome 承载的三个主屏（导航顺序：曲库 0 / 歌单 1 / 设置 2） */
 private val TAB_SCREENS = setOf(GlassScreen.Library, GlassScreen.Playlist, GlassScreen.Settings)
 
+/** 播放页升起时下层后退缩放：Chrome 在播放页打开期间也被缩放（退出飞行端点还原用） */
+private const val RecedeScale = 0.96f
+
 /** 顶部单条玻璃提示（IO 结果 / 播放错误共用）：样式单点定义，避免两条各写一份后漂移 */
 @Composable
 private fun TopBanner(message: String, maxLines: Int, onClick: () -> Unit) {
@@ -940,13 +1094,14 @@ private fun TopBanner(message: String, maxLines: Int, onClick: () -> Unit) {
             .fillMaxWidth()
             .padding(horizontal = 20.dp),
         level = GlassLevel.Hi,
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(R.Card14.dp),
         onClick = onClick,
     ) {
         Text(
             message,
             color = LocalGlassColors.current.textPrimary,
-            fontSize = 12.5.sp,
+            fontSize = 13.sp,
+            lineHeight = 18.sp, // GlassType.LHBody：横幅最多两行，行间归 body 档
             maxLines = maxLines,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),

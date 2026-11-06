@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.theme.AuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 
 /**
  * 主题色色板（F2）：圆形色点网格，选中项带描边 + 对勾语义。
@@ -64,9 +65,19 @@ fun ThemeColorSwatches(
                             .height(44.dp)
                             .clip(CircleShape)
                             .background(color)
+                            // A3-04：选中环宽度/颜色走 tweenHover——旧实现双重瞬变
+                            // （border 不参与布局，动画只影响描边绘制）
                             .border(
-                                width = if (on) 3.dp else 1.dp,
-                                color = if (on) glass.textPrimary else glass.strokeSoft,
+                                width = androidx.compose.animation.core.animateDpAsState(
+                                    if (on) 3.dp else 1.dp,
+                                    com.local.music.core.ui.theme.GlassMotion.tweenHover(),
+                                    label = "swatchBorder",
+                                ).value,
+                                color = androidx.compose.animation.animateColorAsState(
+                                    if (on) glass.textPrimary else glass.strokeSoft,
+                                    com.local.music.core.ui.theme.GlassMotion.tweenHover(),
+                                    label = "swatchBordercolor",
+                                ).value,
                                 shape = CircleShape,
                             )
                             // clickable 在 semantics 之前：读屏把 role/selected 合并到同一可点击节点
@@ -97,7 +108,7 @@ fun AuroraMiniPreview(
         modifier
             .fillMaxWidth()
             .height(72.dp)
-            .clip(RoundedCornerShape(16.dp))
+            .clip(RoundedCornerShape(R.Card14.dp))
             .background(
                 Brush.linearGradient(
                     listOf(palette.deep, palette.deep2, palette.seed, palette.seed2),

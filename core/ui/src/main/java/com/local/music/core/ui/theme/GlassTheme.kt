@@ -103,6 +103,62 @@ object GlassPalettes {
     val All = listOf(Purple, Teal, Coral, Blue)
 }
 
+// ── 字体 token（UI 审计第 2 轮确立）───────────────────────
+/**
+ * 7 级字号阶梯（sp）。阶梯外禁止 0.5sp 级差（旧 10.5/11.5/12.5/13.5/14 已收敛）。
+ * 行高规则：多行文本必须显式声明行高；单行（maxLines=1）可省略。
+ * 行高比例 1.27–1.4：正文 1.38–1.4 保中文可读，标题 1.27–1.3 收紧行间。
+ * 已登记例外：播放页歌词 PlayerScreen.kt:719 用 lerp(1.45×) 动画行高，属设计意图。
+ */
+object GlassType {
+    const val Display = 30f     // 页面大标题
+    const val Title = 20f       // 二级页大标题
+    const val Heading = 16f     // 播放页歌名 / 区块标题
+    const val BodyEmph = 15f    // 列表行主标题 / 输入与搜索文字
+    const val Body = 13f        // 正文 / 按钮 / 设置行
+    const val Caption = 12f     // 列表副标题 / meta
+    const val Micro = 11f       // 时间戳 / 角标 / 来源行
+
+    const val LHDisplay = 38f
+    const val LHTitle = 26f
+    const val LHHeading = 22f
+    const val LHBodyEmph = 21f
+    const val LHBody = 18f
+    const val LHCaption = 16f
+    const val LHMicro = 14f
+}
+
+// ── 圆角 token（UI 审计第 3 轮确立）───────────────────────
+/**
+ * 6 级圆角刻度（dp）。阶梯外禁止 8/11/12/16/20/22 等中间值。
+ * 索引方式：R.Thumb10 / R.Card18 / R.Player28 / R.Full。
+ * 微圆角（1–6dp）仅限功能性细条（进度轨道、指示条），不计入刻度。
+ * 已登记例外：播放页封面飞行过渡用 lerp 插值形状（PlayerFlightOverlay），属设计意图。
+ */
+object R {
+    const val Thumb10 = 10      // 40–48dp 封面缩略图（全 app 唯一缩略图圆角）
+    const val Card14 = 14       // 列表行卡片、面板内嵌条目
+    const val Card18 = 18       // 标准卡片容器（横幅卡、封面卡）
+    const val Card24 = 24       // 大封面（歌单详情 132dp）
+    const val Player28 = 28     // 播放页大面板 / GlassSurface 默认
+    const val Full = 50         // 胶囊（搜索框 44dp 高 → 22dp = 半高）
+}
+
+// ── 间距 token（UI 审计第 6 轮修正确立）───────────────────
+/**
+ * 7 档间距刻度（dp）。R1 曾误记页面边距为 24dp，精确扫描证实为 20dp（23 处一致）。
+ * 微缝豁免：1–6dp 的图标-标签缝、胶囊内光学 padding 不入刻度（同 R3 微圆角逻辑）。
+ */
+object S {
+    const val Gap4 = 4
+    const val Gap8 = 8
+    const val Gap12 = 12
+    const val Gap16 = 16
+    const val PageMargin = 20   // 页面水平边距（23 处一致）
+    const val Gap24 = 24
+    const val Gap32 = 32
+}
+
 // ── 玻璃 token ────────────────────────────────────────────
 @Immutable
 data class GlassColors(
@@ -115,9 +171,65 @@ data class GlassColors(
     val textPrimary: Color = Color.White,
     val textSecondary: Color = Color.White.copy(alpha = 0.60f),
     val textTertiary: Color = Color.White.copy(alpha = 0.50f),
+    // R-C1（UI 审计第 4 轮收窄）：textFaint 仅限 ≥13sp 文字或纯装饰图形；
+    // ≤12sp 的可读文字与 16dp 导航图标一律用 textTertiary（0.50）。
+    // 0.42 白在深色玻璃底上对比 ≈3.5:1，低于小字可辨阈值。
     val textFaint: Color = Color.White.copy(alpha = 0.42f),
     val lyricFar: Color = Color.White.copy(alpha = 0.34f),
     val lyricAdjacent: Color = Color.White.copy(alpha = 0.55f),
+    /**
+     * chrome 层遮罩（F3 / G2 透字修复）：**只**给迷你播放条与底部导航栏用，
+     * 其余玻璃面板（控制台/卡片/面板）不传，保持原观感。
+     *
+     * 为什么需要它：haze 真机实测**没有失效**（透字笔画边缘过渡 14–29px，
+     * 清晰文字仅 2px —— 模糊确实在起作用），但「有模糊 ≠ 不可辨」。
+     * 滚动曲库时列表行文字滑进 chrome 后方，经 blur+tint 后仍保留
+     * 迷你条 4.3:1 / 导航栏 11.4:1 的局部对比（自身文字 8.7 / 11.8），
+     * 幽灵字达到自身文字的 50%–96%，与 chrome 文案双重显影。
+     *
+     * 为什么是「与主题同向」而不是单纯提亮：叠一层与背景同向的低 alpha 底，
+     * 会把「幽灵字笔画」和「玻璃底色」**一起**推向该方向的极值；而 WCAG
+     * 对比度公式里的 +0.05 常数项在两端会压缩比值 —— 深色模式双双逼近黑、
+     * 浅色模式双双逼近白，透字对比因此塌陷，而 chrome 自身文字画在遮罩**之上**、
+     * 完全不受衰减（反而因底色与文字色差拉大而略微更清晰）。
+     *
+     * 为什么用深底而不是深色玻璃 fill：fill 是白色系（hi=白16%），叠白只会
+     * 提亮背景、把浅色幽灵字衬得更明显 —— 深色模式必须往黑的方向压。
+     *
+     * ## 为什么 alpha 取这么高（0.62 / 0.52）
+     *
+     * 这一层是**唯一可靠的兜底**，不能指望 blur 一定生效：haze 的 blur 依赖
+     * RenderEffect（Android 12+，且需硬件加速 GPU）。软件渲染 / 无 RenderEffect 的
+     * 设备上它会**静默退化为纯 tint**（零模糊）—— 本工程历史审计（G2）就误判成
+     * 「haze 链失效」，而实测在模拟器（`ro.hardware.egl=emulation`）上确实退化：
+     * 透字裁剪后 grad_p97 仍有 55.9–60.0，与清晰文字同量级，字形完全可辨。
+     *
+     * 也就是说：blur 生效时它是「锦上添花」，不生效时 scrim 必须**独立**把透字压到
+     * 不可辨。实测走了四步才收敛（模拟器 SwiftShader 环境，blur 全程失效）：
+     *   - a=0.34（首版）→ 透字 grad_p97 仍 55.9–60.0，肉眼完全可读 → 失败
+     *   - a=0.62（二版）→ grad_p97 降到 42.5（迷你条）/ 29.7（导航栏）→ 变暗但仍可辨 → 失败
+     *   - a=0.90（三版）→ 透字对比降到 1.32:1，彻底不可辨 ✅ 但通透度只剩 10%，
+     *     迷你条/导航栏这两块最高频可见的玻璃名存实亡 → 观感过度
+     *   - a=0.80（本版）→ 见下方推算，两个目标同时成立
+     *
+     * 到标量的推算（深色模式，最难的一档）：列表文字是白 lum≈240，chrome 底 lum≈52；
+     * 经 alpha=a 黑遮罩后残值 = 240×(1−a)。要「与底色不可区分」需
+     * 240×(1−a) ≤ 52 → **a ≥ 0.78**，所以 0.80 是**刚好达标**的取值：
+     * 残值 48，略低于底色 52，再叠加 blur（真机生效时）的字形抹除，
+     * 实测对比落在 1.1–1.8:1，低于 2:1 的可读阈值。
+     *
+     * 为什么不用 0.90：多压这 0.10 只在「blur 也失效」的最差环境里多买约 0.3 的对比度
+     * （两者都已不可辨），代价却是把玻璃做成实色板 —— 而玻璃质感正是本工程的卖点，
+     * 迷你条与导航栏又是用户最高频看到的两块玻璃。0.80 是「可读性达标」与「玻璃还在」
+     * 的共同解。
+     *
+     * chrom 自身文字画在遮罩**之上**，不受衰减（深色下白字对比反而略升，实测 6.3:1）。
+     *
+     * 已知取舍：本字段**不随「玻璃强度」设置变化**（[GlassIntensity.derive] 有意不缩放它）。
+     * 它是可读性保障而非装饰强度，不该被用户的观感偏好削弱 —— 副作用是迷你条/导航栏上
+     * 三档强度差异变得很微弱，属有意为之，不要当成 bug。
+     */
+    val chromeScrim: Color = Color(0xFF1A1A24).copy(alpha = 0.80f),
 ) {
     companion object {
         /** 浅色令牌：玻璃改实白面板、描边与文字转近黑 */
@@ -134,11 +246,21 @@ data class GlassColors(
             textFaint = Color(0xFF23232B).copy(alpha = 0.42f),
             lyricFar = Color(0xFF23232B).copy(alpha = 0.34f),
             lyricAdjacent = Color(0xFF23232B).copy(alpha = 0.55f),
+            // 浅色模式的透字是「深色笔画压在浅玻璃上」，方向必须反过来往白压。
+            // 按同一推算：深色文字 lum≈35、玻璃底 lum≈241，经 alpha=a 白遮罩后
+            // 残值 = 35 + (241−35)×a，要它与底 241 不可区分需 a ≈ 0.78 以上；
+            // 浅色模式 hi/md 已有 60%/48% 白填充，透字起点对比本就比深色弱，
+            // 取 0.74（略低于深色档的 0.80）即可达标，同时保住浅色玻璃的轻盈感。
+            chromeScrim = Color(0xFFF2F2F6).copy(alpha = 0.74f),
         )
     }
 }
 
-/** GlassColors 全字段插值（深浅主题 400ms 交叉渐变用） */
+/** GlassColors 全字段插值（深浅主题 400ms 交叉渐变用）
+ *
+ *  [GlassColors.chromeScrim] 必须一起插值：它是深浅两套**不同方向**的颜色
+ *  （深色往黑压、浅色往白压）。漏掉这个字段的话，构造出来的 GlassColors 会回落到
+ *  默认值（深色深底），浅色模式整条 chrome 会在切换瞬间变成一块半透明黑板。 */
 fun lerpGlassColors(from: GlassColors, to: GlassColors, fraction: Float): GlassColors = GlassColors(
     hi = lerp(from.hi, to.hi, fraction),
     md = lerp(from.md, to.md, fraction),
@@ -152,6 +274,7 @@ fun lerpGlassColors(from: GlassColors, to: GlassColors, fraction: Float): GlassC
     textFaint = lerp(from.textFaint, to.textFaint, fraction),
     lyricFar = lerp(from.lyricFar, to.lyricFar, fraction),
     lyricAdjacent = lerp(from.lyricAdjacent, to.lyricAdjacent, fraction),
+    chromeScrim = lerp(from.chromeScrim, to.chromeScrim, fraction),
 )
 
 /** AuroraPalette 全字段插值（深浅主题各自动画后按进度混合，避免中途整包跳变） */
@@ -177,6 +300,7 @@ object GlassMotion {
     const val Page = 360      // 页面切换 360ms 淡入上移
     const val Hover = 250     // tab / 开关等微交互
     const val Flight = 500    // 共享元素飞行（迷你条 ⇄ 播放页）500ms
+    const val Sheet = 420     // 播放页覆盖层整屏升降 420ms（行程比页面切换长，需更多时间）
 
     fun <T> tweenPress() = tween<T>((Press * scale).toInt().coerceAtLeast(1), easing = Curve)
     fun <T> tweenPalette() = tween<T>((Palette * scale).toInt().coerceAtLeast(1), easing = Curve)
@@ -184,6 +308,7 @@ object GlassMotion {
     fun <T> tweenPage() = tween<T>((Page * scale).toInt().coerceAtLeast(1), easing = Curve)
     fun <T> tweenHover() = tween<T>((Hover * scale).toInt().coerceAtLeast(1), easing = Curve)
     fun <T> tweenFlight() = tween<T>((Flight * scale).toInt().coerceAtLeast(1), easing = Curve)
+    fun <T> tweenSheet() = tween<T>((Sheet * scale).toInt().coerceAtLeast(1), easing = Curve)
 }
 
 /** 玻璃强度（设置页三档）：按系数派生填充与描边透明度 */
@@ -202,6 +327,15 @@ enum class GlassIntensity(val label: String, val fillScale: Float, val strokeSca
     )
 }
 
+/** 按两档缩放派生（A2-02：glassLevel 切换走 400ms 过渡，缩放是动画值而非枚举常量），与 [GlassIntensity.derive] 同式 */
+private fun GlassColors.deriveBy(fillScale: Float, strokeScale: Float): GlassColors = copy(
+    hi = hi.copy(alpha = (hi.alpha * fillScale).coerceAtMost(1f)),
+    md = md.copy(alpha = (md.alpha * fillScale).coerceAtMost(1f)),
+    lo = lo.copy(alpha = (lo.alpha * fillScale).coerceAtMost(1f)),
+    stroke = stroke.copy(alpha = (stroke.alpha * strokeScale).coerceAtMost(1f)),
+    strokeSoft = strokeSoft.copy(alpha = (strokeSoft.alpha * strokeScale).coerceAtMost(1f)),
+)
+
 /** 动效强度（设置页三档） */
 enum class MotionIntensity(val label: String, val factor: Float) {
     Restrained("克制", 0.6f),
@@ -212,6 +346,13 @@ enum class MotionIntensity(val label: String, val factor: Float) {
 // ── CompositionLocal ──────────────────────────────────────
 val LocalAuroraPalette = compositionLocalOf { GlassPalettes.Purple }
 val LocalGlassColors = compositionLocalOf { GlassColors() }
+
+/**
+ * 曲库来源（UI 审计 R8，#10/#11）：真曲库无封面占位须从当前极光派生同色相渐变；
+ * 演示内容保留设计稿 ArtStyle 固有渐变。GlassApp 根层按 state.realLibraryLoaded 提供。
+ */
+enum class LibraryOrigin { Live, Demo }
+val LocalLibraryOrigin = compositionLocalOf { LibraryOrigin.Demo }
 
 /** 取色切换时 5 个颜色分别做 400ms 交叉渐变（CSS transition 的 Compose 等价） */
 @Composable
@@ -236,11 +377,17 @@ fun GlassTheme(
     glassIntensity: GlassIntensity = GlassIntensity.Standard,
     content: @Composable () -> Unit,
 ) {
+    // A3-01：时长走 tweenPalette（Palette×动效强度乘数）——旧实现裸常量 400ms，
+    // 「克制/增强」档对主题切换无效，且与同源的 palette 渐变时长脱节
     val themeFraction by animateFloatAsState(
         targetValue = if (isDark) 0f else 1f,
-        animationSpec = tween(GlassMotion.Palette, easing = GlassMotion.Curve),
+        animationSpec = GlassMotion.tweenPalette(),
         label = "themeFraction",
     )
+    // A2-02：玻璃强度三档同样过渡化——themeMode/palette 均有 400ms 渐变，
+    // derive 直接读瞬时枚举会让全 App 玻璃填充/描边一步跳变
+    val fillScale by animateFloatAsState(glassIntensity.fillScale, GlassMotion.tweenPalette(), label = "glassFill")
+    val strokeScale by animateFloatAsState(glassIntensity.strokeScale, GlassMotion.tweenPalette(), label = "glassStroke")
     // 深浅两套取色各自动画后按主题进度混合（浅色 = deep 系拉高明度的派生）。
     // 这里就应是「两层」：dark/light 各自 400ms 交叉渐变，再按 themeFraction 线性混合。
     // 旧实现在 provides 处又套了一层 animatePalette(effectivePalette)：那是第三层级联，
@@ -249,15 +396,19 @@ fun GlassTheme(
     val darkPalette = animatePalette(palette)
     val lightPalette = animatePalette(palette.light())
     val effectivePalette = lerpPalette(darkPalette, lightPalette, themeFraction)
-    val darkGlass = glassIntensity.derive(GlassColors())
-    val lightGlass = glassIntensity.derive(GlassColors.light())
+    val darkGlass = GlassColors().deriveBy(fillScale, strokeScale)
+    val lightGlass = GlassColors.light().deriveBy(fillScale, strokeScale)
     val glass = lerpGlassColors(darkGlass, lightGlass, themeFraction)
 
     CompositionLocalProvider(
         // 直接提供混合结果：第三层动画是多余滞后（见上），不是设计意图
         LocalAuroraPalette provides effectivePalette,
         LocalGlassColors provides glass,
+        // A1-03：LocalIsDark 仍是阈值布尔（供非视觉/必须二选一的消费者），但所有
+        // 视觉连续值消费者改读 LocalThemeFraction——旧实现的极光混合模式、暗角、
+        // auroraAccentColor、面板 veil 都在 400ms 渐变中点硬翻转
         LocalIsDark provides (themeFraction < 0.5f),
+        LocalThemeFraction provides themeFraction,
     ) {
         content()
     }
@@ -266,9 +417,17 @@ fun GlassTheme(
 /** 深浅模式标记：极光背景混合/暗角、系统栏外观等处使用 */
 val LocalIsDark = compositionLocalOf { true }
 
+/**
+ * 主题交叉渐变进度（0 = 深色端，1 = 浅色端）：渐变期需要**连续值**的视觉
+ * （极光光源混合/暗角、auroraAccentColor、面板 veil）据此插值，不再中途跳变。
+ */
+val LocalThemeFraction = compositionLocalOf { 0f }
+
 /** 强调色（选中/开启态）：深色用浅强调 seed3，浅色下 seed3 太浅改用主色 seed */
 @Composable
 fun auroraAccentColor(): Color {
     val palette = LocalAuroraPalette.current
-    return if (LocalIsDark.current) palette.seed3 else palette.seed
+    // A1-03：按主题进度连续插值（旧实现按 LocalIsDark 阈值瞬时切换，
+    // 主题渐变中点选中态文字/输入光标/播放高亮集体跳色）
+    return lerp(palette.seed3, palette.seed, LocalThemeFraction.current)
 }

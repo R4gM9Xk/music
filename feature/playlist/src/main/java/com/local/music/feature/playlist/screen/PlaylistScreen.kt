@@ -53,6 +53,7 @@ import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 
 /**
  * 歌单库：2×2 玻璃封面墙（常驻 + 用户自建，各自带参进详情，长按 = 集合操作面板）
@@ -81,7 +82,7 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                 tracks = tracks,
                 onPlayAll = { shuffle ->
                     state.playCollection(tracks, title, shuffle)
-                    state.screen = GlassScreen.Player
+                    state.openPlayer()
                 },
             )
         }
@@ -171,7 +172,7 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
             GlassSurface(
                 modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
                 level = GlassLevel.Md,
-                shape = RoundedCornerShape(18.dp),
+                shape = RoundedCornerShape(R.Card18.dp),
             ) {
                 Column {
                     FavoriteRow(
@@ -242,20 +243,20 @@ private fun FavoriteRow(
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 6.dp)
-            .clip(RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(R.Card14.dp))
             .pressScale(interactionSource, pressed = 0.98f)
             .then(rowClickable)
             .padding(horizontal = 14.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        ArtThumb(art, Modifier.size(48.dp), RoundedCornerShape(8.dp), bordered = true)
+        ArtThumb(art, Modifier.size(48.dp), RoundedCornerShape(R.Thumb10.dp), bordered = true)
         Column(Modifier.weight(1f)) {
             Text(title, color = LocalGlassColors.current.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(2.dp))
             Text(meta, color = LocalGlassColors.current.textTertiary, fontSize = 12.sp)
         }
         Icon(GlassIcons.ChevronRight, null, Modifier.size(16.dp),
-            tint = LocalGlassColors.current.textFaint)
+            tint = LocalGlassColors.current.textTertiary)
     }
 }

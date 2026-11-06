@@ -18,6 +18,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
@@ -31,6 +32,11 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.local.music.core.ui.theme.AuroraPalette
 import com.local.music.core.ui.theme.GlassPalettes
+import com.local.music.core.ui.theme.LibraryOrigin
+import com.local.music.core.ui.theme.LocalAuroraPalette
+import com.local.music.core.ui.theme.LocalLibraryOrigin
+import com.local.music.core.ui.theme.R
+import androidx.compose.ui.graphics.lerp
 
 /** 封面模拟图：一比一复刻设计稿 .art1 ~ .art6（渐变 + 装饰几何），随尺寸自适应缩放 */
 enum class ArtStyle(
@@ -115,7 +121,7 @@ enum class ArtStyle(
 fun ArtThumb(
     style: ArtStyle,
     modifier: Modifier = Modifier,
-    shape: Shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+    shape: Shape = androidx.compose.foundation.shape.RoundedCornerShape(R.Thumb10.dp),
     bordered: Boolean = false,
     bitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
     artworkUri: String? = null,
@@ -123,6 +129,20 @@ fun ArtThumb(
     // 只读缓存不复用 bitmap 参数语义：bitmap 优先（调用方已持有），其次按 uri 按需解码。
     // getOrDecode 命中 LRU 时为纯查表，未命中才解码一次 256px 缩略图。
     val resolved = bitmap ?: ArtworkBitmapCache.getOrDecode(artworkUri)
+    // 占位色源（R8，#10/#11）：真曲库无封面时，占位渐变从当前极光 palette 同色相派生
+    // （deep2→deep→seed 中间带），保证与整屏氛围同源；演示内容仍走 ArtStyle 设计稿固有渐变。
+    // 明度带 0.08–0.5：与文字 1.0/0.6/0.5 的层级拉开，不与前景争对比。
+    // 装饰几何（style.decorate）两态共用：纹样提供可区分性，色相才分"演示/真库"。
+    val aurora = LocalAuroraPalette.current
+    val placeholderColors = if (LocalLibraryOrigin.current == LibraryOrigin.Live) {
+        listOf(
+            lerp(aurora.deep2, aurora.deep, 0.35f),
+            aurora.deep,
+            lerp(aurora.seed, aurora.deep, 0.45f),
+        )
+    } else {
+        style.colors
+    }
     Box(modifier.clip(shape)) {
         if (resolved != null) {
             androidx.compose.foundation.Image(
@@ -135,15 +155,21 @@ fun ArtThumb(
             Box(
                 Modifier
                     .matchParentSize()
-                    .drawBehind {
-                        drawRect(
-                            Brush.linearGradient(
-                                style.colors,
-                                start = Offset(size.width * 0.2f, 0f),
-                                end = Offset(size.width * 0.8f, size.height),
-                            ),
+                    // A2-09：brush/装饰 Path 进 drawWithCache——旧 drawBehind 每次绘制都
+                    // new 一个 linearGradient（Shader 级分配），而本组件是全 App 出现密度
+                    // 最高的元素，滚动/按压/波形任何重绘都在累积 GC 压力（同仓
+                    // AuroraBackground/Glass.kt glassTopLine 的既定红线）。cache 块在
+                    // 尺寸/配色变化时才重算，帧间复用
+                    .drawWithCache {
+                        val brush = Brush.linearGradient(
+                            placeholderColors,
+                            start = Offset(size.width * 0.2f, 0f),
+                            end = Offset(size.width * 0.8f, size.height),
                         )
-                        style.decorate(this, size)
+                        onDrawBehind {
+                            drawRect(brush)
+                            style.decorate(this, size)
+                        }
                     },
             )
         }

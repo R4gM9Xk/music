@@ -33,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -91,7 +92,6 @@ import com.local.music.core.ui.components.glassHaze
 import com.local.music.core.ui.components.pressScale
 import com.local.music.core.ui.components.trackFlight
 import com.local.music.core.ui.state.AppState
-import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.RepeatMode
 import com.local.music.core.ui.state.SleepTimerOptions
 import com.local.music.core.ui.state.sleepTimerLabel
@@ -99,6 +99,7 @@ import com.local.music.core.ui.state.sleepTimerSubtitle
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalAuroraPalette
+import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.auroraAccentColor
 import dev.chrisbanes.haze.hazeSource
@@ -121,6 +122,12 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
     val lyrics = state.currentLyrics
     val song = state.currentSong
     val flight = LocalPlayerFlight.current
+    // A2-01：currentLyricIndex 的 getter 链组合期读 progressSec（10Hz tick）——直接把
+    // state.currentLyricIndex 传给舞台，会让整个 stageBlock 每拍重组（封面 rect/shadow
+    // 插值、LyricRail 调用点全部重跑，与本项目「进度只失效绘制」的既有做法相悖）。
+    // derivedStateOf 只在结果（行下标）变化时失效：重组频率从 10Hz 降到歌词行推进频率。
+    // key = currentLyrics（换歌换词才重建派生）
+    val lyricIndex by remember(state.currentLyrics) { derivedStateOf { state.currentLyricIndex } }
     // 模态面板宿主（GlassApp 根层）：队列/更多面板经 show 挂载，屏内不再渲染 GlassSheet
     val modal = LocalModalState.current
     // P2-⑤：横屏判定（供舞台/控制台/提示行的紧凑化共用）。
@@ -229,9 +236,10 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         GlassIconButton(onClick = {
                             val f = flight
                             if (f != null) {
-                                f.beginExit(state.currentSong) { state.screen = it }
+                                // 收起回来源页（playerOrigin），而不是硬编码曲库
+                                f.beginExit(state.currentSong) { state.closePlayer() }
                             } else {
-                                state.screen = GlassScreen.Library
+                                state.closePlayer()
                             }
                         }) {
                             Icon(GlassIcons.Down, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
@@ -310,7 +318,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         if (lyrics != null) {
                             LyricRail(
                                 lines = lyrics,
-                                current = state.currentLyricIndex,
+                                current = lyricIndex,
                                 onSelect = { index -> if (showLyrics) state.seekTo(lyrics[index].timeSec + 0.01f) },
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -364,7 +372,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                     .offset {
                                         IntOffset(0, (coverRect.bottom + with(density) { 20.dp.toPx() }).roundToInt())
                                     }
-                                    .graphicsLayer { alpha = 1f - modeT },
+                                    .graphicsLayer { alpha = (1f - modeT) * (flight?.softAlpha() ?: 1f) },
                             )
                         }
                     }
@@ -384,6 +392,9 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                 label = "sheetAlpha",
             )
             val sharedAlpha = { (flight?.playerSharedAlpha() ?: 1f) * sheetAlpha }
+            // 共享子元素（歌名/歌者/播放/下一首）：退出期根层已按 12% 窗渐出，子元素若再乘
+            // 同一系数会平方衰减（中点 0.25），交叉淡化亮度凹陷加深——退出期恒 1 交给根层
+            val sharedInnerAlpha = { (flight?.playerSharedInnerAlpha() ?: 1f) * sheetAlpha }
             val softAlpha = { (flight?.softAlpha() ?: 1f) * sheetAlpha }
             val consoleBlock: @Composable () -> Unit = {
             GlassSurface(
@@ -398,7 +409,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     .trackFlight(FlightKeys.PlayerGlass)
                     .graphicsLayer { alpha = sharedAlpha() },
                 level = GlassLevel.Md,
-                shape = RoundedCornerShape(28.dp),
+                shape = RoundedCornerShape(R.Player28.dp),
                 blur = GlassLevel.Md,
             ) {
                 Column(
@@ -416,12 +427,12 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                 fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier
                                     .trackFlight(FlightKeys.PlayerTitle)
-                                    .graphicsLayer { alpha = sharedAlpha() })
+                                    .graphicsLayer { alpha = sharedInnerAlpha() })
                             Text(song.subtitle, color = LocalGlassColors.current.textSecondary, fontSize = 12.sp,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier
                                     .trackFlight(FlightKeys.PlayerArtist)
-                                    .graphicsLayer { alpha = sharedAlpha() })
+                                    .graphicsLayer { alpha = sharedInnerAlpha() })
                         }
                         Spacer(Modifier.width(12.dp))
                         ConsoleIcon(
@@ -501,13 +512,13 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             onClick = state::togglePlayPause,
                             modifier = Modifier
                                 .trackFlight(FlightKeys.PlayerPlay)
-                                .graphicsLayer { alpha = sharedAlpha() },
+                                .graphicsLayer { alpha = sharedInnerAlpha() },
                         )
                         ConsoleIcon(
                             onClick = { state.next() },
                             modifier = Modifier
                                 .trackFlight(FlightKeys.PlayerNext)
-                                .graphicsLayer { alpha = sharedAlpha() },
+                                .graphicsLayer { alpha = sharedInnerAlpha() },
                         ) {
                             Icon(GlassIcons.Next, null, Modifier.size(28.dp),
                                 tint = LocalGlassColors.current.textSecondary)
@@ -549,7 +560,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             val hintBlock: @Composable () -> Unit = {
             Text(
                 hint,
-                color = LocalGlassColors.current.textFaint, fontSize = 10.5.sp,
+                color = LocalGlassColors.current.textTertiary, fontSize = 11.sp,
                 modifier = Modifier
                     .fillMaxWidth()
                     // P2-⑤：横屏下提示行紧贴控制台，避免它在 720dp 高度里白占一行
@@ -606,6 +617,23 @@ private fun LyricRail(
     val density = LocalDensity.current
     // 每行在 rail 内的中心坐标（px），由 onGloballyPositioned 回填
     val lineCenters = remember { mutableStateMapOf<Int, Float>() }
+    // 上面那条坐标是**在哪一套舞台几何下量出来的**（宽高打包成一个 Long）。
+    // 只有量它的几何 == 当前舞台几何时才算有效。
+    //
+    // 这是 F4（真机横屏歌词空白）的根因判据。manifest 的 configChanges 含
+    // orientation|screenSize|screenLayout|smallestScreenSize，所以旋转**既不重建 Activity
+    // 也不重建组合** —— lineCenters 原样留着竖屏舞台的几何。而舞台尺寸一变就会重启定位
+    // effect，它第一行的 `snapshotFlow { lineCenters[current] }.first()` 对已存在的值**立即发射**
+    // （快照流不会等新布局），于是拿竖屏坐标去算横屏偏移 → rail 被推出舞台 →
+    // 每行 positionalFade 归零 → 左舞台只剩封面。
+    //
+    // **必须同时盖宽度**：lineCenters 存的是行**中心 y**，而 y 由行高与**折行**共同决定，
+    // 折行只取决于宽度。只盖高度的话，分屏拖分隔条 / 折叠屏展开 / 自由窗口 resize 这类
+    // 「只改宽不改高」的路径会让旧戳仍然「有效」→ 同一个 bug 换个入口原样复现。
+    //
+    // 为什么记几何戳而不是「尺寸一变就清空」：清空与定位是两个 LaunchedEffect，靠「清得早」
+    // 来保证正确性等于依赖执行顺序；而带几何戳的坐标**自己就过期**，无论谁先跑都不会被误用。
+    val lineCenterStageKey = remember { mutableStateMapOf<Int, Long>() }
     // P2-32：偏移改 Animatable 手控。旧 animateFloatAsState 初值恒 0——每次进入播放页/切歌
     // 都会从 offset=0「滑」到居中位；Animatable 允许首次定位 snapTo 瞬时落位，行进切换才弹性动画
     val railOffset = remember { Animatable(0f) }
@@ -614,16 +642,53 @@ private fun LyricRail(
 
     BoxWithConstraints(modifier.clipToBounds()) {
         val stageHeightPx = with(density) { maxHeight.toPx() }
-        // 切歌：清空旧行坐标并瞬时归零偏移（snapTo 不带动画），避免上一首的 rail 位置带入新歌词
+        // 舞台几何戳（宽 + 高打包）：行坐标在哪套几何下量出来的唯一凭据。
+        // 宽度**必须**进戳 —— 见 lineCenterStageKey 的注释（折行只由宽度决定）。
+        // 高位塞宽度、低位塞高度的原始位模式，两者任一变化都会得到不同的 Long。
+        val stageW = constraints.maxWidth
+        val stageKey: Long = remember(stageHeightPx, stageW) {
+            (stageW.toLong() shl 32) or (stageHeightPx.toRawBits().toLong() and 0xFFFF_FFFFL)
+        }
+        // G1（体验审计）：歌词端左上角悬浮 64dp 封面（底边 78dp）会盖住从它后方穿过的行
+        // （真机 s7/s8/sc 实拍）——顶部保护带 90dp = 封面底边 78dp + 12dp 缓冲，
+        // 滚入封面区间的行先于封面淡出，而非被硬裁
+        val topGuardPx = with(density) { 90.dp.toPx() }
+        // 切歌：旧行坐标必须**彻底作废**（行文本/行数/折行全不同）。
+        //
+        // 这里必须是**只以 lines 为 key** 的独立 effect —— 不能和「尺寸变化复位」合并：
+        // 合并后（`LaunchedEffect(lines, stageHeightPx)`）切歌时若不 clear，定位 effect 会被
+        // **上一首**残留的坐标立刻喂饱（阶段高度没变，高度戳判据拦不住）并置 hasPositioned=true，
+        // 之后 lines/current/height 三个 key 都不再变 → rail 一直停在上一首的偏移上，
+        // 直到下一句歌词到来才纠正（数秒级错位）。这正是竖屏「切歌瞬时归位」的回归。
+        //
+        // 清空在这里是安全的：切歌会让每一行都重新组合并重新 onGloballyPositioned，
+        // 不存在「清空后长时间没有坐标」的窗口（那种情况才会让 positionalFade 归零黑屏）。
         LaunchedEffect(lines) {
             lineCenters.clear()
+            lineCenterStageKey.clear()
+        }
+        // 尺寸变化（旋转 / 分屏 / 自由窗口）：只复位偏移与首次定位标记，**不清 lineCenters**。
+        //
+        // 不清是有原因的：逐行透明度由 `positionalFade(railOffset + (lineCenters[i] ?: 0f), …)`
+        // 算，而 positionalFade 对 stageY <= 0f 直接返回 0。尺寸变化时行通常不会立刻重测，
+        // 一旦清空就会让**所有行算成 0 透明 —— 整片歌词消失**（第一版修法就是这么把
+        // 「概率性空白」变成「必现空白」的）。保留旧坐标最多一帧偏移不准，绝不会黑屏。
+        //
+        // 正确性由 stageKey（宽高戳）保证：定位 effect 只认「在当前舞台几何下量出来」的坐标。
+        LaunchedEffect(stageKey) {
             railOffset.snapTo(0f)
+            hasPositioned = false
         }
         // 当前行中心 → 对齐舞台中心（rail 与舞台同高，行坐标即舞台坐标，同 CSS 公式）。
         // 行坐标由 onGloballyPositioned 异步回填：用 snapshotFlow 等它就绪后取一次，
         // 而不是把 lineCenters[current] 挂进 key（旧写法每次回填都重启 effect，当前行漂移 P3-67）
-        LaunchedEffect(lines, current, stageHeightPx) {
-            val center = snapshotFlow { lineCenters[current] }.filterNotNull().first()
+        //
+        // 只认**在当前舞台几何下量出来**的坐标：没有就等，绝不用旋转前那套几何去算。
+        // 这是 F4 的正解——旧代码只判 null，于是旋转后被旧值喂饱、把整条 rail 推出可视区。
+        LaunchedEffect(lines, current, stageKey) {
+            val center = snapshotFlow {
+                lineCenters[current]?.takeIf { lineCenterStageKey[current] == stageKey }
+            }.filterNotNull().first()
             if (hasPositioned) {
                 railOffset.animateTo(stageHeightPx / 2f - center, GlassMotion.tweenLyric())
             } else {
@@ -646,11 +711,14 @@ private fun LyricRail(
                         // 位置衰减以 lambda 下发：railOffset 是动画值，行内 graphicsLayer 绘制期
                         // 才读（P3-68——旧版在组合期读，rail 每帧动画都把全部歌词行重组一遍）
                         positionalAlphaProvider = {
-                            positionalFade(railOffset.value + (lineCenters[index] ?: 0f), stageHeightPx)
+                            positionalFade(railOffset.value + (lineCenters[index] ?: 0f), stageHeightPx, topGuardPx)
                         },
                         onClick = { onSelect(index) },
                         modifier = Modifier.onGloballyPositioned { coords ->
                             lineCenters[index] = coords.positionInParent().y + coords.size.height / 2f
+                            // 同一次回调里盖几何戳：坐标与它成立时的舞台几何必须原子一致，
+                            // 分两次写会让定位 effect 有机会读到「新坐标 + 旧戳」的半截组合
+                            lineCenterStageKey[index] = stageKey
                         },
                     )
                 }
@@ -728,10 +796,15 @@ private fun LyricLineRow(
     )
 }
 
-/** 逐行位置衰减：行中心在舞台顶部 10% / 底部 8% 内平滑淡出（smoothstep），永不拦腰切行 */
-private fun positionalFade(stageY: Float, stageH: Float): Float {
+/**
+ * 逐行位置衰减：行中心在舞台顶部淡出带 / 底部 8% 内平滑淡出（smoothstep），永不拦腰切行。
+ * 顶部淡出带 = max(10%, topGuardPx)，再夹到 ≤45% 舞台高：topGuard 覆盖歌词端左上角
+ * 悬浮封面区间（见 LyricRail 内注释）；45% 上限防矮舞台（横屏单列）被保护带整个吞掉、
+ * 恒居中的当前行反而变暗。
+ */
+private fun positionalFade(stageY: Float, stageH: Float, topGuardPx: Float = 0f): Float {
     if (stageH <= 0f) return 1f
-    val topEnd = stageH * 0.10f
+    val topEnd = minOf(maxOf(stageH * 0.10f, topGuardPx), stageH * 0.45f)
     val bottomStart = stageH * 0.92f
     return when {
         stageY <= 0f || stageY >= stageH -> 0f

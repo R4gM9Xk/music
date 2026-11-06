@@ -53,6 +53,8 @@ import androidx.compose.ui.draw.drawWithCache
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
+
 
 /**
  * 播放进度轨：5px 高圆角轨道，seed2→文字色 渐变填充 + 端点 12dp 发光圆点。
@@ -222,26 +224,36 @@ fun MiniPlayerBar(
             .trackFlight(FlightKeys.MiniGlass, keepOnDispose = true)
             .graphicsLayer { alpha = flight?.miniSharedAlpha() ?: 1f },
         level = GlassLevel.Hi,
-        shape = RoundedCornerShape(20.dp),
+        shape = RoundedCornerShape(R.Player28.dp),
         blur = GlassLevel.Hi,
+        // F3 / G2：迷你条悬在滚动列表上方，列表行文字会从它背后透上来。
+        // 真机实测 haze 是活的（透字笔画边缘过渡 14–29px vs 同字号清晰文字 2px），
+        // 但「有模糊 ≠ 不可辨」：经 blur + 白 tint 后透字仍有 4.3:1 局部对比
+        // （自身歌名 8.7:1，即透字达到自身文字的 50%），深色模式下浅色幽灵字压在
+        // 深玻璃上尤其刺眼。
+        // 唯一杠杆是 scrim（主题同向：深色压黑、浅色提白），它独立于 blur 也能压死透字
+        // —— 这里**刻意不再加重 blur**：scrim alpha 已达 0.80，模糊结果对最终像素的
+        // 可见贡献只剩 20%，再加大半径肉眼不可辨，只是白烧 GPU（RenderEffect 半径翻倍
+        // 采样开销显著上升）。详见 GlassColors.chromeScrim 的推导。
+        scrim = glass.chromeScrim,
         onClick = onClick,
     ) {
         Row(
             Modifier.fillMaxSize().padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(11.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             ArtThumb(
                 song.art,
                 Modifier.trackFlight(FlightKeys.MiniCover, keepOnDispose = true).size(42.dp),
-                RoundedCornerShape(11.dp),
+                RoundedCornerShape(R.Thumb10.dp),
                 bordered = true,
                 // coverBitmap 恒为 null（扫描不再预解码全库）；真封面经 artworkUri 按需解码
                 bitmap = song.coverBitmap,
                 artworkUri = song.artworkUri,
             )
             Column(Modifier.weight(1f)) {
-                Text(song.title, color = glass.textPrimary, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold,
+                Text(song.title, color = glass.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.trackFlight(FlightKeys.MiniTitle, keepOnDispose = true))
                 Text(song.artist, color = glass.textSecondary, fontSize = 11.sp,
@@ -319,6 +331,11 @@ fun GlassNavBar(
         level = GlassLevel.Md,
         shape = CircleShape,
         blur = GlassLevel.Md,
+        // F3 / G2：与迷你条同一问题（导航栏下方同样滚过列表行）。md 档透字实测更严重：
+        // 局部对比 11.4:1，达到自身标签 11.8:1 的 96% —— 几乎完全穿透。
+        // 与迷你条同一档 scrim；blur 作用于条**背后**的背景采样，不会糊掉自身图标与标签
+        // （它们画在 haze 结果之上）。
+        scrim = glass.chromeScrim,
     ) {
         Row(Modifier.fillMaxSize()) {
             items.forEach { (label, icon, index) ->
@@ -360,7 +377,7 @@ fun GlassNavBar(
                     }
                     Spacer(Modifier.height(3.dp))
                     Text(
-                        label, fontSize = 10.5.sp,
+                        label, fontSize = 11.sp,
                         color = if (on) glass.textPrimary else glass.textTertiary,
                     )
                 }

@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -60,6 +61,7 @@ import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.SongSort
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 
 /**
  * 首页曲库：大标题 + 玻璃搜索 + tab 胶囊；6 个 tab 均接真实内容——
@@ -81,6 +83,17 @@ fun LibraryScreen(
     // 会销毁内容、rememberSaveable 不保留——真正跨屏保留需把这两个状态提到 AppState，属后续项
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+    // A2-07：六个 tab 共用一份 LazyListState——在「歌曲」滚到深处后切「专辑」，item 数变少时
+    // firstVisibleItemIndex 被 clamp、视口跳到列表尾部，切回也不复原。tab 变化即归零（跳过
+    // 首组合：rememberSaveable 恢复的滚动位置不被冲掉）；lastTab 用普通 remember——本组合实例
+    // 内比较前后值，换屏重进后从零起算正好不误伤恢复
+    var lastTab by remember { mutableIntStateOf(tab) }
+    LaunchedEffect(tab) {
+        if (tab != lastTab) {
+            lastTab = tab
+            listState.scrollToItem(0)
+        }
+    }
     // 模态面板宿主（GlassApp 根层）：排序/单曲/集合面板经 show 挂载
     val modal = LocalModalState.current
     // 排序结果缓存：library 引用（重扫/缓存刷新才换新列表）或排序变化才重算，
@@ -118,7 +131,7 @@ fun LibraryScreen(
                 tracks = tracks,
                 onPlayAll = { shuffle ->
                     state.playCollection(tracks, title, shuffle)
-                    state.screen = GlassScreen.Player
+                    state.openPlayer()
                 },
             )
         }
@@ -379,7 +392,7 @@ private fun GroupRow(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         ArtThumb(
-            art, Modifier.size(48.dp), RoundedCornerShape(12.dp),
+            art, Modifier.size(48.dp), RoundedCornerShape(R.Thumb10.dp),
             bordered = true, bitmap = bitmap, artworkUri = artworkUri,
         )
         Column(Modifier.weight(1f)) {
@@ -389,7 +402,7 @@ private fun GroupRow(
             Text(meta, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        Icon(GlassIcons.ChevronRight, null, Modifier.size(16.dp), tint = LocalGlassColors.current.textFaint)
+        Icon(GlassIcons.ChevronRight, null, Modifier.size(16.dp), tint = LocalGlassColors.current.textTertiary)
     }
 }
 
@@ -423,7 +436,7 @@ private fun LibraryEmptyState(audioDenied: Boolean, onRequestAudioPermission: ()
         GlassSurface(
             modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 12.dp),
             level = GlassLevel.Md,
-            shape = RoundedCornerShape(18.dp),
+            shape = RoundedCornerShape(R.Card18.dp),
         ) {
             SettingRow(
                 GlassIcons.Mic,
