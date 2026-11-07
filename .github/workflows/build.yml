@@ -74,11 +74,20 @@ jobs:
 
       # 版本目录里 compileSdk=36 / minSdk=35，需要对应平台包。
       # cmdline-tools 只提供 sdkmanager，平台包要显式装。
-      # `yes |` 用于接受许可协议（CI 无人值守，必须非交互）。
+      #
+      # ── 为什么这里没有 `yes | sdkmanager --licenses` ──────────────────────
+      # cmdline-tools 16111833 已是重写过的 Android CLI，`--licenses` 被移除
+      # （`sdkmanager` 的帮助文本里根本没有这个参数）。首次改造照搬旧写法，实测报错：
+      #     Warning: The --licenses option is no longer needed.
+      #     yes: standard output: Broken pipe
+      #     Error: Process completed with exit code 1.
+      # `yes` 在 sdkmanager 提前退出后继续写管道 → SIGPIPE，叠加 `pipefail` 直接判失败。
+      # 新版安装包时不再需要单独接受许可，因此整段删掉。
+      #
+      # 仍显式 set -euo pipefail：这个步骤失败必须让 job 红，不能静默吞掉。
       - name: Install SDK platform and build-tools
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null
           sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
           sdkmanager --list_installed
 
