@@ -111,11 +111,52 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      # ── 为什么 CI 要覆盖仓库地址 ──────────────────────────────────────────
+      # settings.gradle.kts 的 pluginManagement/dependencyResolutionManagement 里，
+      # **阿里云镜像排在 google()/mavenCentral() 之前**，注释写明是「本机走代理时
+      # google()/mavenCentral() 直连极慢」。这对作者本机是对的，但把这个顺序带进 CI
+      # 会失败：
+      #     Plugin [id: 'com.google.dagger.hilt.android', version: '2.57.2'] was not found
+      #     Searched in: maven.aliyun.com/repository/gradle-plugin, ... , Google, MavenRepo
+      # CI 在 GitHub 机房直连，阿里云镜像对第三方插件的索引不完整，且该目录不支持
+      # 列目录（实测直接 404），Gradle 在镜像侧拿不到结果就结束解析。
+      #
+      # 处理方式：**不改仓库里的 settings.gradle.kts**（那会影响作者本机开发体验），
+      # 只在 CI 用 init script 把仓库改回官方源。init script 的 settingsEvaluated
+      # 在 pluginManagement 解析插件之前执行，所以覆盖是生效的。
+      # 这样仓库配置保持原样，CI 拿到的是可复现的官方源。
+      - name: Use official Maven repositories in CI
+        run: |
+          set -euo pipefail
+          INIT="$RUNNER_TEMP/ci-repos.init.gradle.kts"
+          printf '%s\n' \
+            '// CI 专用：把仓库覆盖为官方源，回避阿里云镜像索引不全导致的插件解析失败。' \
+            '// 不改 settings.gradle.kts —— 那是作者本机开发用的加速配置。' \
+            'settingsEvaluated {' \
+            '    pluginManagement {' \
+            '        repositories {' \
+            '            clear()' \
+            '            gradlePluginPortal()' \
+            '            google()' \
+            '            mavenCentral()' \
+            '        }' \
+            '    }' \
+            '    dependencyResolutionManagement {' \
+            '        repositories {' \
+            '            clear()' \
+            '            google()' \
+            '            mavenCentral()' \
+            '        }' \
+            '    }' \
+            '}' > "$INIT"
+          echo "--- generated init script ---"
+          cat "$INIT"
+
       - name: Assemble debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+        run: ./gradlew --init-script="$RUNNER_TEMP/ci-repos.init.gradle.kts" :app:assembleDebug --stacktrace
 
       - name: Run unit tests
-        run: ./gradlew testDebugUnitTest --stacktrace
+        run: ./gradlew --init-script="$RUNNER_TEMP/ci-repos.init.gradle.kts" testDebugUnitTest --stacktrace
 
       # 测试报告在失败时最有价值，无条件上传
       - name: Upload test report
