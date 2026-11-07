@@ -6,8 +6,19 @@ name: build
 #
 # 不做的事（刻意）：
 # - 不发版（release.sh 是本机脚本，依赖本机 JDK/SDK 路径与签名文件，不适合放 CI）
-# - 不上传 APK（无版本标签语义，产物对 PR 无意义）
+# - 不上传 release APK（无版本标签语义，产物对 PR 无意义）。debug 包会作为 artifact 上传，
+#   便于人工取件验证「真的构建出来了」，见文件末尾
 # - 不跑 lint（工程未配置 lint 基线，首次接入会产生大量历史告警，等单独一轮清理再接）
+#
+# ── 为什么不再用 android-actions/setup-android ───────────────────────────────
+# 之前用 `android-actions/setup-android@v3`，两次运行都在「Set up Android SDK」失败：
+#     /usr/local/lib/android/sdk/cmdline-tools/16.0/bin/sdkmanager tools
+#     Warning: Failed to find package 'tools'
+#     Error: The process '.../sdkmanager' failed with exit code 1
+# 根因：v3 在收尾时**无条件执行 `sdkmanager tools`** 去装 legacy `tools` 包，
+# 而该包已从 Google SDK 仓库移除（见下方实测：repository2-3.xml 里已无 path="tools"）。
+# 这是钉在 v3 的 dist/index.js 里的固定行为，所以换 v3 的任意小版本都救不回来。
+# 因此改为手动安装 cmdline-tools：不依赖该 action 的内部假设，且版本钉死在官方校验和上。
 
 on:
   push:
@@ -19,6 +30,11 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true # 同一分支连推时取消旧任务，省额度
+
+env:
+  # 手动安装的 Android SDK 根目录。AGP 认 ANDROID_HOME / ANDROID_SDK_ROOT。
+  ANDROID_SDK_ROOT: ${{ github.workspace }}/.android-sdk
+  ANDROID_HOME: ${{ github.workspace }}/.android-sdk
 
 jobs:
   build:
@@ -34,14 +50,37 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # 注：这里不再用 setup-android。见文件头「为什么不再用 android-actions/setup-android」。
+      #
+      # 钉版本 + 校验和的意义：这一步骤曾经因为上游包变化整条 CI 变红。
+      # 写死 URL 会被 Google 悄悄换内容（文件名带 `_latest`），所以同时钉 SHA-1
+      # —— 官方 repository2-3.xml 对 cmdline-tools;latest 只发布 sha1，无 sha256。
+      # 校验失败即 fail，而不是「装个别的版本接着跑」。
+      - name: Install Android cmdline-tools (pinned)
+        run: |
+          set -euo pipefail
+          CT_URL="https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
+          CT_SHA1="e025545c62a8e64c7559119566a569fb1dec5f60"
+          echo "Downloading: $CT_URL"
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/cmdline-tools.zip "$CT_URL"
+          echo "${CT_SHA1}  /tmp/cmdline-tools.zip" | sha1sum -c -
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          unzip -q /tmp/cmdline-tools.zip -d /tmp/ct-extract
+          # sdkmanager 要求目录布局为 cmdline-tools/<version>/bin，否则会报
+          # "Could not determine SDK root"
+          mv /tmp/ct-extract/cmdline-tools "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --version
 
       # 版本目录里 compileSdk=36 / minSdk=35，需要对应平台包。
-      # setup-android 只装命令行工具，平台包要显式装。
-      - name: Install SDK platform
+      # cmdline-tools 只提供 sdkmanager，平台包要显式装。
+      # `yes |` 用于接受许可协议（CI 无人值守，必须非交互）。
+      - name: Install SDK platform and build-tools
         run: |
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          sdkmanager --list_installed
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -53,6 +92,15 @@ jobs:
 
       # 项目路径含中文（Windows 本机），AGP 需要 overridePathCheck。
       # 仓库路径在 CI 上是 ASCII，但 gradle.properties 里已有该开关，无需额外处理。
+
+      # ── 为什么要 chmod ────────────────────────────────────────────────────
+      # `gradlew` 在 git 索引里的 mode 是 100644（无执行位），因为工程最初在 Windows
+      # 上提交，而 Windows 没有 unix exec 位概念。Linux runner 上直接 `./gradlew`
+      # 会 `Permission denied`。这里显式补上，不改仓库里的 mode：
+      # 改 mode 只在 Linux/macOS 的 clone 上生效，Windows 侧 checkout 依然不保留，
+      # 反而会让本机 `git status` 出现脏改动。CI 里就地修成本最低。
+      - name: Make gradlew executable
+        run: chmod +x gradlew
 
       - name: Assemble debug APK
         run: ./gradlew :app:assembleDebug --stacktrace
@@ -69,3 +117,14 @@ jobs:
           path: |
             **/build/reports/tests/testDebugUnitTest/
           retention-days: 7
+
+      # 构建产物也传一份：CI 的价值是「证明能构建」，光看绿勾不够，
+      # 出问题时要能取到当时的包。仅 debug 包 —— release 走本机 release.sh。
+      - name: Upload debug APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7
+          if-no-files-found: error # 构建成功却没产物 = 配置有问题，必须暴露
