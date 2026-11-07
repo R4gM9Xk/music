@@ -1,9 +1,9 @@
 {
-  "versionCode": 4,
-  "versionName": "1.0.3",
-  "changelog": "新增定时关闭、播放变速、自定义主题色、流派视图、最常播放、歌单页直接加歌、M3U 导入导出与备份恢复；修复空曲库进播放页崩溃、面板返回键误退应用、定时状态不归零、主题色色块无法点选等多处问题",
+  "versionCode": 5,
+  "versionName": "1.1.0",
+  "changelog": "gap-audit P0 修复：坏文件自动跳过、专辑曲序修正、响度归一与音效链、无障碍、桌面歌词与小部件、分享与铃声、换机歌单重绑定、R8 体积优化（29.6MB→5.7MB）",
   "apk": "https://gh-proxy.com/https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
   "apkMirror": "https://ghfast.top/https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
   "apkAlt": "https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
-  "sha256": "86fd9095de233da47b64bff63f2504cd1255669935e7b0d236f981977541afc9"
+  "sha256": "6af1d127efcbbfd21d19faf62735fd0569a970db0d1df2259de4162b93f8f3f7"
 }
