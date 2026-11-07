@@ -23,3 +23,8 @@ Thumbs.db
 # 捕获与性能记录
 captures/
 *.hprof
+
+# 正式签名密钥（绝不进版本库：泄露 = 任何人可签同签名包覆盖安装）
+keystore/
+*.jks
+*.keystore

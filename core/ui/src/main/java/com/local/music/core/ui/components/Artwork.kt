@@ -251,7 +251,9 @@ private const val WaveBarMaxPx = 13f
  *  真曲库文件：mediaUri = MediaStore content uri；coverBitmap = 内嵌封面缩略图；
  *  lyricLines = 同名 .lrc 解析结果（缺省用 DemoCatalog.lyrics 演示歌词）；
  *  格式参数：codec/sampleRateHz/bitDepth/bitrateKbps（0 = 未知，展示时降级）；
- *  元数据：genre 为扫描真值（空 = 未知流派，分组视图归一展示）；year/trackNo 取 MediaStore（0 = 未知）。 */
+ *  元数据：genre 为扫描真值（空 = 未知流派，分组视图归一展示）；year/trackNo/discNo 取 MediaStore（0 = 未知）；
+ *  albumArtist 空串 = 标签缺失（专辑分组时回退到 [artist]，见 AppState.albumGroupsFrom）。
+ *  **新增字段一律带默认值**：快照/缓存的旧数据缺这些键时按默认值解码，不要求字段一定存在。 */
 data class DemoSong(
     val id: String,
     val title: String,
@@ -263,6 +265,36 @@ data class DemoSong(
     val genre: String = "",
     val year: Int = 0,
     val trackNo: Int = 0,
+    /** 专辑艺术家（MediaStore ALBUM_ARTIST / 标签 TPE2）：专辑分组键的第二元。
+     *  空串 = 标签缺失 → 分组时回退到 [artist]（合辑的专辑艺术家通常是
+     *  "Various Artists"，缺失的普通专辑回退到曲目艺术家 = 旧行为）。
+     *  用空串而非 null：与 [genre]/[year]/[trackNo] 的「哨兵值 = 未知」口径一致，
+     *  旧缓存/旧快照缺该键时直接落到同一路径，不需要额外 null 分支。 */
+    val albumArtist: String = "",
+    /** 碟号（MediaStore DISC_NUMBER / 标签 TPOS）：多碟专辑内排序的**第一键**。
+     *  0 = 未知（很多 MP3 根本没有 TPOS 帧，MediaProvider 也常填 NULL）→ 排序时排**末尾**，
+     *  **不是**当成第 0 碟排最前。这一点极易写反：若把 0 当第 1 碟，一张没打碟号的专辑里
+     *  那些「恰好没编号」的歌会被排到正式第 1 碟之前，比改造前的字母序还离谱。
+     *  排序实现在 AppState.sortAlbumTracks（0 → Int.MAX_VALUE），与这里必须同口径。 */
+    val discNo: Int = 0,
+    /**
+     * 本机能否解码该曲目的容器/编码（扫描期由 [com.local.music.player.MediaLibrary] 按 MIME 判定）。
+     *
+     * **为什么需要这个字段**：本工程的播放引擎只依赖 `media3-exoplayer` + `media3-session`，
+     * 没有接 FFmpeg 扩展渲染器。而 `mimeToCodec` 表里明确写了 `audio/ape → APE`、
+     * `audio/x-ms-wma → WMA` —— 于是用户在歌曲信息面板会看到一个漂亮的「APE · 44.1kHz / 16bit」，
+     * 点播放却得到「音频格式不支持播放」。**「说了做不到」比「没说」伤口碑得多**，这是审计
+     * （01 报告 14a）点名的整类问题。
+     *
+     * 所以在扫描期就把「引擎能不能解」这件事判出来并落到数据模型上，让 UI 有机会诚实标注。
+     * 判定口径是**保守**的：只把 Media3 开箱支持的那批 MIME 判为 true，其余一律 false ——
+     * 宁可对某个冷门但恰好能解的容器少标一次「不支持」，也不能反过来宣称支持然后播不了。
+     *
+     * 默认 `true`（乐观）是刻意的：默认值面向「旧缓存 / 旧快照里没有这个键的条目」与
+     * 「演示曲目」这两类场景，它们要么是真能播的常规格式，要么根本不参与播放判定；
+     * 给 false 会让升级后的首屏把所有老歌都标成「不支持」，那才是真正的事故。
+     */
+    val playable: Boolean = true,
     val inLibrary: Boolean = true,
     val mediaUri: String? = null,
     val coverBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
@@ -305,5 +337,11 @@ object DemoData {
 
 /** 秒数 → mm:ss 显示串（进度文本/倒计时共用）。
  *  同 [DemoSong.duration]，固定 Locale.US：默认 locale 会输出本地化数字字形，
- *  而这里是纯数值展示（不是给用户看的本地化量词），必须跨区域稳定。 */
-fun Int.asTime(): String = String.format(java.util.Locale.US, "%02d:%02d", this / 60, this % 60)
+ *  而这里是纯数值展示（不是给用户看的本地化量词），必须跨区域稳定。
+ *
+ *  负值钳到 0：引擎时长未知时可能传出 -1（C.TIME_UNSET 的转换残留），
+ *  原实现会渲染成 "00:-1"（Kotlin 对负数的整除/取模都是负），是明显的显示 bug。 */
+fun Int.asTime(): String {
+    val sec = this.coerceAtLeast(0)
+    return String.format(java.util.Locale.US, "%02d:%02d", sec / 60, sec % 60)
+}

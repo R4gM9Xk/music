@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  4x2 封面版 — appwidget-provider 声明
+
+  尺寸（同上一个文件的网格换算：70 * n - 30 dp）：
+  - minWidth  = 4 格 = **250dp**
+  - minHeight = 2 格 = **110dp**
+  封面版的内容（64dp 封面 + 两行文字 + 进度 + 44dp 控制）需要约 146dp，
+  所以 targetCellHeight 给到 **2**，minHeight 按 2 格声明。用户在部分 ROM 上
+  拖到 2 格高时布局会略微紧凑（封面 64 + 控制 44 是硬需求），这是可接受的。
+-->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="250dp"
+    android:minHeight="110dp"
+    android:targetCellWidth="4"
+    android:targetCellHeight="2"
+    android:maxResizeWidth="400dp"
+    android:maxResizeHeight="300dp"
+    android:initialLayout="@layout/widget_music_square"
+    android:previewImage="@mipmap/ic_launcher"
+    android:description="@string/widget_desc_square"
+    android:resizeMode="horizontal|vertical"
+    android:updatePeriodMillis="0"
+    android:widgetCategory="home_screen" />

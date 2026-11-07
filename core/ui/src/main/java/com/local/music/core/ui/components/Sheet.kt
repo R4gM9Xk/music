@@ -50,6 +50,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.paneTitle
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -204,6 +211,32 @@ internal val LocalSheetExitFinished = staticCompositionLocalOf<() -> Unit> { {} 
 private const val EXIT_FALLBACK_MS = 64L
 
 /**
+ * 面板容器自身的读屏文案（无障碍 P0-4）。
+ *
+ * **为什么要集中成对象**：本轮（task-4）不建 strings.xml（那是 task-5 的活），文案先用
+ * 中文字面量；但若把字面量直接散进 `semantics { contentDescription = "关闭面板" }` 里，
+ * 下一轮做资源抽取时就得反过来在 UI 代码里逐个 grep 定位。集中成常量后，抽取动作变成
+ * 「把这个对象整体搬进 resources + 改这里的引用」，每个文案的**唯一来源**仍是这里。
+ *
+ * 只放面板容器自己的文案。菜单项文案（「下一首播放」「全部播放」等）**不搬进来**——
+ * 它们来自 [SheetAction] 的 label/subtitle 形参，是可见文字，读屏靠 merge 自动朗读，
+ * 硬编码到常量里反而会造成「界面文案 vs 读屏文案」双源漂移。
+ */
+private object SheetA11y {
+    /** 面板遮罩：点它 = 关闭面板（明眼用户点面板外部，盲用户走读屏动作） */
+    const val BACKDROP = "关闭面板"
+
+    /**
+     * 队列面板「清空」按钮。
+     *
+     * 可见文字只有「清空」两字，紧跟在「接下来 · N 首」右侧；读屏按节点顺序朗读时
+     * 上下文（那行段头文字）已经过去了，单独一个「清空」无法自解释。
+     * 文案里写清**作用范围**：只清「接下来」，不动正在播放的那首。
+     */
+    const val CLEAR_UP_NEXT = "清空接下来要播放的歌曲"
+}
+
+/**
  * 在 modal.show { } 内挂 GlassSheet 的便捷包装：自动接宿主 visible/dismiss——
  * 各屏不再直接渲染 GlassSheet（效果层统一在根层宿主）。
  */
@@ -277,6 +310,29 @@ fun GlassSheet(
             modifier
                 .fillMaxSize()
                 .background(Color.Black.copy(alpha = 0.35f))
+                // 读屏（无障碍 P0-4）：这个 Box 只是为了「点面板外部关闭面板」而整屏铺满的
+                // 视觉遮罩，本身就画一层 35% 黑。若不处理语义，TalkBack 会把它当成一个
+                // 占满全屏、无描述的可点节点——盲用户划进面板时第一个落点常是它，
+                // 读屏只念「按钮」，既不知道这是什么、也不知道点了会怎样。
+                //
+                // 这里给两条语义：
+                // 1. contentDescription = "关闭面板" —— 让这个节点自解释。
+                // 2. **必须同时挂 onClick 动作** —— 明眼用户靠「点外面」关闭面板，盲用户
+                //    没有这个手势；把点击暴露成读屏可执行的动作后，局部导航里就多出一条
+                //    「关闭面板」，功能对等。只写 contentDescription 不挂 onClick 是**更糟**
+                //    的假修复：读屏会念「关闭面板」却点不动，文案承诺了一个不存在的功能。
+                //
+                // 关于「焦点圈在面板内」：不要试图在这里用 accessibilityFocusGroup ——
+                // 那是 compose-ui 1.11+ 的 API，本工程锁在 1.10.0（见 libs.versions.toml），
+                // 用了直接编译不过。1.10.0 的正确做法是把 paneTitle 挂在**面板本体**上
+                // （见下方 GlassSurface 的注释），而不是挂在遮罩上。
+                .semantics {
+                    this.contentDescription = SheetA11y.BACKDROP
+                    onClick(label = SheetA11y.BACKDROP) {
+                        onDismiss()
+                        true
+                    }
+                }
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
@@ -289,6 +345,12 @@ fun GlassSheet(
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .imePadding()
+                    // 语义清洗：这个 Box 存在的唯一目的是「吞掉打在面板上的点击」，
+                    // 防止透传到下面的 scrim 把面板关掉。它是纯手势挡板，
+                    // **有意无描述、且从无障碍树里摘掉**（clearAndSetSemantics {}）——
+                    // 否则读屏会在整片面板内容之前多插一个「无描述的可点节点」。
+                    // 注意 clearAndSetSemantics 只清本节点语义，子级（真正的菜单项）不受影响。
+                    .clearAndSetSemantics { }
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
@@ -296,7 +358,18 @@ fun GlassSheet(
                     ),
             ) {
                 GlassSurface(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        // 读屏（无障碍 P0-4）：paneTitle 把这块底部面板声明成一个「窗格」。
+                        // 这是 compose-ui 1.10.0 里表达「焦点圈在面板内」的标准做法
+                        // （accessibilityFocusGroup 要到 1.11+ 才有，本工程不能用）。
+                        // 挂面板本体而不是挂遮罩：paneTitle 的语义是「这片区域是一个独立
+                        // 窗格」，读屏进入时先报窗格名，再把焦点限制在窗格内部遍历——
+                        // 盲用户因此不会划着划着跑到被面板压黑的背景层上去，
+                        // 打开面板时也立刻知道「现在弹出了什么」。
+                        // 标题复用 GlassSheet 的 title 形参：面板顶部的可见标题就是它，
+                        // 不另造一份文案（避免界面与读屏两个来源）。
+                        .semantics { paneTitle = title },
                     level = GlassLevel.Md,
                     shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
                     blur = GlassLevel.Md,
@@ -347,7 +420,30 @@ fun GlassSheet(
     }
 }
 
-/** 面板动作行：32dp 玻璃图标块 + 主副标题；emphasized = 选中态（强调色） */
+/**
+ * 面板动作行：32dp 玻璃图标块 + 主副标题；emphasized = 选中态（强调色）。
+ *
+ * **读屏语义（无障碍 P0-4）**：这是全 App 所有菜单项的唯一渲染点——
+ * SongActionsSheet（下一首播放/收藏/加入歌单/歌曲信息…）、CollectionActionsSheet
+ * （全部播放/重命名/删除…）、排序面板、添加歌曲面板全部经它出图。
+ * 所以这一处的语义补齐，等价于把「曲库/搜索/歌单/播放页所有 Sheet 菜单」一次性修好，
+ * 是本次收益/成本比最高的一处。
+ *
+ * 为什么要 `mergeDescendants = true`（这一点不是可选的）：
+ * 行内是「图标块 Box + 标题 Text + 可选副标题 Text」三个兄弟节点。Compose 默认**不会**
+ * 把 Row 的子节点合并成一个无障碍节点，于是 TalkBack 会把这行拆成 3 个可聚焦项——
+ * 其中图标块是个完全无文字的空节点（读屏停上去只念「按钮」）、标题和副标题又各停一次。
+ * 对一行「下一首播放 / 添加到当前播放队列之后」的动作项，盲用户要划 3 下才能确认自己
+ * 停在哪里，且中间那个空节点纯属噪声。merge 后整行收敛为单个按钮节点，
+ * 读屏一次念完「下一首播放，添加到当前播放队列之后，按钮」。
+ *
+ * 为什么不给 Row 写死 contentDescription 而是让子 Text 自然合并：label/subtitle 本身就是
+ * 可见文字，merge 后 Compose 按子树文字顺序拼出描述——**不写死**才不会在文案改动时
+ * 出现「读屏念旧文案、界面显示新文案」的双源漂移（这类缺陷审计查不出来，只有盲用户能撞上）。
+ *
+ * 子 Icon 传 null 是对的、且必须保持 null：图标纯粹是行首视觉锚点，语义已由同行的
+ * 标题/副标题承担；若给它一并描述，读屏会把同一句话念两遍（见 PlayPauseButton 同款说明）。
+ */
 @Composable
 fun SheetAction(
     icon: ImageVector,
@@ -366,6 +462,9 @@ fun SheetAction(
             .clip(RoundedCornerShape(14.dp))
             .pressScale(interactionSource, pressed = 0.98f)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+            // 语义挂在 clickable 同一个节点上（与 Chrome.MiniBarButton / PlayerScreen.ConsoleIcon
+            // 同款写法），整行合并为单个 Button 节点，见上方 KDoc
+            .semantics(mergeDescendants = true) { this.role = Role.Button }
             .padding(horizontal = 6.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -377,6 +476,8 @@ fun SheetAction(
                 .background(glass.md),
             contentAlignment = Alignment.Center,
         ) {
+            // contentDescription = null 是**有意为之、非遗漏**：图标为行首视觉锚点，
+            // 语义由同一行的 label/subtitle 承担（merge 后自动朗读），给了就是重复播报
             Icon(
                 icon, null, Modifier.size(18.dp),
                 tint = if (emphasized) accent else LocalGlassColors.current.textPrimary,
@@ -506,6 +607,16 @@ fun QueueSheet(
                     modifier = Modifier
                         .pressScale(clearInteraction, pressed = 0.92f)
                         .clickable(interactionSource = clearInteraction, indication = null, onClick = onClearUpNext)
+                        // 读屏（无障碍 P0-4）：可见文字只有「清空」两个字，脱离视觉上下文时
+                        // 读屏念出来是歧义的——「清空」什么？整个队列？搜索框？当前筛选？
+                        // 它实际只清「接下来」这一段（当前曲与已播段不受影响），
+                        // 所以这里用 contentDescription 把**作用域**说清楚，并补 role = Button
+                        // （纯 Text + clickable 不会自动获得按钮角色，读屏不提示「双击激活」）。
+                        // 注意 contentDescription 会**覆盖**子 Text 的文字，不再重复播报。
+                        .semantics {
+                            this.role = Role.Button
+                            this.contentDescription = SheetA11y.CLEAR_UP_NEXT
+                        }
                         .padding(horizontal = 6.dp, vertical = 4.dp),
                 )
             }

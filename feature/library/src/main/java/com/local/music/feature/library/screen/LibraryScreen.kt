@@ -34,6 +34,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.ArtStyle
@@ -210,18 +213,29 @@ fun LibraryScreen(
                         item(key = "tab-empty-1") { TabEmptyState("还没有专辑") }
                     } else {
                         groups.chunked(2).forEach { pair ->
-                            item(key = "album:${pair.first().key}") {
+                            // LazyColumn 的 item key 必须唯一，而**专辑名**不唯一：两张同名
+                            // 不同艺术家的专辑会有相同的 key → Compose 直接抛
+                            // "Key ... was already used" 崩溃（不是显示错乱，是崩）。
+                            // 所以 item key 用分组唯一标识 id，而不是展示名 key。
+                            item(key = "album:${pair.first().id}") {
                                 Row(
                                     Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
                                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                                 ) {
                                     pair.forEach { album ->
                                         PlaylistCard(
+                                            // 卡片标题仍是**纯专辑名**（album.key），不是定位用的 id：
+                                            // id 里带着 NUL + 专辑艺术家，是内部实现对，不能漏到界面上
                                             title = album.key, meta = album.meta, art = album.art,
-                                            onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Album, album.key)) },
+                                            // 详情定位走 album.id（专辑名 + 专辑艺术家二元组）：
+                                            // 旧实现传 album.key，两只同名专辑会进同一张详情页
+                                            onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Album, album.id)) },
                                             onLongClick = {
                                                 collectionActions(
-                                                    DetailTarget(DetailTarget.Kind.Album, album.key), album.key, album.songs,
+                                                    // 第一个参数是**定位目标** → 用 id；
+                                                    // 第二个参数是集合操作面板的**标题文案** → 必须是专辑名，
+                                                    // 换成 id 会把 NUL 串显示在面板标题上
+                                                    DetailTarget(DetailTarget.Kind.Album, album.id), album.key, album.songs,
                                                 )
                                             },
                                             modifier = Modifier.weight(1f),
@@ -387,6 +401,14 @@ private fun GroupRow(
             .clip(RoundedCornerShape(14.dp))
             .pressScale(interactionSource, pressed = 0.98f)
             .then(rowClickable)
+            // 读屏（无障碍 P0-4）：整行可点（= 进入该分组的详情页），但 clickable /
+            // combinedClickable 只提供 onClick 动作、**不带 role**，读屏只会把
+            // title + meta 当一段文字念出来，盲用户无法判断这行能进。
+            // 补 role = Button 后读屏念「周杰伦，12 首，按钮，双击激活」。
+            //
+            // 不写 contentDescription：title/meta 是可见文字，clickable 自带
+            // mergeDescendants 会按子树顺序拼出描述，写死反而形成双源漂移。
+            .semantics { this.role = Role.Button }
             .padding(horizontal = 14.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -402,6 +424,8 @@ private fun GroupRow(
             Text(meta, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
+        // 装饰性 chevron，**有意 null、非遗漏**：只是「这行能进去」的视觉提示，
+        // 同一件事已由整行的 role = Button 表达，读屏再念一次「右箭头」纯属噪声
         Icon(GlassIcons.ChevronRight, null, Modifier.size(16.dp), tint = LocalGlassColors.current.textTertiary)
     }
 }

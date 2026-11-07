@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  4x1 播放条 — appwidget-provider 声明
+
+  ## 尺寸怎么算的
+  Android 的小部件网格单位是 `70 * n - 30` dp（n = 占几格），即
+    1 格 = 40dp，2 格 = 110dp，3 格 = 180dp，4 格 = 250dp。
+  - minWidth  = 4 格 = **250dp**（起始放置宽度）
+  - minHeight = 1 格 = **40dp**，但 40dp 装不下 48dp 的封面 + padding，
+    所以实际按 **2 格高（110dp）**声明更诚实 —— 声明 1 格却要求 2 格的空间，
+    会被部分 ROM 直接拒绝放置（表现为「选择器里有，拖不出来」）。
+    这里取 **minHeight = 110dp**（2 格），保证一个横条 + 呼吸空间。
+  - targetCellWidth/Height（API 31+）与 minWidth/minHeight 同时声明：
+    新系统优先用 cell 语义（对折叠屏/大屏更准），旧系统回落到 dp。
+
+  ## updatePeriodMillis = 0 的理由
+  0 = 禁止系统周期性唤醒。小部件是**事件驱动**刷新的（播放状态变化时由
+  MusicPlaybackProvider / Service 主动推），周期性唤醒只会白白耗电：
+  按最小允许值 30 分钟算，一天也要唤醒 48 次 × N 个实例，而实际可能一天都没播一次。
+
+  ## previewImage
+  系统小部件选择器里显示的预览图。用应用图标（adaptive icon 在 API 33+ 可直接引用
+  mipmap）—— 4x1 的预览在本机上无法生成真实截图，与其画一张假的界面图，不如用
+  品牌图标 + 准确的描述文字（见 description 属性），至少不误导用户。
+-->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="250dp"
+    android:minHeight="110dp"
+    android:targetCellWidth="4"
+    android:targetCellHeight="2"
+    android:maxResizeWidth="400dp"
+    android:maxResizeHeight="160dp"
+    android:initialLayout="@layout/widget_music_wide"
+    android:previewImage="@mipmap/ic_launcher"
+    android:description="@string/widget_desc_wide"
+    android:resizeMode="horizontal|vertical"
+    android:updatePeriodMillis="0"
+    android:widgetCategory="home_screen" />

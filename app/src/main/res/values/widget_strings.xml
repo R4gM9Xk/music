@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小部件专用字符串。
+  **单独成文件而不是塞进 strings.xml**：strings.xml 由无障碍/文案抽取那条线在管
+  （见 task-5），widget 的这几条只要落在独立文件里，两边就不会互相覆盖。
+-->
+<resources>
+    <!-- 系统小部件选择器里显示在名字下方的描述。要能让人**不用点进去**就知道这个卡片是什么 -->
+    <string name="widget_desc_wide">4×1 播放条：封面、歌名与上一首/播放暂停/下一首</string>
+    <string name="widget_desc_square">4×2 封面版：大封面、歌名、进度与完整播放控制</string>
+
+    <!-- 小部件自身名称（部分 ROM 的选择器标题用这个名字） -->
+    <string name="widget_label_wide">音乐播放条</string>
+    <string name="widget_label_square">音乐封面</string>
+</resources>

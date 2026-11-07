@@ -1,0 +1,71 @@
+name: build
+
+# 为什么只做「构建 + 单测」两件事：
+# 本项目此前零 CI，导致 `CoverArtBitmap.kt` 这类「源码没提交」的问题
+# 一直存在到有人 clone 才发现。CI 的第一价值不是覆盖率，是**证明仓库是可构建的**。
+#
+# 不做的事（刻意）：
+# - 不发版（release.sh 是本机脚本，依赖本机 JDK/SDK 路径与签名文件，不适合放 CI）
+# - 不上传 APK（无版本标签语义，产物对 PR 无意义）
+# - 不跑 lint（工程未配置 lint 基线，首次接入会产生大量历史告警，等单独一轮清理再接）
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # 允许手动触发，便于验证
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true # 同一分支连推时取消旧任务，省额度
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 版本目录里 compileSdk=36 / minSdk=35，需要对应平台包。
+      # setup-android 只装命令行工具，平台包要显式装。
+      - name: Install SDK platform
+        run: |
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # 工程要求 local.properties 里有 sdk.dir；CI 上由 ANDROID_HOME 提供，
+      # 但 AGP 在找不到 local.properties 时也会读环境变量，这里显式写一份更稳。
+      - name: Provide local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      # 项目路径含中文（Windows 本机），AGP 需要 overridePathCheck。
+      # 仓库路径在 CI 上是 ASCII，但 gradle.properties 里已有该开关，无需额外处理。
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      # 测试报告在失败时最有价值，无条件上传
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: |
+            **/build/reports/tests/testDebugUnitTest/
+          retention-days: 7

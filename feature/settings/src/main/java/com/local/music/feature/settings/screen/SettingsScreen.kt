@@ -42,12 +42,19 @@ import com.local.music.core.ui.components.ThemeColorSwatches
 import com.local.music.core.ui.components.asTime
 import com.local.music.core.ui.theme.AuroraPalette
 import com.local.music.core.ui.state.AppState
+import com.local.music.core.ui.state.BassBoostLevelLabels
+import com.local.music.core.ui.state.BassBoostStrengths
 import com.local.music.core.ui.state.EqPreset
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.SleepTimerOptions
 import com.local.music.core.ui.state.ThemeMode
+import com.local.music.core.ui.state.VirtualizerLevelLabels
+import com.local.music.core.ui.state.VirtualizerStrengths
+import com.local.music.core.ui.state.bassBoostSubtitle
+import com.local.music.core.ui.state.loudnessNormSubtitle
 import com.local.music.core.ui.state.sleepTimerLabel
 import com.local.music.core.ui.state.sleepTimerSubtitle
+import com.local.music.core.ui.state.virtualizerSubtitle
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.GlassIntensity
@@ -82,6 +89,20 @@ fun SettingsScreen(
     onImportM3u: () -> Unit = {},
     onExportBackup: () -> Unit = {},
     onImportBackup: () -> Unit = {},
+    /**
+     * 崩溃日志入口（04 报告 #3 的最后一环）。
+     *
+     * 崩溃日志的**实现**在 app 模块（`com.local.music.crash.CrashHandler`），而本屏属于
+     * `feature:settings`——feature 模块不能反向依赖 app 模块，所以这里只能拿到「数量」与
+     * 「动作」两个抽象。数量用来决定这一行显不显示、副标题写什么；动作由 app 层用 SAF
+     * 拉起导出（与备份导出同一套 CreateDocument 通道）。
+     *
+     * 为什么把「数量」而不是「是否有日志」传进来：用户看到「有 3 份」比看到「有崩溃日志」
+     * 更有实感，也更容易意识到「原来我崩过三次」而不是「大概是别人的设备问题」。
+     */
+    crashLogCount: Int = 0,
+    onExportCrashLogs: () -> Unit = {},
+    onClearCrashLogs: () -> Unit = {},
     // E2：自启动引导（仅国产省电 ROM 显示该行）
     autoStartGuideSubtitle: String? = null,
     onAutoStartGuide: () -> Unit = {},
@@ -94,6 +115,16 @@ fun SettingsScreen(
      */
     corruptSnapshot: Boolean = false,
     onRebuildFromCorrupt: () -> Unit = {},
+    /**
+     * 桌面歌词开关（P0-8）。与 crashLogCount 同一套解耦模式：开关**状态**由 app 层
+     * 持久化（SettingsStore 快照）并经 MediaSession 命令下发服务端，本屏只拿布尔与
+     * 两个动作。权限引导也整个丢回 app 层——canDrawOverlays / ACTION_MANAGE_OVERLAY_PERMISSION
+     * 都是 framework 细节，feature:settings 不该知道。
+     */
+    desktopLyricsEnabled: Boolean = false,
+    onDesktopLyricsEnabledChange: (enabled: Boolean) -> Unit = {},
+    // 悬浮窗权限未授予时的引导跳转（去系统「显示在其他应用上层」页）
+    onDesktopLyricsPermission: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var scanning by remember { mutableStateOf(false) }
@@ -327,6 +358,107 @@ fun SettingsScreen(
                     },
                 )
                 RowDivider()
+                // ── 音效链：响度归一 / 低音增强 / 虚拟环绕 ──────────────────────
+                // 为什么这三项放在「均衡器」下面：它们是同一类东西（都挂播放器音频会话的
+                // audiofx），用户的心智模型是「音效」一组。也正因为它们会改变听感，
+                // 三项**默认全关**，与上面 EQ 默认「关闭」保持一致口径。
+                SettingRow(
+                    GlassIcons.Wave, "响度归一", loudnessNormSubtitle(state.audioFx),
+                    onClick = { state.setLoudnessNorm(!state.audioFx.loudnessNorm) },
+                    trailing = {
+                        GlassToggle(
+                            state.audioFx.loudnessNorm,
+                            onToggle = { state.setLoudnessNorm(it) },
+                        )
+                    },
+                )
+                RowDivider()
+                // 低音增强：整行可点开档位面板，尾部开关直接开关（与「扫描过滤」同款双通道）
+                SettingRow(
+                    GlassIcons.Wave, "低音增强", bassBoostSubtitle(state.audioFx),
+                    onClick = {
+                        modal.show {
+                            ModalSheet(modal, "低音增强") {
+                                // 「关闭」作为显式一档：否则用户进了这个面板却无法从这里关掉，
+                                // 只能退出去拨尾部开关（面板里关不掉是常见的体验断点）
+                                SheetAction(
+                                    icon = GlassIcons.Wave,
+                                    label = "关闭",
+                                    subtitle = "不改变原始低频",
+                                    emphasized = !state.audioFx.bassBoost,
+                                    onClick = {
+                                        state.setBassBoost(false)
+                                        modal.requestDismiss()
+                                    },
+                                )
+                                BassBoostStrengths.forEachIndexed { level, _ ->
+                                    SheetAction(
+                                        icon = GlassIcons.Wave,
+                                        label = BassBoostLevelLabels[level],
+                                        subtitle = "强度 ${BassBoostStrengths[level]}（0-1000）",
+                                        // 只有「已开启且档位相同」才高亮：关闭状态下没有任何一档在生效
+                                        emphasized = state.audioFx.bassBoost &&
+                                            level == state.audioFx.safeBassLevel,
+                                        onClick = {
+                                            // 选档位隐含「打开」：用户点「强」的意图是听到强低音，
+                                            // 而不是「记住这个档但先别生效」（旧式两段操作反直觉）
+                                            state.selectBassLevel(level)
+                                            state.setBassBoost(true)
+                                            modal.requestDismiss()
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    },
+                    trailing = {
+                        GlassToggle(
+                            state.audioFx.bassBoost,
+                            onToggle = { state.setBassBoost(it) },
+                        )
+                    },
+                )
+                RowDivider()
+                SettingRow(
+                    GlassIcons.Wave, "虚拟环绕", virtualizerSubtitle(state.audioFx),
+                    onClick = {
+                        modal.show {
+                            ModalSheet(modal, "虚拟环绕") {
+                                SheetAction(
+                                    icon = GlassIcons.Wave,
+                                    label = "关闭",
+                                    subtitle = "保持原始声场",
+                                    emphasized = !state.audioFx.virtualizer,
+                                    onClick = {
+                                        state.setVirtualizer(false)
+                                        modal.requestDismiss()
+                                    },
+                                )
+                                VirtualizerStrengths.forEachIndexed { level, _ ->
+                                    SheetAction(
+                                        icon = GlassIcons.Wave,
+                                        label = VirtualizerLevelLabels[level],
+                                        subtitle = "强度 ${VirtualizerStrengths[level]}（0-1000）· 耳机下更明显",
+                                        emphasized = state.audioFx.virtualizer &&
+                                            level == state.audioFx.safeVirtualLevel,
+                                        onClick = {
+                                            state.selectVirtualLevel(level)
+                                            state.setVirtualizer(true)
+                                            modal.requestDismiss()
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    },
+                    trailing = {
+                        GlassToggle(
+                            state.audioFx.virtualizer,
+                            onToggle = { state.setVirtualizer(it) },
+                        )
+                    },
+                )
+                RowDivider()
                 SettingRow(
                     GlassIcons.Moon, "定时关闭", sleepSubtitle,
                     onClick = {
@@ -355,6 +487,16 @@ fun SettingsScreen(
                     GlassIcons.Mic, "歌词", "优先读取本地 .lrc 歌词文件",
                     onClick = { state.lyricEnabled = !state.lyricEnabled },
                     trailing = { GlassToggle(state.lyricEnabled, onToggle = { state.lyricEnabled = it }) },
+                )
+                RowDivider()
+                // 桌面歌词（P0-8）：悬浮窗单行歌词。开关形态与「歌词」同款双通道。
+                // 权限判定整个在 app 层的 [onDesktopLyricsEnabledChange] 里做：
+                // 未授权时它不真正开开关、而是跳系统授权页——本屏不需要知道 canDrawOverlays
+                SettingRow(
+                    GlassIcons.Wave, "桌面歌词",
+                    if (desktopLyricsEnabled) "播放中显示悬浮歌词，可拖动" else "未开启 · 需悬浮窗权限",
+                    onClick = { onDesktopLyricsEnabledChange(!desktopLyricsEnabled) },
+                    trailing = { GlassToggle(desktopLyricsEnabled, onToggle = onDesktopLyricsEnabledChange) },
                 )
             }
 
@@ -476,6 +618,34 @@ fun SettingsScreen(
                     "从备份文件还原全部数据（覆盖当前）",
                     onClick = onImportBackup,
                 )
+                RowDivider()
+                // ── 崩溃日志（04 报告 #3）──
+                // 崩溃采集本身早已实现（CrashHandler 把未捕获异常写到 filesDir/crash/），
+                // 但此前**没有任何导出入口** —— 日志躺在用户手机里，开发者永远拿不到，
+                // 等于「用户反馈闪退时你手上只有 0 条信息」这个问题没解决。
+                // 这一行就是那条闭环的最后一米：用户崩了 → 进设置 → 导出 → 发给你。
+                //
+                // 无日志时**也显示**这一行（副标题写「暂无记录」）而不是整行隐藏：
+                // 隐藏会让用户以为「这个 App 没有日志功能」，而它其实一直在记录；
+                // 显式写「暂无」同时也是一种安抚——说明当前没有攒下崩溃。
+                SettingRow(
+                    GlassIcons.Book,
+                    "崩溃日志",
+                    if (crashLogCount > 0) {
+                        "$crashLogCount 份记录 · 点击导出（纯本地文本，不含曲库与个人信息）"
+                    } else {
+                        "暂无记录"
+                    },
+                    onClick = onExportCrashLogs,
+                )
+                if (crashLogCount > 0) {
+                    RowDivider()
+                    SettingRow(
+                        GlassIcons.Trash, "清空崩溃日志",
+                        "删除本机已记录的全部崩溃日志",
+                        onClick = onClearCrashLogs,
+                    )
+                }
             }
 
             SectionHeader("关于")

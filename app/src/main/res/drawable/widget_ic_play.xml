@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小部件控制 ：播放。与 core/ui 的 GlassIcons.Play 同一路径（M8 5.5 19 12 8 18.5z），
+  这里必须用 Android vector 再写一遍而不是复用 Compose ImageVector：
+  RemoteViews 不跑 Compose，只能吃 drawable 资源。
+
+  为什么要单独一份而不是从 core/ui 取：RemoteViews 引用的是 **:app 模块自己的**
+  R.drawable —— core/ui 的 drawable 资源虽然会合并进 APK，但跨模块引用要写全限定名
+  （com.local.music.core.ui.R），在 RemoteViews 的 setImageViewResource 里
+  传资源 id 时容易踩 nonTransitiveRClass 的坑（本工程开了
+  android.nonTransitiveRClass=true，各模块 R 类不传递）。放 :app 下最稳。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M8,5.5 L19,12 L8,18.5 Z" />
+</vector>

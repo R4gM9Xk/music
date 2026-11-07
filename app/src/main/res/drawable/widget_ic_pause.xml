@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小部件控制 ：暂停。两条圆角竖条，与 core/ui 的 GlassIcons.Pause 一致。
+  圆角用 pathData 里的圆角矩形近似（RemoteViews 的矢量光栅化走系统 VectorDrawable，
+  不支持 stroke 上的 lineCap，所以用填充路径而不是描线）。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 左条：x 7..10.2，圆角 1.6 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M7,6.6 A1.6,1.6 0 0,1 8.6,5 L8.6,5 A1.6,1.6 0 0,1 10.2,6.6 L10.2,17.4 A1.6,1.6 0 0,1 8.6,19 L8.6,19 A1.6,1.6 0 0,1 7,17.4 Z" />
+    <!-- 右条 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M13.8,6.6 A1.6,1.6 0 0,1 15.4,5 L15.4,5 A1.6,1.6 0 0,1 17,6.6 L17,17.4 A1.6,1.6 0 0,1 15.4,19 L15.4,19 A1.6,1.6 0 0,1 13.8,17.4 Z" />
+</vector>

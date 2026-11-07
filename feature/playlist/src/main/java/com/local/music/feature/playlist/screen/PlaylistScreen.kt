@@ -30,6 +30,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.ArtStyle
@@ -95,6 +98,11 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                 .weight(1f)
                 .verticalScroll(scrollState),
         ) {
+            // 读屏（无障碍 P0-4）：**必须传 actionLabel**。
+            // 旧实现只给了 actionIcon + onAction，actionLabel 为 null，于是 PageHeader 内部
+            // 连 semantics 都不挂 —— 「新建歌单」这个入口对读屏是一个哑节点（只念「按钮」）。
+            // PageHeader 现在有「标题，操作 1」的兜底描述，所以不漏但难听；
+            // 这里补上精确文案才是正解（兜底是防遗漏的网，不是终态方案）。
             PageHeader(title = "歌单", actionIcon = GlassIcons.Plus, onAction = {
                 // 新建歌单面板（含输入框：GlassSheet 的 imePadding 让其浮在键盘之上，机制不动）
                 modal.show {
@@ -134,7 +142,7 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                         )
                     }
                 }
-            })
+            }, actionLabel = "新建歌单")
             // 玻璃封面墙（内建歌单已被删除的不再显示）。P2-22：userPlaylists 先经 resolvePlaylist
             // 实时解析——计数与详情页同口径、失效 id 被过滤；内建歌单 visibleBuiltInPlaylists()
             // 已 resolve 过，重复 resolve 幂等（songIndex 缓存 O(1)），可接受
@@ -246,6 +254,11 @@ private fun FavoriteRow(
             .clip(RoundedCornerShape(R.Card14.dp))
             .pressScale(interactionSource, pressed = 0.98f)
             .then(rowClickable)
+            // 读屏（无障碍 P0-4）：整行可点（= 进入该动态歌单详情），但 clickable /
+            // combinedClickable 不带 role，读屏只会念「收藏，12 首」而不会提示「按钮」。
+            // 补 role 后读屏念「收藏，12 首，按钮，双击激活」。
+            // 不写 contentDescription：title/meta 已是可见文字，mergeDescendants 自动合并。
+            .semantics { this.role = Role.Button }
             .padding(horizontal = 14.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -256,6 +269,7 @@ private fun FavoriteRow(
             Spacer(Modifier.height(2.dp))
             Text(meta, color = LocalGlassColors.current.textTertiary, fontSize = 12.sp)
         }
+        // 装饰性 chevron，**有意 null、非遗漏**：语义由整行的 role = Button 表达
         Icon(GlassIcons.ChevronRight, null, Modifier.size(16.dp),
             tint = LocalGlassColors.current.textTertiary)
     }

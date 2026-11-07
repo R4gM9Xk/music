@@ -32,4 +32,6 @@ dependencies {
     implementation(libs.foundation)
     implementation(libs.material3)
     api(libs.haze) // LocalHazeState 公开 HazeState，消费方需可见 haze 类型
+
+    testImplementation(libs.junit)
 }

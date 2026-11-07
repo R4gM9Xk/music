@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ============================================================================
+  4x1 播放条（横条布局）
+  ============================================================================
+  约束：RemoteViews 只认 **白名单里的控件与容器**（FrameLayout / LinearLayout /
+  RelativeLayout / GridLayout / TextView / ImageView / ProgressBar / Button …），
+  且**不支持 ConstraintLayout**、不支持自定义 View、不支持 layout_weight 之外的
+  任何复杂测量。所以这里全部用 LinearLayout + weight 手写，宁可笨拙也不要踩「布局
+  在桌面上渲染成空白」的坑（那是小部件最典型的故障，且没有任何报错日志）。
+
+  尺寸约定：4x1 的可用高度在主流 ROM 上约 56-72dp，所以
+  - 根容器不让它 fillMaxHeight，靠 android:padding + 内容自然高度撑开；
+  - 封面固定 48dp（48 + 上下 padding 8*2 = 64dp，落在安全区间）；
+  - 所有文字 singleLine + ellipsize=end，避免长标题把行高顶破。
+
+  根容器 id 必须是 widget_root（清单元件点击 → 拉起 App）。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:background="@drawable/widget_bg"
+    android:paddingStart="10dp"
+    android:paddingEnd="6dp"
+    android:paddingTop="8dp"
+    android:paddingBottom="8dp">
+
+    <!-- 封面缩略图：48dp 固定，圆角裁切由 clipToOutline 在代码里另做（见 MusicWidgetViews） -->
+    <ImageView
+        android:id="@+id/widget_art"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_marginEnd="10dp"
+        android:scaleType="centerCrop"
+        android:contentDescription="专辑封面"
+        android:src="@drawable/widget_art_placeholder" />
+
+    <!-- 文字区：占满剩余宽度，weight=1 -->
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/widget_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:singleLine="true"
+            android:ellipsize="end"
+            android:textColor="#FFFFFFFF"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:shadowColor="#80000000"
+            android:shadowDx="0"
+            android:shadowDy="1"
+            android:shadowRadius="2" />
+
+        <!-- 横条版把这个 TextView 常驻 GONE，标题与艺术家拼成一行（见 bindWide）。
+             仍然要声明：4x1 在窄宽时会被当成 square 布局复用同一套 id 查找，
+             缺失 id 会让 RemoteViews.setTextViewText 直接抛 IllegalArgumentException。 -->
+        <TextView
+            android:id="@+id/widget_subtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:singleLine="true"
+            android:ellipsize="end"
+            android:textColor="#B3FFFFFF"
+            android:textSize="11sp"
+            android:visibility="gone" />
+
+        <!-- 进度条 & 时间：横条版隐藏，但同样必须存在（id 查找不到会崩） -->
+        <ProgressBar
+            android:id="@+id/widget_progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="3dp"
+            android:layout_marginTop="4dp"
+            android:max="100"
+            android:progress="0"
+            android:progressDrawable="@drawable/widget_progress"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/widget_time"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="#80FFFFFF"
+            android:textSize="10sp"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <!-- 空态文案：`未在播放`。hasCurrent=false 时显示，控制按钮整组隐藏 -->
+    <TextView
+        android:id="@+id/widget_empty"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="6dp"
+        android:textColor="#99FFFFFF"
+        android:textSize="12sp"
+        android:visibility="gone" />
+
+    <!-- 控制组：上一首 / 播放暂停 / 下一首 -->
+    <LinearLayout
+        android:id="@+id/widget_controls"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <ImageView
+            android:id="@+id/widget_prev"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:padding="9dp"
+            android:src="@drawable/widget_ic_prev"
+            android:background="@android:color/transparent"
+            android:contentDescription="上一首" />
+
+        <ImageView
+            android:id="@+id/widget_play"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:padding="10dp"
+            android:src="@drawable/widget_ic_play"
+            android:background="@android:color/transparent"
+            android:contentDescription="播放或暂停" />
+
+        <ImageView
+            android:id="@+id/widget_next"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:padding="9dp"
+            android:src="@drawable/widget_ic_next"
+            android:background="@android:color/transparent"
+            android:contentDescription="下一首" />
+    </LinearLayout>
+</LinearLayout>

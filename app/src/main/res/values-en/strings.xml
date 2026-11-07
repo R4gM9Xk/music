@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  英文资源（i18n 的第一步：让 App 有第二种语言可选）。
+
+  ## 为什么先做 en 而不是别的语言
+  - 它是 Google Play 默认语言，也是「应用能否出海」的最低门槛；
+  - 审计报告指出「零 values-xx」意味着国际市场零可能——补一份 en 就把这条路打开了；
+  - 其余语言（繁中 / 日 / 韩）可以在有真实需求时再补，资源结构已经就位。
+
+  ## 翻译原则（写给未来的译者）
+  1. **不直译**：中文的「已收录 X 首」在英文里更自然是 "X tracks"；
+  2. **保持简洁**：播放器按钮文案要短（"Next" 而不是 "Go to next track"），
+     通知栏与小部件空间极窄；
+  3. **术语统一**：Track / Album / Artist / Playlist / Queue 全库统一用这几个词；
+  4. **格式占位符必须与中文版一致**（%1$d / %1$s），否则运行期会抛
+     IllegalFormatException——这是本地化最经典的崩溃来源。
+-->
+<resources>
+
+    <!-- ── Common ── -->
+    <string name="common_cancel">Cancel</string>
+    <string name="common_confirm">OK</string>
+    <string name="common_delete">Delete</string>
+    <string name="common_rename">Rename</string>
+    <string name="common_share">Share</string>
+    <string name="common_retry">Retry</string>
+    <string name="common_unknown_artist">Unknown artist</string>
+    <string name="common_unknown_album">Unknown album</string>
+    <string name="common_unknown_genre">Unknown genre</string>
+    <string name="common_no_lyrics">♪ No lyrics</string>
+
+    <!-- ── Player controls ── -->
+    <string name="player_btn_collapse">Close player</string>
+    <string name="player_btn_more">More playback options</string>
+    <string name="player_btn_play">Play</string>
+    <string name="player_btn_pause">Pause</string>
+    <string name="player_btn_prev">Previous</string>
+    <string name="player_btn_next">Next</string>
+    <string name="player_btn_shuffle">Shuffle</string>
+    <string name="player_btn_repeat">Repeat mode</string>
+    <string name="player_btn_queue">Open queue</string>
+    <string name="player_btn_favorite">Favorite</string>
+    <string name="player_btn_unfavorite">Remove from favorites</string>
+    <string name="player_state_playing">Playing</string>
+    <string name="player_state_paused">Paused</string>
+    <string name="player_state_favorited">Favorited</string>
+    <string name="player_state_not_favorited">Not favorited</string>
+    <string name="player_state_shuffle_on">On</string>
+    <string name="player_state_shuffle_off">Off</string>
+    <string name="player_repeat_off">In order</string>
+    <string name="player_repeat_all">Repeat all</string>
+    <string name="player_repeat_one">Repeat one</string>
+    <string name="player_progress_desc">Playback progress</string>
+    <string name="player_source_local">Local music</string>
+
+    <!-- ── Library / playlists ── -->
+    <string name="library_tab_songs">Songs</string>
+    <string name="library_tab_albums">Albums</string>
+    <string name="library_tab_artists">Artists</string>
+    <string name="library_tab_folders">Folders</string>
+    <string name="library_tab_genres">Genres</string>
+    <string name="library_tab_playlists">Playlists</string>
+    <string name="library_empty_no_songs_title">No songs yet</string>
+    <string name="library_empty_no_permission_title">Music access required</string>
+    <string name="library_empty_no_permission_desc">Grant access to scan your music</string>
+    <string name="library_scanning">Scanning…</string>
+
+    <!-- ── Settings ── -->
+    <string name="settings_section_appearance">Appearance</string>
+    <string name="settings_section_playback">Playback</string>
+    <string name="settings_section_library">Library</string>
+    <string name="settings_section_data">Data</string>
+    <string name="settings_section_about">About</string>
+    <string name="settings_crash_logs">Crash logs</string>
+    <string name="settings_crash_logs_empty">No records</string>
+    <string name="settings_crash_logs_clear">Clear crash logs</string>
+    <string name="settings_desktop_lyrics">Desktop lyrics</string>
+    <string name="settings_desktop_lyrics_on">Show floating lyrics during playback (draggable)</string>
+    <string name="settings_desktop_lyrics_off">Off · Requires overlay permission</string>
+
+    <!-- ── Share / ringtone ── -->
+    <string name="action_share_song">Share song</string>
+    <string name="action_set_ringtone">Set as ringtone</string>
+    <string name="action_share_playlist">Share playlist</string>
+    <string name="share_no_app">No app available to share</string>
+    <string name="ringtone_no_support">This device does not support setting ringtone in-app</string>
+
+    <!-- ── Playback errors ── -->
+    <string name="error_file_missing">Audio file is missing or unreadable</string>
+    <string name="error_format_unsupported">Audio format not supported</string>
+    <string name="error_file_missing_skipped">Audio file is missing or unreadable — skipped</string>
+    <string name="error_format_unsupported_skipped">Audio format not supported — skipped</string>
+    <string name="error_skip_limit">Skipped %1$d tracks and still cannot play; auto-skip paused</string>
+    <string name="error_engine_disconnected">Playback service disconnected</string>
+    <string name="error_engine_connect_failed">Cannot connect to playback service</string>
+    <string name="format_unsupported_hint">%1$s (not supported on this device)</string>
+
+    <!-- ── Restore report ── -->
+    <string name="restore_report_all_matched">Restored %1$d tracks</string>
+    <string name="restore_report_partial">Restored %1$d tracks, %2$d not found (file paths changed)</string>
+    <string name="restore_report_none">None of the %1$d tracks were found (file paths changed)</string>
+
+
+</resources>

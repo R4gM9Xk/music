@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小部件进度条：细线 + 已播部分亮色。
+
+  **为什么自己画而不是用系统默认**：默认的 progressBarStyleHorizontal 走的是
+  Material 的三层 drawable（background/progress/secondaryProgress），在 RemoteViews
+  里下发到桌面后，部分 ROM 会把 progress 层按主题色渲染成**亮紫**（Theme.Material 的
+  accent），与本小部件的深色玻璃底完全不搭。自己给两层渐变，颜色可控。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 轨道 -->
+    <item android:id="@android:id/background">
+        <shape android:shape="rectangle">
+            <solid android:color="#33FFFFFF" />
+            <corners android:radius="2dp" />
+        </shape>
+    </item>
+    <!-- 已播（secondaryProgress 不用，但保留同一形状避免高度不一致） -->
+    <item android:id="@android:id/secondaryProgress">
+        <scale
+            android:scaleWidth="100%"
+            android:scaleGravity="start|center_vertical">
+            <shape android:shape="rectangle">
+                <solid android:color="#4DFFFFFF" />
+                <corners android:radius="2dp" />
+            </shape>
+        </scale>
+    </item>
+    <!-- 进度 -->
+    <item android:id="@android:id/progress">
+        <scale
+            android:scaleWidth="100%"
+            android:scaleGravity="start|center_vertical">
+            <shape android:shape="rectangle">
+                <solid android:color="#FFFFFFFF" />
+                <corners android:radius="2dp" />
+            </shape>
+        </scale>
+    </item>
+</layer-list>

@@ -8,8 +8,10 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.local.music.core.ui.state.AppStateSnapshot
+import com.local.music.core.ui.state.AudioFxSettings
 import com.local.music.core.ui.state.PlaylistSnapshot
 import com.local.music.core.ui.state.SnapshotStore
+import com.local.music.core.ui.state.SongRematch
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -315,7 +317,16 @@ class SettingsStore(context: Context) : SnapshotStore {
         private val KEY_SCAN_FILTER_SHORT = booleanPreferencesKey("scan_filter_short")
         /** All-Files 引导一次性标记（见 [allFilesPrompted]）：与快照无关，故独立键 */
         private val KEY_ALL_FILES_PROMPTED = booleanPreferencesKey("all_files_prompted")
-        private const val VERSION = 9
+        /**
+         * 快照 schema 版本。
+         *
+         * v10：新增 `trackRefs`（曲目指纹表，换机 re-match 用）。
+         * 为什么升版（而不是像 scanFilterShort/playCounts 那样靠 opt 默认值悄悄兼容）：
+         * v 号是「这个文件可能包含旧版本读不懂的东西」的唯一信号，而本字段体积可达 1MB 级，
+         * 一旦被旧版 App 静默忽略后再写回，用户那份备份的指纹就永久没了（旧版无法恢复它）。
+         * 升版后旧版解码会走 P3-62 的「来自更新版本」拒绝分支，宁可明确失败也不静默拆解。
+         */
+        private const val VERSION = 10
 
         /** P2-27：损坏快照留档份数上限（见 [dumpCorrupt]），够人工排查即可 */
         private const val CORRUPT_KEEP = 3
@@ -418,6 +429,52 @@ class SettingsStore(context: Context) : SnapshotStore {
             // 睡眠定时器（v9）：分钟档模式 + 到期时间戳；0 值照写（结构稳定，读侧 opt 默认值同型）
             put("sleepTimerMode", s.sleepTimerMode)
             put("sleepTimerDeadlineMs", s.sleepTimerDeadlineMs)
+            // 音效链（v10）：响度归一 / 低音增强 / 虚拟环绕。
+            //
+            // **为什么压成一个嵌套对象而不是 5 个平铺键**：这 5 个值是一组状态，
+            // 服务端收到的是整组覆盖（CMD_SET_AUDIO_FX 一次带全）。嵌套后「缺失」只有一种含义
+            // （整组没设过 → 默认全关），不会出现「bassBoost 读到、bassLevel 缺失」这种半套状态；
+            // 平铺 5 键则必须接受任意组合缺失，读侧要写 5 个 opt 默认值，且它们的组合不保证合法。
+            //
+            // 默认全关是硬要求：旧备份（≤v9）没有这段 → 解码走 AudioFxSettings() 默认值
+            // （三项全关）→ 用户升级后听到的声音与升级前逐比特一致。
+            put(
+                "audioFx",
+                JSONObject().apply {
+                    put("loudnessNorm", s.audioFx.loudnessNorm)
+                    put("bassBoost", s.audioFx.bassBoost)
+                    put("bassLevel", s.audioFx.bassLevel)
+                    put("virtualizer", s.audioFx.virtualizer)
+                    put("virtualLevel", s.audioFx.virtualLevel)
+                },
+            )
+            // 曲目指纹表（v10）：换机 re-match 的唯一输入。
+            //
+            // **为什么必须存**：曲目 id = "f" + 绝对路径，换机后路径全变，而 id 里推不出
+            // 标题/艺术家/专辑/时长——没有这张表，恢复时只能按文件名硬碰，
+            // 「用户改了文件名」或「文件被并入扁平目录」就彻底找不回来。
+            //
+            // 编码形态：每个曲目压成一个 4 元数组 [title, artist, album, durationSec]，
+            // 而不是嵌套对象。理由是体积：万首曲库用对象形态多出约 4 倍键名开销
+            // （每首约 60 字节 × 4 个键名 × 10000 首 ≈ 2.4MB 纯键名），而备份文件
+            // 是用户要上传到网盘/发微信的东西。数组形态下每首约 40-120 字节。
+            //
+            // 空表也照写：结构稳定，读侧靠 has() 区分「字段缺失（≤v9 旧备份）」与
+            // 「显式空表（新版本但曲库为空）」——两者行为一致（都退化为纯文件名匹配），
+            // 但显式写出让将来排查问题时能一眼看出备份是哪个版本产生的。
+            put(
+                "trackRefs",
+                JSONObject().apply {
+                    s.trackRefs.forEach { (id, ref) ->
+                        put(id, JSONArray().apply {
+                            put(ref.title)
+                            put(ref.artist)
+                            put(ref.album)
+                            put(ref.durationSec)
+                        })
+                    }
+                },
+            )
         }.toString()
 
         /**
@@ -435,10 +492,24 @@ class SettingsStore(context: Context) : SnapshotStore {
                     return null
                 }
             }
-            val snapshot = if (raw.trimStart().startsWith("{")) {
-                runCatching { decodeJson(JSONObject(raw)) }
-            } else {
-                runCatching { decodeLegacy(raw) }
+            // 两条分支都必须**兜住异常并降级为 null**，不能只包一条：
+            // - decodeJson 里大量 `.optXxx` 本身不会抛，但 `JSONObject(raw)` 构造会
+            //   （非法 JSON / 超大嵌套），且 stringSet/listOfPlaylists 这类辅助函数里有
+            //   `getString` 之类的强类型读取，坏数据照样抛
+            // - decodeLegacy 有 `require(size >= 15)`，旧格式被截断时必抛
+            // 任何一条漏包，坏快照就会一路冒到调用方，表现为「一启动就闪退」——
+            // 而快照损坏本身是可恢复的（三态读取会把它留档重建），绝不能让它变成崩溃。
+            //
+            // 注：这里曾出现过一处调试残留（把上面的 runCatching 去掉、只留注释
+            // "TEMP-DEBUG: 让异常直接冒出来"），导致 else 分支的 `.getOrNull()` 类型不匹配、
+            // **release 编译直接失败**。debug 分支当时因为另一处逻辑不同而侥幸能编过，
+            // 属于典型的「只有 release 挂、最容易漏」的问题。恢复时两条分支一并写全。
+            val snapshot = runCatching {
+                if (raw.trimStart().startsWith("{")) {
+                    decodeJson(JSONObject(raw))
+                } else {
+                    decodeLegacy(raw)
+                }
             }.getOrNull()
             if (snapshot == null) Log.e(TAG, "snapshot decode failed; ignoring (len=${raw.length})")
             return snapshot
@@ -495,7 +566,49 @@ class SettingsStore(context: Context) : SnapshotStore {
                 ?.optString("queueSource"), // 旧版本（≤v7）无此字段：null 零迁移
             sleepTimerMode = o.optInt("sleepTimerMode", 0), // 旧版本（≤v8）无此字段：默认 0 零迁移
             sleepTimerDeadlineMs = o.optLong("sleepTimerDeadlineMs", 0L), // 旧版本（≤v8）无此字段：默认 0 零迁移
+            // 音效链（v10）：旧版本（≤v9）无此字段 → 整组默认（三项全关，听感不变）。
+            // 逐项 opt 默认值兜住「对象在但某个键缺失」的残缺写法；档位索引的越界由
+            // AudioFxSettings.safeBassLevel / safeVirtualLevel 在**使用侧**钳制
+            // （存进来的是不是越界值不重要，用的时候一定合法，不会被数组越界打断）。
+            audioFx = o.optJSONObject("audioFx")?.let { fx ->
+                AudioFxSettings(
+                    loudnessNorm = fx.optBoolean("loudnessNorm", false),
+                    bassBoost = fx.optBoolean("bassBoost", false),
+                    bassLevel = fx.optInt("bassLevel", AudioFxSettings.DEFAULT_LEVEL),
+                    virtualizer = fx.optBoolean("virtualizer", false),
+                    virtualLevel = fx.optInt("virtualLevel", AudioFxSettings.DEFAULT_LEVEL),
+                )
+            } ?: AudioFxSettings(),
+            // 曲目指纹表（v10）：换机 re-match 的输入。旧版本（≤v9）无此字段 → 空表零迁移，
+            // 此时 SongRematch 退化为「只按文件名匹配」，仍然远好于旧实现「匹配不上就静默丢弃」。
+            // 逐项容错：单个条目的数组残缺/类型错乱只丢弃该条，不让整份备份解码失败——
+            // 指纹是「锦上添花」的数据，绝不能因为它坏而让用户的歌单/收藏一起读不出来。
+            trackRefs = parseTrackRefs(o.optJSONObject("trackRefs")),
         )
+
+        /**
+         * 解析曲目指纹表（见 [encode] 的 trackRefs 段）。
+         *
+         * 每条独立 runCatching：坏一条只丢一条。这是有意为之——备份文件可能经过
+         * 各种中转（云盘、微信、编辑器），个别条目损坏时用户宁可「少几条文件名的匹配
+         * 能力」，也不能接受「整份备份读不出来、歌单全丢」。
+         */
+        private fun parseTrackRefs(obj: JSONObject?): Map<String, SongRematch.TrackRef> {
+            if (obj == null) return emptyMap()
+            val out = HashMap<String, SongRematch.TrackRef>(obj.length() * 2)
+            obj.keys().forEach { id ->
+                runCatching {
+                    val arr = obj.optJSONArray(id) ?: return@runCatching
+                    out[id] = SongRematch.TrackRef(
+                        title = arr.optString(0, ""),
+                        artist = arr.optString(1, ""),
+                        album = arr.optString(2, ""),
+                        durationSec = arr.optInt(3, 0),
+                    )
+                }
+            }
+            return out
+        }
 
         // ── v1（旧版）：\u001F 分字段 / \u001E 分集合项 / \u001D 分子字段，仅作迁移 ──
 

@@ -43,6 +43,8 @@ import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -163,19 +165,32 @@ fun ProgressTrack(
         contentAlignment = Alignment.CenterStart,
     ) {
         // 读屏进度语义：独立小组件，10Hz 变化只重组它自己，不波及整条 Chrome
-        ProgressSemantics(progressProvider)
+        ProgressSemantics(progressProvider, if (enabled) onSeek else null)
     }
 }
 
-/** 进度轨的读屏语义载体（零尺寸）：state 读取被隔离在此，重组范围最小 */
+/** 进度轨的读屏语义载体（零尺寸）：state 读取被隔离在此，重组范围最小。
+ *
+ *  [onSeek] 非空时挂 [setProgress] 动作——**这是「可拖动」的读屏表达**：
+ *  只给 progressBarRangeInfo 的话，TalkBack 只会念「播放进度，45%」，
+ *  用户仍然无法在盲操作下调整进度（本页唯一的 seek 入口就是这条轨）。
+ *  补上 setProgress 后，读屏把节点识别为「可调整」，上/下滑即按 5% 步进 seek。
+ *  [onSeek] = null（enabled = false 的纯展示轨）时不挂该动作，避免读屏提示一个不生效的手势。
+ */
 @Composable
-private fun ProgressSemantics(progressProvider: () -> Float) {
+private fun ProgressSemantics(progressProvider: () -> Float, onSeek: ((Float) -> Unit)?) {
     Box(
         Modifier
             .fillMaxSize()
             .semantics {
                 contentDescription = "播放进度"
                 progressBarRangeInfo = ProgressBarRangeInfo(progressProvider().coerceIn(0f, 1f), 0f..1f)
+                if (onSeek != null) {
+                    setProgress { target ->
+                        onSeek(target.coerceIn(0f, 1f))
+                        true
+                    }
+                }
             },
     )
 }
@@ -262,11 +277,20 @@ fun MiniPlayerBar(
             }
             // 空曲库不渲染控制键（见函数 KDoc）
             if (hasSongs) {
-                MiniBarButton(onPlayPause, Modifier.trackFlight(FlightKeys.MiniPlay, keepOnDispose = true)) {
+                MiniBarButton(
+                    onClick = onPlayPause,
+                    contentDescription = if (playing) "暂停" else "播放",
+                    stateDescription = if (playing) "正在播放" else "已暂停",
+                    modifier = Modifier.trackFlight(FlightKeys.MiniPlay, keepOnDispose = true),
+                ) {
                     Icon(if (playing) GlassIcons.Pause else GlassIcons.Play, null,
                         Modifier.size(22.dp), tint = glass.textPrimary)
                 }
-                MiniBarButton(onNext, Modifier.trackFlight(FlightKeys.MiniNext, keepOnDispose = true)) {
+                MiniBarButton(
+                    onClick = onNext,
+                    contentDescription = "下一首",
+                    modifier = Modifier.trackFlight(FlightKeys.MiniNext, keepOnDispose = true),
+                ) {
                     Icon(GlassIcons.Next, null, Modifier.size(22.dp), tint = glass.textPrimary)
                 }
             }
@@ -297,7 +321,9 @@ fun MiniPlayerBar(
 @Composable
 private fun MiniBarButton(
     onClick: () -> Unit,
+    contentDescription: String,
     modifier: Modifier = Modifier,
+    stateDescription: String? = null,
     content: @Composable () -> Unit,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
@@ -305,6 +331,12 @@ private fun MiniBarButton(
         modifier
             .pressScale(interactionSource, pressed = 0.88f)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+            // 语义挂 clickable 节点本身；子 Icon 传 null（避免重复播报），见 PlayPauseButton 同款说明
+            .semantics {
+                this.role = Role.Button
+                this.contentDescription = contentDescription
+                if (stateDescription != null) this.stateDescription = stateDescription
+            }
             .padding(4.dp),
     ) { content() }
 }
@@ -350,6 +382,10 @@ fun GlassNavBar(
                         .semantics {
                             this.role = Role.Tab
                             this.selected = on
+                            // tab 的可见文字就是标签本身，但 Icon 没有描述、Column 又没合并子节点：
+                            // 不显式给 contentDescription 时，TalkBack 会把「图标(无描述) + 文字」
+                            // 拆成两个节点，读屏出现一个空节点。显式指定后整列合并为单个可读 tab。
+                            this.contentDescription = label
                         },
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,

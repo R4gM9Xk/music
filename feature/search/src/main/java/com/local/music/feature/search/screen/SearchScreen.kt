@@ -31,6 +31,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.Color
@@ -119,6 +122,10 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                             state.searchQuery = ""
                             state.screen = GlassScreen.Library
                         }
+                        // 读屏（无障碍 P0-4）：纯 Text + clickable，没有 role，
+                        // 读屏念「取消」但不提示可点。补 role = Button 即可，
+                        // 可见文字「取消」本身就是最好的描述（不另写 contentDescription）。
+                        .semantics { this.role = Role.Button }
                         .padding(4.dp),
                 )
             }
@@ -213,7 +220,10 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         val visibleAlbums = if (showAllAlbums) albums else albums.take(2)
                         // 专辑卡是两列一行：每个 LazyColumn item 承担一整行（item 内不能再懒）
                         visibleAlbums.chunked(2).forEachIndexed { rowIndex, pair ->
-                            item(key = "album-row-$rowIndex-${pair.first().key}") {
+                            // item key 用专辑分组的唯一标识 id，而不是展示名 key：
+                            // 两张同名不同艺术家的专辑 key 相同，LazyColumn 会因 key 重复崩溃
+                            // （rowIndex 只区分行，同一行内两张同名专辑仍会撞）
+                            item(key = "album-row-$rowIndex-${pair.first().id}") {
                                 AlbumRow(pair, state)
                             }
                         }
@@ -228,7 +238,12 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                                         .pressScale(expandInteraction, pressed = 0.92f)
                                         .clickable(
                                             interactionSource = expandInteraction, indication = null,
-                                        ) { showAllAlbums = !showAllAlbums },
+                                        ) { showAllAlbums = !showAllAlbums }
+                                        // 读屏（无障碍 P0-4）：纯 Text + clickable，无 role。
+                                        // 这行文字本身在「全部 N 张专辑」/「收起」之间切换，
+                                        // 文字已完整表达当前可做的动作，所以只补 role 不写死描述
+                                        // （写死「展开专辑」会在收起态下念错，正是双源漂移的典型）。
+                                        .semantics { this.role = Role.Button },
                                 )
                             }
                         }
@@ -292,8 +307,9 @@ private fun AlbumRow(pair: List<LibraryGroup>, state: AppState) {
     ) {
         pair.forEach { album ->
             PlaylistCard(
+                // 标题仍是纯专辑名；定位用 id（专辑名 + 专辑艺术家），否则同名专辑会进错详情页
                 title = album.key, meta = album.meta, art = album.art,
-                onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Album, album.key)) },
+                onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Album, album.id)) },
                 modifier = Modifier.weight(1f),
                 bitmap = album.coverBitmap,
                 artworkUri = album.coverUri,
@@ -305,10 +321,24 @@ private fun AlbumRow(pair: List<LibraryGroup>, state: AppState) {
     }
 }
 
-/** 玻璃芯片（.chip），点击写入搜索词 */
+/**
+ * 玻璃芯片（.chip）：点历史词条回填搜索框。
+ *
+ * 读屏（无障碍 P0-4）：GlassSurface 内部走 combinedClickable，只提供动作、**不带 role**。
+ * 于是 TalkBack 把芯片念成一句普通文字「周杰伦」，盲用户完全不知道它是可点的
+ * —— 而「最近搜索」列表里这排芯片正是回填历史词条的唯一入口。
+ * 补 role = Button 后读屏念「周杰伦，按钮，双击激活」。
+ *
+ * 不写 contentDescription：`text` 本身就是可见文字，写死会与之双源漂移。
+ */
 @Composable
 private fun GlassChip(text: String, onClick: () -> Unit) {
-    GlassSurface(level = GlassLevel.Lo, shape = RoundedCornerShape(50), onClick = onClick) {
+    GlassSurface(
+        level = GlassLevel.Lo,
+        shape = RoundedCornerShape(50),
+        onClick = onClick,
+        modifier = Modifier.semantics { this.role = Role.Button },
+    ) {
         Text(
             text, color = LocalGlassColors.current.textSecondary,
             fontSize = 12.sp,

@@ -63,6 +63,32 @@ data class AppStateSnapshot(
     val queueSource: String? = null, // 队列语境标签（v8 起编码；null = 整库/未知，播放页「来自『…』」展示用）
     val sleepTimerMode: Int = 0, // 定时关闭模式（v9 起编码；Activity 重建后回显用）
     val sleepTimerDeadlineMs: Long = 0L, // 分钟档到期时间戳（v9 起编码）
+    /**
+     * 音效链开关（v10 起编码）：响度归一 / 低音增强 / 虚拟环绕，见 [AudioFxSettings]。
+     *
+     * **为什么整组存一个对象而不是拆成 5 个平铺字段**：这 5 个值永远一起下发、一起重放
+     * 给服务端（见 MusicPlaybackService.CMD_SET_AUDIO_FX），拆开会让「快照里出现半套状态」
+     * 这种不可能态变得可能，也让 decode 侧要多写 5 行带默认值的 opt。
+     *
+     * **默认值 = 全关**（[AudioFxSettings] 的默认构造）：旧版本（≤v9）备份没有这个字段时
+     * 解码走默认值，用户升级后听到的声音与升级前**完全一致**——这是硬要求，
+     * 不能让一次版本升级悄悄改变用户的听感。
+     */
+    val audioFx: AudioFxSettings = AudioFxSettings(),
+    /**
+     * 曲目指纹表（v10 起编码）：曲目 id → 标题/艺术家/专辑/时长。
+     *
+     * **这是换机 re-match 能工作的前提**：曲目 id 是 `"f" + 绝对路径`，换机后路径全变，
+     * 而 id 本身推不出任何可用于重新对位的元数据。把指纹随快照一起存下来，恢复后才能
+     * 走 [SongRematch] 的 3、4 级「标签匹配」（1、2 级只看文件名，不依赖这张表）。
+     *
+     * 默认空 Map = 旧版本（≤v9）备份没有这个字段：此时退化到纯文件名匹配，
+     * 仍然远好于旧实现「匹配不上就静默丢弃」。旧快照解码零迁移。
+     *
+     * 体积代价：每首约 60-120 字节 × 曲库规模。万首曲库约 1MB —— 与快照已有的
+     * addedTracks/playCounts 同量级，可接受（且只在恢复/备份时需要完整内容）。
+     */
+    val trackRefs: Map<String, SongRematch.TrackRef> = emptyMap(),
 )
 
 /** 持久化桥接：AppState 只面向它，实现在 app 模块（DataStore） */
@@ -157,11 +183,29 @@ interface PlayerEngine {
     var onMediaItemChanged: ((String?) -> Unit)?
     /** 引擎自动切换（完播/自动下一首）回调：仅用于播放次数统计（D1）——手动切歌不计 */
     var onAutoAdvanced: ((String?) -> Unit)?
-    var onError: ((String) -> Unit)?
+    /**
+     * 播放错误上报。
+     *
+     * [recovered] = true 表示引擎**已经自行恢复**（当前只有一个场景：坏文件被自动跳过、
+     * 队列继续往下播）。宿主据此可以只弹提示、**不清除播放态**。
+     *
+     * 为什么需要这个位：原先只有一个 message 参数，宿主拿到任何错误都无条件
+     * `playing = false; engineLoadedUri = null; onEngineDisconnected()`。
+     * 而「跳过坏文件」是个**成功恢复**的路径——音频其实还在播下一首，
+     * 却会把界面打成「已暂停」再被随后的 onMediaItemChanged 纠正回来，
+     * 用户看到的就是每次遇到坏文件都闪一下。区分开就不闪了。
+     *
+     * 默认 false（致命错误）是刻意的保守默认：新增调用点若忘了传，行为与改造前一致，
+     * 不会因为漏传就把真错误当成已恢复。
+     */
+    var onError: ((message: String, recovered: Boolean) -> Unit)?
     fun loadQueue(specs: List<SongSpec>, startIndex: Int, startSec: Float, autoPlay: Boolean)
     fun setRepeatMode(repeatAll: Boolean, repeatOne: Boolean)
     fun setShuffleMode(enabled: Boolean)
     fun setEqPreset(presetName: String)
+
+    /** 音效链开关（响度归一 / 低音增强 / 虚拟环绕）：整组下发服务端，见 [AudioFxSettings] */
+    fun setAudioFx(settings: AudioFxSettings)
     fun setSleepTimer(modeMinutes: Int)
     fun setPlaybackSpeed(speed: Float)
     fun play()
@@ -192,15 +236,40 @@ interface PlayerEngine {
 
 /** 曲库分组（专辑/艺术家/文件夹/流派共用） */
 data class LibraryGroup(
+    /** **展示名**：专辑 tab 显示专辑名、艺术家 tab 显示艺术家名、文件夹 / 流派同理。
+     *  这个字段一直是「给人看的」，改造后依然是——不要往里面塞分组键。 */
     val key: String,
     val songs: List<DemoSong>,
+    /**
+     * **分组唯一标识**：`DetailTarget.id` 用它定位详情页，`LazyColumn` 的 item key 也用它。
+     *
+     * 为什么必须和 [key] 分开：专辑分组键改造后是 `(专辑名, 专辑艺术家)` 二元组，
+     * 但界面上只能显示专辑名——两张同名专辑的用户期望是「两个都叫《精选集》的卡片」，
+     * 而不是「《精选集》」和「《精选集》｜周杰伦」这种把实现细节漏到 UI 上的产物。
+     *
+     * 所以拆成两个字段：key 管展示（可能重复），id 管定位（必须唯一）。
+     * 默认值 = key，保证艺术家/文件夹/流派/歌单这些「键本身就唯一」的分组不用改一行代码。
+     */
+    val id: String = key,
 ) {
     val art: ArtStyle get() = songs.first().art
     val coverBitmap get() = songs.first().coverBitmap
 
     /** 首曲封面地址：扫描不再预解码全库封面，卡片封面改为按需解码（ArtworkBitmapCache） */
     val coverUri get() = songs.first().artworkUri
-    val meta: String get() = "${songs.size} 首 · ${songs.first().artist}"
+
+    /**
+     * 卡片副标题：曲目数 + 艺术家。
+     *
+     * 艺术家取「专辑艺术家」而不是首曲艺术家——合辑的首曲艺术家只是恰好排在第一位的
+     * 那个人，用它当整张专辑的艺术家是错的（审计 02 报告点名的「合辑 meta 显示首曲艺术家」）。
+     * 专辑艺术家缺失时才回退首曲艺术家，与分组口径保持一致。
+     */
+    val meta: String
+        get() {
+            val albumArtist = songs.first().albumArtist.ifBlank { songs.first().artist }
+            return "${songs.size} 首 · $albumArtist"
+        }
 }
 
 /**
@@ -212,7 +281,26 @@ data class LibraryGroup(
  * 装载真曲库后再次尝试；服务端已在播则以 MediaSession 为权威。恢复落地前 scheduleSave
  * 是 no-op（hydrated 门控），避免初始化期间的默认演示状态覆盖磁盘快照。
  */
-class AppState {
+class AppState(
+    /**
+     * 时间源（毫秒）。默认取系统墙钟，**但允许注入**。
+     *
+     * 这是 04 报告 #6 点名「投入产出比最高的一步」：改造前本类在 8 处直接调
+     * `System.currentTimeMillis()`，导致睡眠定时（到点暂停）、队列快照节流
+     * （20s 一条）这两段逻辑**在单测里完全无法确定性验证**——你没法让真实时钟
+     * 快进 60 分钟，也没法断言「19.9s 和 20.1s 的边界到底哪边落盘」。
+     *
+     * 加一个带默认值的构造参数后，测试可以传入手动推进的假时钟：
+     * ```
+     * var now = 0L
+     * val state = AppState(clock = { now })
+     * ```
+     * 一行改动，换来的是「零测试不是没时间写，是写不出来」这个诊断的一半解药。
+     * 之所以用带默认值的参数而不是引入 DI 框架：**这是一个人能在一分钟内理解并采用的
+     * 最小改动**，而 Hilt 那套会让此刻的收益（可测）被迁移成本抵消掉。
+     */
+    private val clock: () -> Long = System::currentTimeMillis,
+) {
     // ── 导航 ──────────────────────────────────────────────
     // 初值是曲库页：旧实现是 Player，于是首装权限被拒 / 无音频的用户启动后直接看到
     // 一个没有 Chrome、没有「去授权」入口的占位播放页，必须自己按返回才找得到出路。
@@ -435,6 +523,15 @@ class AppState {
     var glassLevel by mutableStateOf(GlassIntensity.Standard)
     var motionLevel by mutableStateOf(MotionIntensity.Standard)
     var eqPreset by mutableStateOf(EqPreset.Off)
+
+    /**
+     * 音效链设置（响度归一 / 低音增强 / 虚拟环绕）：**默认全关**，见 [AudioFxSettings] 的
+     * 「为什么不默认开启」说明。改动一律经 [commitAudioFx]（由 setLoudnessNorm / setBassBoost /
+     * selectBassLevel / setVirtualizer / selectVirtualLevel 这几个公开 setter 调用）下发，
+     * 不要直接赋新值——直接赋值只改 UI 状态、服务端不知道，表现为「开关拨了没反应」。
+     */
+    var audioFx by mutableStateOf(AudioFxSettings())
+        private set
     var playbackSpeed by mutableFloatStateOf(1f) // 播放速度档（快照 v5 持久化；服务端 Sonic 变速不变调）
         private set
     var themeMode by mutableStateOf(ThemeMode.Dark)
@@ -576,13 +673,20 @@ class AppState {
         engine.onMediaItemChanged = { mediaId -> syncFromEngine(mediaId) }
         // 完播计数（D1）：引擎报告「自动切换到下一首」时才 +1（手动切歌不计数）
         engine.onAutoAdvanced = { finishedId -> finishedId?.let { bumpPlayCount(it) } }
-        engine.onError = { message ->
+        engine.onError = { message, recovered ->
             playbackError = message
-            playing = false
-            engineLoadedUri = null
-            // 引擎侧出错（含断连）时服务端的定时协程已不可信：清掉武装戳，
-            // 让下一次 syncEngineModes 按剩余时间重发（见 onEngineDisconnected 注释）
-            onEngineDisconnected()
+            // 已自动恢复（坏文件被跳过、队列继续往下播）时**不动播放态**：
+            // 音频还在放，把 playing 打成 false 只会让界面闪一下「暂停」再被
+            // onMediaItemChanged 纠正回来。同理不清 engineLoadedUri —— 那会让下一次
+            // syncEngineModes 误以为「当前曲没装载」而重发整条队列，等于每遇到一个
+            // 坏文件就重建一次队列（万首库时是一次可感知的卡顿）。
+            if (!recovered) {
+                playing = false
+                engineLoadedUri = null
+                // 引擎侧真出错（含断连）时服务端的定时协程已不可信：清掉武装戳，
+                // 让下一次 syncEngineModes 按剩余时间重发（见 onEngineDisconnected 注释）
+                onEngineDisconnected()
+            }
             scheduleSave()
         }
         // 服务为权威：读回现有曲目 / 进度 / 播放态（重新打开界面时服务可能仍在播）
@@ -646,12 +750,15 @@ class AppState {
         }
     }
 
-    /** 循环 / 随机 / 均衡器 / 播放速度 / 定时关闭 → 服务端播放器（切换即时下发；
+    /** 循环 / 随机 / 均衡器 / 音效链 / 播放速度 / 定时关闭 → 服务端播放器（切换即时下发；
      *  attachPlayer / prepareResume / startCurrent / restore 都经此补同步，速度随队列装载重下发） */
     private fun syncEngineModes(eng: PlayerEngine) {
         eng.setRepeatMode(repeatMode == RepeatMode.All, repeatMode == RepeatMode.One)
         eng.setShuffleMode(shuffleOn)
         eng.setEqPreset(eqPreset.name)
+        // 音效链必须走同一个公共出口：服务进程被杀后重启，服务端 audioFxSettings 回到默认全关，
+        // 而 UI 上开关还亮着 —— 不在这里补发，用户会觉得「音效上次开过，这次开机就没了」。
+        eng.setAudioFx(audioFx)
         eng.setPlaybackSpeed(playbackSpeed)
         // 定时关闭也在这里收敛：服务端定时器不持久化（服务重建即丢），而本方法恰好是
         // attachPlayer 与 restore 两条恢复路径的公共出口——不在公共出口补，就得两处各写一遍，
@@ -724,7 +831,7 @@ class AppState {
         if (sleepTimerNeedsCancel) return 0
         if (sleepTimerMode <= 0) return null
         if (effectiveSleepTimerMode() == 0) return 0 // 已过期：显式撤销
-        val remainMs = (sleepTimerDeadlineMs - System.currentTimeMillis()).coerceAtLeast(0L)
+        val remainMs = (sleepTimerDeadlineMs - clock()).coerceAtLeast(0L)
         if (remainMs <= 0L) return 0
         // ceil：见 KDoc 里的取舍说明（宁可晚 <60s，也不能因 floor 得到 0 而丢掉定时）
         return ((remainMs + 59_999L) / 60_000L).toInt()
@@ -778,7 +885,7 @@ class AppState {
             queueStateWriter?.invoke(specs, specIndex, snap.progressSec)
             lastQueueStateQueue = queue
             lastQueueStateIndex = snap.queueIndex
-            lastQueueStateAtMs = System.currentTimeMillis()
+            lastQueueStateAtMs = clock()
         }
     }
 
@@ -794,7 +901,7 @@ class AppState {
         if (queue !== lastQueueStateQueue || index != lastQueueStateIndex) return true
         // 暂停/未播放：位置不再漂移，写一次是廉价的且能保住精确续播点
         if (!playing) return true
-        return System.currentTimeMillis() - lastQueueStateAtMs >= QUEUE_STATE_MIN_INTERVAL_MS
+        return clock() - lastQueueStateAtMs >= QUEUE_STATE_MIN_INTERVAL_MS
     }
 
     /** 服务端可读的播放现场写出器（实现在 app 模块：写 files/queue_state.json）。
@@ -802,10 +909,217 @@ class AppState {
      *  注意：实现方必须自行切到 IO 线程——本函数在 UI tick 里被调（每 5s）。 */
     var queueStateWriter: ((specs: List<SongSpec>, index: Int, positionSec: Float) -> Unit)? = null
 
+    // ── 备份换机 re-match（P0-5 B）────────────────────────
+    //
+    // 曲目 id = "f" + 绝对路径（扫描处如此约定，理由见 MediaLibrary：MediaStore _id 会漂移，
+    // 只有路径跨扫描稳定）。这个设计唯一的致命副作用是**换机后路径全变**：
+    // 备份里的 favorites/playedIds/playCounts/userPlaylists/addedTracks 引用全部失配 →
+    // songById() 返回 null → 各 resolvePlaylist 的 mapNotNull 静默丢弃 →
+    // 用户看到「我恢复备份了但歌单全空了」，而且**没有任何提示**。对纯本地播放器，
+    // 「攒了两年的歌单换手机就没了」比任何 UI 缺陷都致命。
+    //
+    // 修复由三部分组成：
+    //   1) 备份里额外存一张 [AppStateSnapshot.trackRefs] 指纹表（id → 标题/艺术家/专辑/时长）；
+    //   2) 曲库装载后对「查不到的引用」跑 [SongRematch] 的四级重绑定；
+    //   3) 把结果写成 [RestoreReport] 交给 UI 顶部横幅，**不再静默**。
+
+    /**
+     * 快照用的指纹表：只收录「当前曲库」里的曲目（queue 里可能有已删文件的引用）。
+     *
+     * 为什么每次 snapshot 都全量重建：曲目标签（标题/艺术家）在重扫后可能被修正，
+     * 指纹跟着走才对得上；而曲库引用变化本身是低频事件，构建一次是 O(n) 的字符串拷贝，
+     * 与快照序列化本身的量级相同，不构成额外瓶颈。
+     *
+     * 复用 [songIndex] 不可行——那是「id → song」且只覆盖 library，这里正好需要全库，
+     * 所以直接遍历 library 就地构建（不做中间集合，避免万首曲库下的额外分配）。
+     */
+    private fun trackRefsSnapshot(): Map<String, SongRematch.TrackRef> {
+        val lib = library
+        if (lib.isEmpty()) return emptyMap()
+        val out = HashMap<String, SongRematch.TrackRef>(lib.size * 2)
+        for (song in lib) {
+            out[song.id] = SongRematch.TrackRef(
+                title = song.title,
+                artist = song.artist,
+                album = song.album,
+                durationSec = song.durationSec,
+            )
+        }
+        return out
+    }
+
+    /** 最近一次恢复的匹配统计（null = 还没恢复过 / 已消费）。UI 取走后置空，避免重复弹横幅 */
+    var restoreReport by mutableStateOf<RestoreReport?>(null)
+        private set
+
+    /** 消费恢复报告（横幅展示后调用；幂等） */
+    fun consumeRestoreReport() {
+        restoreReport = null
+    }
+
+    /**
+     * 备份恢复时记下的「本次恢复来自备份文件」标记，供 [rematchMissingRefs] 决定提示强度：
+     * 冷启动读本地快照也可能出现「引用失效」（用户删了歌），那是日常行为，不该弹横幅；
+     * 而备份恢复出现失效项必须告诉用户（他从别的手机迁过来，只能靠这句话判断迁移结果）。
+     */
+    private var restoreFromBackupFile = false
+
+    /** 备份恢复入口：与冷启动 [restore] 同路径，差别只有「这确实是用户在恢复备份文件」 */
+    fun restoreFromBackup(snapshot: AppStateSnapshot) {
+        restoreFromBackupFile = true
+        restore(snapshot)
+    }
+
+    /**
+     * 曲库装载后对失效引用做四级重绑定，并把统计写成 [restoreReport]。
+     *
+     * **必须在 library 已经就位之后调用**（即 [loadLibrary] 尾部）：否则曲库里还没有
+     * 新曲目可选，"匹配"必然全空。同一份曲库只跑一次（[rematchDoneFor] 记引用），
+     * 避免重扫时反复重跑与反复弹横幅。
+     *
+     * 回写范围 = 所有「存了曲目 id」的集合：favorites / playedIds / playCounts 的键 /
+     * userPlaylists 里 PlaylistSnapshot 无 id（它是数据类，id 在 addedTracks 的 key 上）→
+     * 实际写的是 addedTracks 的每条列表。无法匹配的条目**原样保留**（不删）：
+     * 用户至少能在恢复报告里看到「这些歌没找到」，而不是让它们凭空消失。
+     */
+    private fun rematchMissingRefs() {
+        // 只有「刚刚恢复过一份快照」才需要重匹配。没有这道闸，每次重扫都会重新统计
+        // 一遍失效引用（用户删歌是日常行为）→ 每次扫描都弹「N 首未找到」横幅，
+        // 把一条本该只出现一次的迁移报告变成噪音。
+        if (!rematchPending) return
+        val lib = library
+        val libIds = songIndex() // 内部按 library 引用缓存，这里刚换过 library，必然重建一次
+        val refs = pendingTrackRefs
+        rematchPending = false
+
+        // 收集全部「当前曲库解析不到」的引用（去重：同一 id 可能同时在收藏与歌单里）
+        val allIds = LinkedHashSet<String>(favorites.size + playedIds.size + playCounts.size + 64)
+        allIds += favorites
+        allIds += playedIds
+        allIds += playCounts.keys
+        // 内建歌单的「加入歌单」叠加层同样要覆盖（key 不在 userPlaylists 里）
+        addedTracks.forEach { (_, tracks) -> allIds += tracks }
+
+        var reused = 0
+        val missing = ArrayList<SongRematch.MissingRef>()
+        allIds.forEach { id ->
+            if (libIds.containsKey(id)) reused++ else missing += SongRematch.MissingRef(id, refs[id])
+        }
+        if (missing.isEmpty()) {
+            // 引用全部命中（绝大多数情况：同一台设备冷启动）：不打扰用户
+            if (restoreFromBackupFile) restoreReport = RestoreReport(reused, 0, 0, fromBackup = true)
+            restoreFromBackupFile = false
+            pendingTrackRefs = emptyMap()
+            return
+        }
+
+        val result = SongRematch.rematch(missing, lib)
+        if (result.mapping.isNotEmpty()) {
+            // 回写：Set/List/Map 的键一次性映射。注意 Set 的映射可能让两条旧 id 收敛到
+            // 同一个新 id —— SongRematch 的「唯一认领」保证了这种情况不会发生，
+            // 所以这里不会出现「收藏少了一首」的静默丢失。
+            remapIds(result.mapping, favorites)
+            remapIds(result.mapping, playedIds)
+            remapKeys(result.mapping, playCounts)
+            addedTracks.forEach { (_, tracks) -> remapIds(result.mapping, tracks) }
+        }
+
+        // 未匹配项的样本：优先给曲名（用户认得出），拿不到指纹就回退文件名
+        val samples = result.unresolved
+            .asSequence()
+            .map { oldId ->
+                refs[oldId]?.title?.takeIf { it.isNotBlank() }
+                    ?: SongRematch.basenameOf(oldId).ifBlank { oldId }
+            }
+            .distinct()
+            .take(RESTORE_REPORT_SAMPLE_LIMIT)
+            .toList()
+
+        restoreReport = RestoreReport(
+            reused = reused,
+            resolved = result.mapping.size,
+            missing = result.unresolved.size,
+            missingSamples = samples,
+            fromBackup = restoreFromBackupFile,
+        )
+        restoreFromBackupFile = false
+        pendingTrackRefs = emptyMap()
+    }
+
+    /**
+     * 集合内就地替换 id。
+     *
+     * **必须保留原有顺序**：`playedIds` 是「最近播放」的展示序（新→旧），
+     * 用 `remove + add` 会把每个被重绑定的曲目全踢到列表尾部——用户换机恢复后，
+     * 「最近播放」从「按时间排」变成「按 id 哈希排」，是比丢歌更隐蔽的错乱。
+     * 所以这里按索引写回（`set`），只在最后做一次去重，绝不改变相对顺序。
+     */
+    private fun remapIds(mapping: Map<String, String>, target: MutableList<String>) {
+        if (target.isEmpty() || mapping.isEmpty()) return
+        var changed = false
+        for (i in target.indices) {
+            val new = mapping[target[i]] ?: continue
+            if (new != target[i]) {
+                target[i] = new
+                changed = true
+            }
+        }
+        if (!changed) return
+        // 去重：两条旧 id 收敛到同一新 id 时只保留第一次出现的位置（SongRematch 已保证
+        // 不会发生，这里是防御性兜底——宁可少一条也不能让同一个 id 在「最近播放」里出现两次，
+        // 那会让 LazyColumn 的 key 重复直接崩溃）
+        val seen = HashSet<String>(target.size * 2)
+        var write = 0
+        for (read in target.indices) {
+            val v = target[read]
+            if (seen.add(v)) {
+                if (write != read) target[write] = v
+                write++
+            }
+        }
+        while (target.size > write) target.removeAt(target.lastIndex)
+    }
+
+    /** Set 版：集合本来无序，直接 remove/add 即可 */
+    private fun remapIds(mapping: Map<String, String>, target: MutableSet<String>) {
+        if (target.isEmpty() || mapping.isEmpty()) return
+        val hits = target.mapNotNull { old -> mapping[old]?.let { old to it } }.filter { it.first != it.second }
+        if (hits.isEmpty()) return
+        hits.forEach { (old, new) ->
+            target.remove(old)
+            target.add(new)
+        }
+    }
+
+    /** 播放次数的键映射：两条旧 id 映射到同一新 id 时**次数相加**（都是同一首歌的历史播放） */
+    private fun remapKeys(mapping: Map<String, String>, target: MutableMap<String, Int>) {
+        if (target.isEmpty() || mapping.isEmpty()) return
+        val moved = HashMap<String, Int>(mapping.size * 2)
+        mapping.forEach { (old, new) ->
+            val n = target.remove(old)
+            if (n != null) moved[new] = (moved[new] ?: 0) + n
+        }
+        moved.forEach { (new, n) -> target[new] = (target[new] ?: 0) + n }
+    }
+
+    /** 待匹配指纹：restore 时从快照取下，等曲库装载后由 [rematchMissingRefs] 消费 */
+    private var pendingTrackRefs: Map<String, SongRematch.TrackRef> = emptyMap()
+
+    /**
+     * 「有一份刚恢复的快照等着做 re-match」。
+     *
+     * 与 [pendingTrackRefs] 分开记：旧备份（≤v9）的指纹表恒为空，但**仍然要做**文件名匹配
+     * （1、2 级完全不依赖指纹表）。若用「pendingTrackRefs 非空」当闸门，旧备份恢复就
+     * 完全跳过重匹配 —— 而这恰好是最需要它的群体（他们的备份里只有路径）。
+     */
+    private var rematchPending = false
+
     /** 设置指纹：GlassApp 用 snapshotFlow 监听设置变更触发存盘 */
     fun settingsKey(): String =
         "$followCover|$lyricEnabled|${glassLevel.name}|${motionLevel.name}|${eqPreset.name}|${themeMode.name}|" +
             "$shuffleOn|${repeatMode.name}|$playbackSpeed|$scanFilterShort|$customSeedArgb|${queueSource.orEmpty()}|" +
+            // 音效链也要进指纹：否则「只拨音效开关」不会触发存盘，重启后开关回弹（用户会以为设置没保存）
+            "$audioFx|" +
             excludedFolders.joinToString(",")
 
     fun snapshot(): AppStateSnapshot {
@@ -843,6 +1157,8 @@ class AppState {
                 queueSource = queueSource,
                 sleepTimerMode = sleepTimerMode,
                 sleepTimerDeadlineMs = sleepTimerDeadlineMs,
+                audioFx = audioFx,
+                trackRefs = trackRefsSnapshot(),
             )
         } else {
             AppStateSnapshot(
@@ -875,6 +1191,8 @@ class AppState {
                 queueSource = queueSource,
                 sleepTimerMode = sleepTimerMode,
                 sleepTimerDeadlineMs = sleepTimerDeadlineMs,
+                audioFx = audioFx,
+                trackRefs = trackRefsSnapshot(),
             )
         }
     }
@@ -886,6 +1204,14 @@ class AppState {
         glassLevel = runCatching { GlassIntensity.valueOf(snapshot.glassLevel) }.getOrDefault(GlassIntensity.Standard)
         motionLevel = runCatching { MotionIntensity.valueOf(snapshot.motionLevel) }.getOrDefault(MotionIntensity.Standard)
         eqPreset = runCatching { EqPreset.valueOf(snapshot.eqPreset) }.getOrDefault(EqPreset.Off)
+        // 音效链（v10）：旧版本（≤v9）备份没有该字段 → 解码走默认值 = 全关，用户听感不变。
+        // 档位索引做一次钳制：万一备份来自改过档位数的版本，越界索引会落在数组外（崩溃），
+        // AudioFxSettings 的 safeBassLevel/safeVirtualLevel 在读取侧已兜住，这里再归一一次存下来，
+        // 保证快照里存的值始终合法（避免把一个坏索引反复写回磁盘）。
+        audioFx = snapshot.audioFx.copy(
+            bassLevel = snapshot.audioFx.safeBassLevel,
+            virtualLevel = snapshot.audioFx.safeVirtualLevel,
+        )
         themeMode = runCatching { ThemeMode.valueOf(snapshot.themeMode) }.getOrDefault(ThemeMode.Dark)
         songSort = runCatching { SongSort.valueOf(snapshot.songSort) }.getOrDefault(SongSort.Title)
         shuffleOn = snapshot.shuffleOn
@@ -902,7 +1228,7 @@ class AppState {
         // 定时关闭回显（v9）：分钟档仅在 deadline 未过期时恢复；播完档（-1/-2）依赖服务端旗标，
         // 进程重启后服务端旗标也已丢失，所以一律丢弃（避免 UI 显示「已开启」但实际不生效）。
         sleepTimerMode = when {
-            snapshot.sleepTimerMode > 0 && snapshot.sleepTimerDeadlineMs > System.currentTimeMillis() ->
+            snapshot.sleepTimerMode > 0 && snapshot.sleepTimerDeadlineMs > clock() ->
                 snapshot.sleepTimerMode
             else -> 0
         }
@@ -941,6 +1267,16 @@ class AppState {
         }
         pendingPlayback = snapshot.queueIds to (snapshot.queueIndex to snapshot.progressSec)
         currentSongIdPending = snapshot.currentSongId
+        // 换机 re-match 的输入：先记下本次快照的指纹表，等真曲库装载后由
+        // rematchMissingRefs 消费（此刻 library 可能是空的/还是旧曲库，匹配必然全空）。
+        // 旧备份（≤v9）没有这个字段 → 空表，退化为纯文件名匹配，仍然远好于旧实现的静默丢弃。
+        pendingTrackRefs = snapshot.trackRefs
+        // 标一个「待重匹配」闸门：真正的匹配要等曲库就位（见 rematchMissingRefs 的 KDoc）。
+        // 与 pendingTrackRefs 分开：旧备份的指纹表恒为空，但仍要走文件名匹配。
+        rematchPending = true
+        // 曲库此刻已就位（运行时恢复备份的常见情形）：直接跑一次重匹配，不必等下一次扫描。
+        // 曲库为空（冷启动尚未装载）时上面的门控会跳过，交给 loadLibrary 末尾那一次调用。
+        if (library.isNotEmpty()) rematchMissingRefs()
         hydrated = true // 恢复完成：允许存盘
         // restore 可能晚于 attachPlayer 到达：循环/随机/EQ/速度就地补同步到服务端（否则引擎停留在默认模式）
         // 定时关闭的重武装也走这里（syncEngineModes 内），按剩余时间而不是快照里的原始档位下发：
@@ -1137,6 +1473,12 @@ class AppState {
         // playing 与服务实际一致：引擎空 = 未播放；引擎在则如实回读（重发恢复现场后为暂停态，
         // 服务在播解析不到的曲目时不误置 false）
         playing = eng?.isEnginePlaying() ?: false
+        // 换机 re-match（P0-5 B）：曲库此刻才真正就位，是唯一能做好四级匹配的时机。
+        // 必须在上面所有队列收敛分支之后调用——它要读的是「装载完成的 library」。
+        // 重扫（rescan）时也会走到这里：此时 restore 早已消费完 pendingTrackRefs（空表），
+        // 且各引用集合里的 id 都已是新 id，rematchMissingRefs 会全部判 reused、
+        // 不产生 report、不改任何数据，是安全的空转。
+        rematchMissingRefs()
         // 重扫不再清空最近播放（历史中的失效 id 在展示层自然过滤）
     }
 
@@ -1435,6 +1777,49 @@ class AppState {
         scheduleSave()
     }
 
+    /**
+     * 音效链：立即下发服务端 + 记快照。
+     *
+     * **为什么每项都单独给 setter 而不是让 UI 直接改 `audioFx = ...`**：
+     * `audioFx` 是 private set，UI 改不了；所有改动必须经过这里，才能保证
+     * 「状态变了 → 服务端一定收到」这条不变量。旧实现的 EQ 就有过直接给 `eqPreset` 赋值
+     * 导致「界面显示切了、实际没下发」的窗口，这里从类型上堵死。
+     *
+     * 三项都走同一个 [commitAudioFx]：内容未变时**不重复下发**（拨同一档不该产生 binder 流量，
+     * 也让 [settingsKey] 的指纹在无实际变化时保持稳定，避免触发多余存盘）。
+     */
+    fun setLoudnessNorm(enabled: Boolean) {
+        commitAudioFx(audioFx.copy(loudnessNorm = enabled))
+    }
+
+    /** 低音增强开关 */
+    fun setBassBoost(enabled: Boolean) {
+        commitAudioFx(audioFx.copy(bassBoost = enabled))
+    }
+
+    /** 低音强度档位（索引，越界自动钳制到合法档） */
+    fun selectBassLevel(level: Int) {
+        commitAudioFx(audioFx.copy(bassLevel = level.coerceIn(0, BassBoostStrengths.lastIndex)))
+    }
+
+    /** 虚拟环绕开关 */
+    fun setVirtualizer(enabled: Boolean) {
+        commitAudioFx(audioFx.copy(virtualizer = enabled))
+    }
+
+    /** 虚拟环绕强度档位 */
+    fun selectVirtualLevel(level: Int) {
+        commitAudioFx(audioFx.copy(virtualLevel = level.coerceIn(0, VirtualizerStrengths.lastIndex)))
+    }
+
+    /** 音效链唯一提交口：去重 → 落 UI 状态 → 下发服务端 → 存盘 */
+    private fun commitAudioFx(next: AudioFxSettings) {
+        if (next == audioFx) return
+        audioFx = next
+        engine?.setAudioFx(next)
+        scheduleSave()
+    }
+
     /** 播放速度：立即下发服务端（Media3 原生 Sonic 变速不变调）。
      *  命名避开 var playbackSpeed 的 JVM setter（setPlaybackSpeed）签名冲突 */
     fun selectPlaybackSpeed(speed: Float) {
@@ -1449,7 +1834,7 @@ class AppState {
     fun setSleepTimer(modeMinutes: Int) {
         engine?.setSleepTimer(modeMinutes)
         sleepTimerMode = modeMinutes
-        sleepTimerDeadlineMs = if (modeMinutes > 0) System.currentTimeMillis() + modeMinutes * 60_000L else 0L
+        sleepTimerDeadlineMs = if (modeMinutes > 0) clock() + modeMinutes * 60_000L else 0L
         // 与 syncEngineModes 的判重戳对齐：本函数刚刚亲手下发过一次，若不同步记下这次
         // (代次, deadline)，紧接着的任意一次 syncEngineModes（切歌/恢复都会走）会认为
         // 「还没下发过」而按剩余分钟数再发一遍——服务端协程被重建，倒计时被截断几十秒。
@@ -1462,14 +1847,14 @@ class AppState {
      *  由 onPlayingChanged 收到播放停止时就地归零（用户手动暂停视为放弃定时） */
     fun effectiveSleepTimerMode(): Int {
         val mode = sleepTimerMode
-        if (mode > 0 && System.currentTimeMillis() >= sleepTimerDeadlineMs) return 0
+        if (mode > 0 && clock() >= sleepTimerDeadlineMs) return 0
         return mode
     }
 
     /** 分钟级定时的剩余秒数（非分钟档 = null；已到期钳 0）：UI 每秒读一次驱动倒计时刷新 */
     fun sleepTimerRemainingSec(): Int? {
         if (sleepTimerMode <= 0 || sleepTimerDeadlineMs <= 0L) return null
-        return ((sleepTimerDeadlineMs - System.currentTimeMillis()) / 1000L).toInt().coerceAtLeast(0)
+        return ((sleepTimerDeadlineMs - clock()) / 1000L).toInt().coerceAtLeast(0)
     }
 
     fun cycleRepeat() {
@@ -1630,7 +2015,7 @@ class AppState {
             finalTitle
         }
         val playlist = DemoPlaylist(
-            id = "user-${System.currentTimeMillis()}",
+            id = "user-${clock()}",
             title = uniqueTitle,
             meta = "0 首",
             art = ArtStyle.Room,
@@ -1856,7 +2241,7 @@ class AppState {
         val lib = visibleLibrary()
         groupCache?.let { (cachedLib, cached) -> if (cachedLib === lib) return cached }
         val byKey = compareBy<LibraryGroup, String>(groupCollator) { it.key }
-        val album = lib.groupBy { it.album }.map { LibraryGroup(it.key, it.value) }.sortedWith(byKey)
+        val album = albumGroupsFrom(lib, byKey)
         val computed = LibraryGroups(
             album = album,
             artist = lib.groupBy { it.artist }.map { LibraryGroup(it.key, it.value) }.sortedWith(byKey),
@@ -1865,17 +2250,114 @@ class AppState {
             // 详情入口 target.id 与分组键同源）
             genre = lib.groupBy { if (it.genre.isBlank()) "未知流派" else it.genre }
                 .map { LibraryGroup(it.key, it.value) }.sortedWith(byKey),
-            // 每专辑归其首曲艺术家（与曲库页原预计算同口径），再按艺术家计数
-            albumCountByArtist = album.map { it.songs.first().artist }.groupingBy { it }.eachCount(),
+            // 每张专辑归其**专辑艺术家**（缺失回退首曲艺术家），再按艺术家统计专辑数。
+            //
+            // 不能用 songs.first().artist（改造前的口径）：合辑的第一首只是碰巧排第一的那个人，
+            // 用它计数会把别人的合辑算到这个艺术家头上，于是「周杰伦 · 12 张专辑」里
+            // 混进去几张跟他无关的合辑。用专辑艺术家才和「分组键」是同一个口径。
+            albumCountByArtist = album
+                .map { g -> g.songs.first().albumArtist.ifBlank { g.songs.first().artist } }
+                .groupingBy { it }.eachCount(),
         )
         groupCache = lib to computed
         return computed
     }
 
+    /**
+     * 专辑分组 + 组内曲序排序（审计 02 报告最致命缺口②）。
+     *
+     * 改造前是 `lib.groupBy { it.album }`，两个后果：
+     * 1. **两张同名不同艺术家的专辑被合并成一张**（都叫《精选集》就完蛋）
+     * 2. **组内是 MediaStore 返回的字母序**，不是专辑曲序——打开任意专辑曲目都是乱序，
+     *    这是用户 3 秒内就能发现「这不是正经播放器」的缺陷
+     *
+     * 改造后分组键是 `(专辑名, 专辑艺术家)` 二元组：
+     * - 展示名仍是专辑名（[LibraryGroup.key]）
+     * - 唯一标识是二元组拼成的串（[LibraryGroup.id]），供 DetailTarget 与 LazyColumn 用
+     */
+    private fun albumGroupsFrom(lib: List<DemoSong>, byKey: Comparator<LibraryGroup>): List<LibraryGroup> {
+        // 专辑艺术家归一：标签缺失（空串）时回退到曲目艺术家。
+        //
+        // 这个回退是整套模型的关键取舍：合辑的专辑艺术家通常是 "Various Artists"，有标签时
+        // 自然就是它；而绝大多数普通专辑的 ALBUM_ARTIST 标签**压根没填**，那时它等价于
+        // 曲目艺术家，回退得到的正是改造前的行为——**没标签的库升级后观感零变化**，
+        // 只有真的填了专辑艺术家的专辑（同名不同艺术家、合辑）才会被正确拆开。
+        fun albumArtistOf(song: DemoSong): String = song.albumArtist.ifBlank { song.artist }
+
+        // 分组键 = (专辑名, 专辑艺术家) 二元组，**不是**先拼好的字符串：
+        // 用二元组分组，同专辑的曲目天然聚在一起，最后才把二元组编码成 id。
+        // 反过来（先拼字符串、再按字符串 groupBy）也能跑，但那样「分组口径」与
+        // 「id 编码口径」就绑死在同一行字符拼接里——将来想改编码（比如换成哈希）
+        // 会顺带改变分组语义。分开写，两者各管一件事。
+        //
+        // 分隔符用 NUL（\\u0000）而不是常见的 "|" / " - "：后者在真实专辑名/艺术家名里
+        // 都可能出现（"周杰伦 | 叶惠美" 这种命名并不罕见），一旦撞上就会把两张不同的
+        // 专辑拼成同一个 id → 详情页定位串台。NUL 不可能出现在标签里，是安全的。
+        val grouped = lib.groupBy { song -> song.album to albumArtistOf(song) }
+        return grouped.map { (pair, songs) ->
+            val (albumName, albumArtist) = pair
+            LibraryGroup(
+                // 展示名 = 纯专辑名。两张同名不同艺术家的专辑在界面上长得一模一样，这是**对的**：
+                // 用户认知里它们就叫同一个名字，卡片的区分靠封面 / 曲目数 / meta 里的艺术家副标题。
+                // 绝不能把艺术家拼进 key，否则界面上会出现「精选集｜周杰伦」这种把内部实现
+                // 漏到 UI 的产物（审计明令「UI 上显示的专辑名必须仍然只有专辑名」）。
+                key = albumName,
+                songs = sortAlbumTracks(songs),
+                // 定位 id：与 [albumIdOf] 共用**同一个**编码函数 [albumId]，
+                // 不在这里另写一份拼接——两处各写一份正是「改了分组忘了反查」那类
+                // bug 的标准来源（长按歌曲「查看专辑」走的是 albumIdOf 那条路）
+                id = albumId(albumName, albumArtist),
+            )
+        }.sortedWith(byKey)
+    }
+
+    /**
+     * 专辑内曲序排序：`(碟号, 音轨号, 标题)` 升序。
+     *
+     * 两条关键的「未知值」处理规则：
+     * 1. **碟号 / 音轨号为 0 表示未知**（MediaStore 与标签都可能没有这个信息），
+     *    未知必须排**末尾**而不是当成第 0 首排最前——否则一张没有音轨号的专辑里，
+     *    那些「恰好没编号」的歌会跑到专辑第一首的位置，比改造前的字母序还离谱。
+     * 2. 同碟同轨（或都未知）时按中文 Collator 排标题，保证排序**稳定**：
+     *    曲库重扫、列表重组都不能让同一张专辑的曲目顺序抖动。
+     */
+    private fun sortAlbumTracks(songs: List<DemoSong>): List<DemoSong> = songs.sortedWith(
+        compareBy<DemoSong> { it.discNo.takeIf { d -> d > 0 } ?: Int.MAX_VALUE }
+            .thenBy { it.trackNo.takeIf { t -> t > 0 } ?: Int.MAX_VALUE }
+            .thenComparator { a, b -> groupCollator.compare(a.title, b.title) },
+    )
+
     /** 艺术家 → 专辑数（曲库艺术家 tab 与艺术家详情页 meta 共用同一份缓存） */
     fun albumCountByArtist(): Map<String, Int> = groups().albumCountByArtist
 
     fun albumGroups(): List<LibraryGroup> = groups().album
+
+    /**
+     * 由**一首歌**反查它所属专辑的分组 id（供 `DetailTarget(Kind.Album, ...)` 用）。
+     *
+     * 为什么需要这个函数：`DetailTarget` 的 Album 分支现在是按 [LibraryGroup.id] 定位的
+     * （`专辑名\0专辑艺术家`），而「长按歌曲 → 查看专辑」这类入口手里只有一个 [DemoSong]，
+     * 曲目上没有「专辑 id」这个字段。旧实现直接传 `song.album`（纯专辑名），在改造后
+     * **恰好只在「同专辑名的其它艺术家专辑也存在」时才错**——也就是最不容易被日常操作
+     * 发现、但用户一进合辑就必踩的那种 bug：
+     * 用户从《精选集》里的一首歌点「查看专辑」，会进到另一张同名《精选集》里，
+     * 曲目对不上还找不到原因。
+     *
+     * 所以这里按**与 albumGroupsFrom 完全相同的二元组口径**现算一次 id，保证
+     * 「分组时算出来的 id」与「反查出来的 id」永远同源——两处各写一份拼装逻辑
+     * 是这类 bug 的标准来源（改了一处忘了另一处，于是只有某条入口失效）。
+     *
+     * 性能：只用 `song.album` / `song.albumArtist` / `song.artist` 三个字段做字符串拼接，
+     * 不碰全库分组缓存，O(1)；不读 [groups] 是为了保持这条路径在任何曲库状态下都可用
+     * （包括曲库尚未装载完、或用 [DemoSong] 来自队列快照、根本不在当前 library 里的场景），
+     * 那种时候去查 albumGroups 只会返回 null。
+     */
+    fun albumIdOf(song: DemoSong): String =
+        albumId(song.album, song.albumArtist.ifBlank { song.artist })
+
+    /** 专辑分组 id 的**唯一**编码点（[albumGroupsFrom] 与 [albumIdOf] 共用，见二者的注释）。 */
+    private fun albumId(albumName: String, albumArtist: String): String =
+        albumName + '\u0000' + albumArtist
 
     fun artistGroups(): List<LibraryGroup> = groups().artist
 
@@ -1905,11 +2387,21 @@ class AppState {
     fun searchAlbumGroups(query: String): List<LibraryGroup> {
         val q = query.trim()
         if (q.isEmpty()) return emptyList()
-        // 演示模式下 searchScope 与 library 不同源（演示库已移除，此处仅为语义完整）
-        val groups = if (realLibraryLoaded) albumGroups() else searchScope().groupBy { it.album }
-            .map { LibraryGroup(it.key, it.value) }.sortedWith(compareBy(groupCollator) { it.key })
+        // 演示模式下 searchScope 与 library 不同源（演示库已移除，此处仅为语义完整）。
+        // 演示分支也必须走 albumGroupsFrom：否则搜索结果里的专辑卡片 id 与详情页
+        // 用的 id 不是同一套编码（一个是 "专辑名\0艺术家"，一个是纯专辑名），
+        // 点进去会定位失败——演示模式只是没有真曲库，不该有独立的一套 id 体系
+        val groups = if (realLibraryLoaded) albumGroups() else albumGroupsFrom(
+            searchScope(),
+            compareBy(groupCollator) { it.key },
+        )
         return groups.filter { g ->
-            g.key.contains(q, true) || g.songs.first().artist.contains(q, true) ||
+            // 匹配专辑名 / 专辑艺术家 / 任一曲名。专辑艺术家也参与匹配是必要的：
+            // 用户搜 "周杰伦" 时，他名下的合辑（专辑艺术家 = 周杰伦）应该出现，
+            // 而合辑里可能没有一首歌的曲目艺术家是他，只看 songs.first().artist 会漏
+            g.key.contains(q, true) ||
+                g.songs.first().albumArtist.contains(q, true) ||
+                g.songs.first().artist.contains(q, true) ||
                 g.songs.any { it.title.contains(q, true) }
         }
     }
@@ -1994,7 +2486,11 @@ class AppState {
             DetailTarget.Kind.Playlist -> resolvePlaylist(target.id)?.let {
                 DetailData("歌单", it.title, it.meta, it.art, it.tracks, coverUri = it.tracks.firstOrNull()?.artworkUri)
             }
-            DetailTarget.Kind.Album -> albumGroups().firstOrNull { it.key == target.id }?.let {
+            // 专辑详情按 **id** 定位（专辑名 + 专辑艺术家二元组），不能按 key：
+            // key 是展示用的专辑名，两张同名不同艺术家的专辑 key 相同，按 key 找永远
+            // 只会命中第一张 —— 用户点第二张《精选集》会进到第一张里去，是肉眼可见的错
+            DetailTarget.Kind.Album -> albumGroups().firstOrNull { it.id == target.id }?.let {
+                // 详情页标题仍显示专辑名（不是 id 那个带 NUL 的内部串）
                 DetailData("专辑", it.key, it.meta, it.art, it.songs, coverUri = it.coverUri)
             }
             DetailTarget.Kind.Artist -> artistGroups().firstOrNull { it.key == target.id }?.let {

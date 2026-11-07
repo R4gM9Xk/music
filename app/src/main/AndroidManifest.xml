@@ -12,6 +12,13 @@
     <!-- 所有文件访问：读取任意公共目录的同名 .lrc 歌词（Download/QQ 等），特殊权限经系统页授权 -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
+    <!-- 桌面歌词悬浮窗（P0-8）：TYPE_APPLICATION_OVERLAY 的前置权限（special app access，
+         用户在「显示在其他应用上层」页手动授予，不是运行时弹窗）。
+         代码侧必须先判 Settings.canDrawOverlays() 再 addView——部分 ROM 即便授权过也会
+         动态撤销，所有 WindowManager 操作另有 runCatching 兜底（见 DesktopLyricsController）。
+         未授权时歌词功能静默不可用（不崩溃、不弹系统弹窗），由设置入口引导授权 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <!-- E2 包可见性（Android 11+ / targetSdk 30+）：AutoStartGuide 用 resolveActivity 探测
          厂商自启动/电池页，未声明 <queries> 时这些包全部不可见 → 只能落到应用详情页兜底。
          按候选组件逐包精确声明（与 AutoStartGuide.CANDIDATES 一一对应，比 intent-filter
@@ -73,6 +80,67 @@
                 <action android:name="androidx.media3.session.MediaSessionService" />
             </intent-filter>
         </service>
+
+        <!--
+          ════════════════════════════════════════════════════════════════════
+          桌面小部件（P0-6）
+          ════════════════════════════════════════════════════════════════════
+          两个尺寸 = 两个独立 receiver（各自带自己的 appwidget-provider meta-data），
+          这样系统小部件选择器里会出现两张卡片，用户能分别放置。
+
+          exported="false"：AppWidgetProvider 由系统的 AppWidgetService 唤起。
+          **这里必须是 false，系统仍能正常唤起它** —— 因为桌面/系统服务是以
+          「同 uid 的广播」之外的路径（AppWidgetManager 内部的显式组件调用）触达，
+          且 Glance 官方模板同样用 false。写成 true 只是把攻击面放大（任何应用都能
+          往你的 APPWIDGET_UPDATE 广播里塞 ID），没有好处。
+
+          meta-data 的 android:resource 指向 res/xml/music_widget_4x1.xml（appwidget-provider）。
+
+          注意 intent-filter 里只声明 APPWIDGET_UPDATE：
+          - APPWIDGET_DELETED / APPWIDGET_OPTIONS_CHANGED 等由 AppWidgetProvider
+            的回调分发**自动**送达同名 receiver，不需要单独声明；
+          - 把它们也写进来反而会绕过系统的组件校验路径，属于无意义放大。
+          ════════════════════════════════════════════════════════════════════
+        -->
+        <receiver
+            android:name=".widget.MusicWidgetWideProvider"
+            android:exported="false"
+            android:label="@string/widget_label_wide">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/music_widget_4x1" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.MusicWidgetSquareProvider"
+            android:exported="false"
+            android:label="@string/widget_label_square">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/music_widget_4x2" />
+        </receiver>
+
+        <!--
+          小部件控制动作的转发入口（上一首 / 播放暂停 / 下一首）。
+
+          exported="false" 是**安全要求**而不只是习惯：
+          小部件的 PendingIntent 是显式组件广播（setClass 到本 receiver），
+          exported=false 时系统外没有任何应用能伪造「下一首」「暂停」这类命令。
+          若写成 true，任何应用都能往这三个 action 上灌广播来操控用户的播放器。
+
+          冷知识：PendingIntent 由系统代发，不受 exported 限制 —— 即使这里是 false，
+          小部件照样能正常触发（这是 Android 有意设计，PendingIntent 的授权在
+          创建时就固化了）。所以 false 完全不影响功能，只砍掉攻击面。
+        -->
+        <receiver
+            android:name=".widget.WidgetActionReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

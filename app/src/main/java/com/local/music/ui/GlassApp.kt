@@ -6,8 +6,10 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -59,6 +61,10 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -68,7 +74,9 @@ import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.media3.session.MediaController
+import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionToken
+import com.local.music.crash.CrashHandler
 import com.local.music.core.ui.components.AuroraBackground
 import com.local.music.core.ui.components.GlassChrome
 import com.local.music.core.ui.components.GlassLevel
@@ -77,6 +85,8 @@ import com.local.music.core.ui.components.FlightKeys
 import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.components.LocalModalState
 import com.local.music.core.ui.components.LocalPlayerFlight
+import com.local.music.core.ui.components.LocalSystemActions
+import com.local.music.core.ui.components.SystemActions
 import com.local.music.core.ui.components.ModalSheetHost
 import com.local.music.core.ui.components.ModalState
 import com.local.music.core.ui.components.PlayerFlight
@@ -84,7 +94,9 @@ import com.local.music.core.ui.components.asTime
 import com.local.music.core.ui.components.trackFlight
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
+import com.local.music.core.ui.state.RestoreReport
 import com.local.music.core.ui.state.ThemeMode
+import com.local.music.core.ui.state.restoreReportMessage
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LibraryOrigin
 import com.local.music.core.ui.theme.LocalLibraryOrigin
@@ -98,12 +110,14 @@ import com.local.music.feature.playlist.screen.PlaylistDetailScreen
 import com.local.music.feature.playlist.screen.PlaylistScreen
 import com.local.music.feature.search.screen.SearchScreen
 import com.local.music.feature.settings.screen.SettingsScreen
+import com.local.music.lyrics.DesktopLyricsStore
 import com.local.music.player.AutoStartGuide
 import com.local.music.player.MediaControllerEngine
 import com.local.music.player.MediaLibrary
 import com.local.music.player.MusicPlaybackService
 import com.local.music.player.M3uPlaylistIO
 import com.local.music.player.QueueStateStore
+import com.local.music.share.ShareActions
 import com.local.music.state.SettingsStore
 import com.local.music.state.SnapshotReadResult
 import com.local.music.update.UpdateManager
@@ -336,6 +350,9 @@ fun GlassApp() {
         // 只有真正的「键不存在（首装）」才 markHydrated 放行首份快照。
         val readOutcome = runCatching { store.readResult() }
         when (val readResult = readOutcome.getOrNull()) {
+            // 冷启动恢复走普通 restore（不是 restoreFromBackup），场景语义见 AppState 里
+            // restoreFromBackupFile 的注释：同一台设备冷启动出现失效引用是日常（删过歌），
+            // 不该弹横幅；只有**备份文件恢复**才需要无条件报告迁移结果。
             is SnapshotReadResult.Ok -> state.restore(readResult.snapshot)
             // 首装：无现场可保护，放行存盘写出第一份快照
             SnapshotReadResult.Absent -> state.markHydrated()
@@ -501,6 +518,84 @@ fun GlassApp() {
         if (toRequest.isNotEmpty()) permissionLauncher.launch(toRequest.toTypedArray())
     }
 
+    // 结果提示（成功/失败/未命中汇总）：全屏级顶部横幅的唯一数据源。
+    // 声明点必须早于所有写入者（桌面歌词 / 文件 IO / 分享 / 恢复报告），
+    // Kotlin 局部变量不支持前向引用——原先声明在文件 IO 段（约 650 行）时，
+    // 桌面歌词段（约 570 行）赋值会报 Unresolved。
+    var ioMessage by remember { mutableStateOf<String?>(null) }
+
+    // 桌面歌词（P0-8）开关状态与接线。
+    // 为什么不放进 AppState：AppStateSnapshot（SettingsStore 快照 v1→v10 迁移链）已封板，
+    // 为一个布尔键升版+三路迁移的风险远超功能本身，改用 lyrics 包内独立 DataStore
+    // （DesktopLyricsStore，注释里有完整取舍）。UI 持有状态，服务只做显示与进度驱动。
+    var desktopLyricsOn by remember { mutableStateOf(false) }
+
+    // 服务连接成功后的 MediaController 引用：开关命令的发送通道。
+    // 为什么不走 PlayerEngine：那是 AppState 的封板接口，为显示层开关加方法不值得；
+    // 直接握 controller.sendCustomCommand（一次性命令，无监听器，随 Activity 销毁释放，
+    // 不与小部件的「短命 controller」模式冲突——App 主 controller 本就常驻）。
+    var desktopLyricsController by remember { mutableStateOf<MediaController?>(null) }
+
+    /** 桌面歌词开关命令下发（见 [desktopLyricsController] 的通道说明）。controller 未连上时静默丢弃 */
+    fun sendDesktopLyricsCommand(controller: MediaController?, on: Boolean) {
+        if (controller == null) return
+        val args = Bundle().apply { putBoolean(MusicPlaybackService.KEY_DESKTOP_LYRICS_ON, on) }
+        runCatching {
+            controller.sendCustomCommand(
+                SessionCommand(MusicPlaybackService.CMD_SET_DESKTOP_LYRICS, Bundle.EMPTY),
+                args,
+            )
+        }.onFailure { Log.w("GlassApp", "send desktop lyrics command failed", it) }
+    }
+
+    // 启动：读回持久化的开关值（只改本地状态，不发命令——此刻服务多半还没连上，
+    // 真正的重放在下面「controller 变为非空」的 effect 里做）
+    LaunchedEffect(Unit) {
+        desktopLyricsOn = DesktopLyricsStore.read(context)
+    }
+    // 服务连上（controller 就绪）后按最新状态重放一次：覆盖「进程被杀 → 系统续播拉起
+    // 服务 → 用户再打开 App」的场景。服务端不持久化开关（悬浮窗是显示瞬态，自动弹窗
+    // 反而打扰），所以每次 App 启动都要重放
+    LaunchedEffect(desktopLyricsController) {
+        val controller = desktopLyricsController ?: return@LaunchedEffect
+        sendDesktopLyricsCommand(controller, desktopLyricsOn)
+    }
+
+    /**
+     * 设置页「桌面歌词」开关回调（含权限引导）。
+     *
+     * 未授权悬浮窗权限时**不真正开开关**、跳系统授权页并给出横幅提示；
+     * 用户授权后回到 App 再拨一次开关即可（授权页跳转不 kill 本进程，状态都在）。
+     * 关闭方向无权限门槛，直接生效。
+     */
+    fun onDesktopLyricsChange(enable: Boolean) {
+        if (!enable) {
+            desktopLyricsOn = false
+            sendDesktopLyricsCommand(desktopLyricsController, false)
+            scope.launch { DesktopLyricsStore.write(context, false) }
+            return
+        }
+        // 权限判定 + 授权页跳转都在这里（feature:settings 只拿哑回调，framework 细节不外泄）
+        if (!Settings.canDrawOverlays(context)) {
+            val opened = DesktopLyricsStore.openPermissionPage(context)
+            ioMessage = if (opened) {
+                "请在系统设置中允许「显示在其他应用上层」，返回后再开启桌面歌词"
+            } else {
+                "未能打开系统设置，请手动前往「设置 → 应用 → 音乐 → 显示在其他应用上层」"
+            }
+            return
+        }
+        desktopLyricsOn = true
+        sendDesktopLyricsCommand(desktopLyricsController, true)
+        scope.launch {
+            val ok = DesktopLyricsStore.write(context, true)
+            // 服务此刻可能还没连上（controller=null，命令被丢弃）：状态已落盘，
+            // 服务连上后重放会补发。这里不做 UI 回滚——回滚会让「刚才明明开了」的
+            // 用户看到开关自己弹回去，反而困惑。
+            if (!ok) Log.w("GlassApp", "desktop lyrics switch persist failed")
+        }
+    }
+
     // 连接播放服务：MediaController 就绪后注入 AppState（通知/锁屏/后台由 service 承担）
     DisposableEffect(Unit) {
         val future = MediaController.Builder(
@@ -512,6 +607,8 @@ fun GlassApp() {
                 val controller = runCatching { future.get() }.getOrNull()
                 if (controller != null) {
                     state.attachPlayer(MediaControllerEngine(controller, context.applicationContext))
+                    // 桌面歌词（P0-8）：握住 controller 作为开关命令通道（随 Activity 销毁置空）
+                    desktopLyricsController = controller
                 } else {
                     state.reportEngineFailure("播放服务连接失败，无法播放本地音频")
                 }
@@ -520,6 +617,7 @@ fun GlassApp() {
         )
         onDispose {
             // 非阻塞释放：内部等 future 就绪后再 release（future.get() 会卡主线程）
+            desktopLyricsController = null
             runCatching { MediaController.releaseFuture(future) }
         }
     }
@@ -561,7 +659,8 @@ fun GlassApp() {
     // ── D2/D3 文件 IO：SAF 选择器（导出 M3U / 导入 M3U / 导出备份 / 恢复备份）──
     // 结果通过一次性回调交给发起方（设置页行 / 歌单详情菜单），避免把 SAF 逻辑散到各屏
     var pendingM3uExportPlaylist by remember { mutableStateOf<com.local.music.core.ui.components.DemoPlaylist?>(null) }
-    var ioMessage by remember { mutableStateOf<String?>(null) } // 结果提示（成功/失败/未命中汇总）
+    // ioMessage 已上移到「桌面歌词」段之前：它是全屏级的横幅状态，被桌面歌词、文件 IO、
+    // 分享、恢复报告等多处写入，声明点必须早于所有写入点（Kotlin 局部变量不支持前向引用）。
 
     val m3uExportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("audio/x-mpegurl"),
@@ -624,6 +723,44 @@ fun GlassApp() {
             ioMessage = if (ok) "备份已导出" else "备份导出失败"
         }
     }
+    // ── 崩溃日志导出（04 报告 #3 的最后一环）──
+    // CrashHandler 早就把未捕获异常写进了 filesDir/crash/，但此前**没有任何导出入口**：
+    // 日志躺在用户手机里，开发者永远拿不到，等于「用户反馈闪退时你手上只有 0 条信息」
+    // 这个问题根本没解决。这里复用备份导出的同一套 SAF CreateDocument 通道，
+    // 把它做成「用户崩了 → 进设置 → 导出 → 发给你」的闭环。
+    //
+    // 为什么用 text/plain 而不是 application/json：内容是人类可读的崩溃栈合集，
+    // 用 text/plain 能让用户在文件管理器里直接点开预览，不必先猜该用什么打开。
+    val crashLogCount = remember { mutableStateOf(0) }
+    // 每次进入设置页时重新数一遍：用户可能在别处崩过、也可能刚清空过
+    LaunchedEffect(state.screen) {
+        if (state.screen == GlassScreen.Settings) {
+            crashLogCount.value = withContext(Dispatchers.IO) { CrashHandler.list(context).size }
+        }
+    }
+    val crashExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    // bundle() 返回 null 表示「此刻没有日志」——可能是刚才被系统清理了。
+                    // 这时不能写空文件骗用户说导出成功，必须如实提示
+                    val text = CrashHandler.bundle(context) ?: error("没有可导出的崩溃日志")
+                    context.contentResolver.openOutputStream(uri)?.use {
+                        it.write(text.toByteArray(Charsets.UTF_8))
+                    } ?: error("无法写入所选位置")
+                    CrashHandler.list(context).size
+                }
+            }
+            ok.onSuccess { count ->
+                ioMessage = "已导出 $count 份崩溃日志"
+            }.onFailure {
+                ioMessage = "崩溃日志导出失败：${it.message ?: "无法写入"}"
+            }
+        }
+    }
     val backupImportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
@@ -638,12 +775,23 @@ fun GlassApp() {
                 }
             }
             snapshot.onSuccess {
-                state.restore(it) // 与启动恢复同一路径：设置/歌单/收藏立即生效，播放现场走 pending
+                // 与启动恢复同一路径：设置/歌单/收藏立即生效，播放现场走 pending。
+                // **必须走 restoreFromBackup 而不是 restore**：前者多打一个「本次是备份文件恢复」
+                // 的标记，供 re-match 决定提示强度——冷启动读本地快照时出现失效引用是日常
+                // （用户删过歌），不该弹横幅；而备份恢复出现失效项必须告诉用户。
+                state.restoreFromBackup(it)
                 // 运行时曲库已装载，loadLibrary 不会再调来消费 pending：就地应用恢复的播放现场
                 // （否则界面不切到备份现场，scheduleSave 还会把 pending 原样回写）
                 state.applyRestoredPlayback()
                 state.scheduleSave()
-                ioMessage = "备份已恢复"
+                // 旧实现这里固定是「备份已恢复」——对「换了台手机、路径全变」的用户是句谎话：
+                // 他的歌单可能是空的，而界面只说了「已恢复」。改为把 re-match 的统计
+                // （复用/重匹配/未找到）原样呈现，见 SongRematch.RestoreReport 的 KDoc。
+                ioMessage = restoreReportMessage(
+                    state.restoreReport ?: RestoreReport(reused = 0, resolved = 0, missing = 0),
+                )
+                // 报告已上屏：消费掉，避免它在下一次无关的 I/O 提示里又冒出来
+                state.consumeRestoreReport()
             }.onFailure {
                 ioMessage = "恢复失败：${it.message ?: "文件无法解析"}"
             }
@@ -671,7 +819,31 @@ fun GlassApp() {
         if (modalState.isOpen) modalState.requestDismiss()
     }
 
-    CompositionLocalProvider(LocalModalState provides modalState, LocalPlayerFlight provides flight) {
+    // ── 系统集成动作（P0-5 A：分享歌曲 / 设为铃声 / 分享歌单）──
+    //
+    // 这里把 :app 侧的实现（ShareActions，依赖 Intent/FileProvider/RingtoneManager）
+    // 经 CompositionLocal 下发到 :core:ui 的操作面板。面板在 core:ui 不能反向依赖 :app，
+    // 所以走 SystemActions 这层函数式桥（见该文件 KDoc 里「为什么不用形参」的说明）。
+    //
+    // remember 的空 key：三个 lambda 只捕获 context（Application 级，跨重组稳定）与
+    // 会随每次调用重新读 state 的闭包；不捕获任何会变的 Compose 状态，
+    // 所以整棵树的 LocalSystemActions 引用在进程内恒定 —— 这也是用
+    // staticCompositionLocalOf 的前提（该值永不变，读取不记订阅）。
+    val systemActions = remember {
+        SystemActions(
+            shareSong = { song -> ioMessage = ShareActions.shareSong(context, song).message },
+            setRingtone = { song -> ioMessage = ShareActions.setAsRingtone(context, song).message },
+            sharePlaylist = { title, tracks ->
+                ioMessage = ShareActions.sharePlaylist(context, title, tracks).message
+            },
+        )
+    }
+
+    CompositionLocalProvider(
+        LocalModalState provides modalState,
+        LocalPlayerFlight provides flight,
+        LocalSystemActions provides systemActions,
+    ) {
         GlassTheme(
             palette = state.palette,
             isDark = state.themeMode == ThemeMode.Dark,
@@ -896,6 +1068,32 @@ fun GlassApp() {
                                         onImportBackup = {
                                             backupImportLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
                                         },
+                                        // 崩溃日志：有记录才让用户点导出（无记录时按钮点击会落到
+                                        // 下面的「清空」分支，所以这里显式判空并给提示，避免打开一个
+                                        // 空的选择器让用户白跑一趟）
+                                        crashLogCount = crashLogCount.value,
+                                        onExportCrashLogs = {
+                                            if (crashLogCount.value <= 0) {
+                                                ioMessage = "暂无崩溃记录可导出"
+                                            } else {
+                                                crashExportLauncher.launch("music-crash-logs.txt")
+                                            }
+                                        },
+                                        onClearCrashLogs = {
+                                            scope.launch {
+                                                val removed = withContext(Dispatchers.IO) {
+                                                    CrashHandler.clear(context)
+                                                }
+                                                crashLogCount.value = withContext(Dispatchers.IO) {
+                                                    CrashHandler.list(context).size
+                                                }
+                                                ioMessage = if (removed > 0) {
+                                                    "已删除 $removed 份崩溃日志"
+                                                } else {
+                                                    "没有可删除的崩溃日志"
+                                                }
+                                            }
+                                        },
                                         // E2：自启动引导（仅国产省电 ROM 显示）
                                         autoStartGuideSubtitle = if (AutoStartGuide.shouldSuggest()) {
                                             AutoStartGuide.subtitle()
@@ -905,6 +1103,15 @@ fun GlassApp() {
                                         onAutoStartGuide = {
                                             if (!AutoStartGuide.open(context)) {
                                                 ioMessage = "未能打开系统设置，请手动前往「设置 → 电池 → 应用启动管理」"
+                                            }
+                                        },
+                                        // 桌面歌词（P0-8）：哑开关 + 权限引导都在 app 层做（见 onDesktopLyricsChange）
+                                        desktopLyricsEnabled = desktopLyricsOn,
+                                        onDesktopLyricsEnabledChange = ::onDesktopLyricsChange,
+                                        onDesktopLyricsPermission = {
+                                            // 副标题引导专用入口（开关回调内已含权限分支，这里保底给手动路径）
+                                            if (!DesktopLyricsStore.openPermissionPage(context)) {
+                                                ioMessage = "未能打开系统设置，请手动前往「设置 → 应用 → 音乐 → 显示在其他应用上层」"
                                             }
                                         },
                                     )
@@ -1060,6 +1267,21 @@ fun GlassApp() {
                             }
                             TopBanner(message, maxLines = 3) { ioMessage = null }
                         }
+                        // 备份恢复的 re-match 报告（P0-5 B）：冷启动/后台恢复也可能产生
+                        // （备份文件恢复那条路径已经就地消费掉了自己的报告，走到这里的一般
+                        // 是「曲库稍后才装载完」的时序）。**停留时间比普通 IO 提示长**：
+                        // 「已恢复 37 首，12 首未找到」是用户需要读完并据此行动的信息，
+                        // 4s 一闪而过等于没提示。点击可提前关闭。
+                        state.restoreReport?.let { report ->
+                            if (ioMessage != null) Spacer(Modifier.height(6.dp))
+                            LaunchedEffect(report) {
+                                delay(9000)
+                                state.consumeRestoreReport()
+                            }
+                            TopBanner(restoreReportMessage(report), maxLines = 3) {
+                                state.consumeRestoreReport()
+                            }
+                        }
                         // 播放错误提示条（4s 自动消退，点击关闭）
                         state.playbackError?.let { message ->
                             LaunchedEffect(message) {
@@ -1086,13 +1308,33 @@ private val TAB_SCREENS = setOf(GlassScreen.Library, GlassScreen.Playlist, Glass
 /** 播放页升起时下层后退缩放：Chrome 在播放页打开期间也被缩放（退出飞行端点还原用） */
 private const val RecedeScale = 0.96f
 
-/** 顶部单条玻璃提示（IO 结果 / 播放错误共用）：样式单点定义，避免两条各写一份后漂移 */
+/**
+ * 顶部单条玻璃提示（IO 结果 / 播放错误 / 备份恢复报告共用）：样式单点定义，避免多条各写
+ * 一份后漂移。
+ *
+ * 读屏（无障碍 P0-4）：这个横幅是**可点的**（点击关闭），但 GlassSurface 内部只走
+ * combinedClickable，不带 role——读屏会把 [message] 当成一整段文字念完就过去，
+ * 盲用户既不知道它可点、也不知道点了会怎样。补 role = Button 与 onClick 的标签
+ * （「关闭提示」）后，读屏念「<消息内容>，按钮，双击即可关闭提示」。
+ *
+ * 为什么不把「关闭提示」写进 contentDescription：那会**覆盖** message，把横幅真正的
+ * 内容（播放错误原因、备份恢复了几首）吞掉——而内容才是这条横幅的全部价值。
+ * 用 onClick(label=...) 的方式追加动作名，才能既保留内容又表达可点性。
+ */
 @Composable
 private fun TopBanner(message: String, maxLines: Int, onClick: () -> Unit) {
     GlassSurface(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp),
+            .padding(horizontal = 20.dp)
+            .semantics {
+                this.role = Role.Button
+                // 动作名而不是内容替换：见函数 KDoc
+                onClick(label = "关闭提示") {
+                    onClick()
+                    true
+                }
+            },
         level = GlassLevel.Hi,
         shape = RoundedCornerShape(R.Card14.dp),
         onClick = onClick,

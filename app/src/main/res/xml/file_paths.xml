@@ -13,4 +13,17 @@
 -->
 <paths>
     <files-path name="update" path="update/" />
+    <!-- 歌单分享（P0-5 A）：filesDir/share/ 下的临时 M3U8，由 ShareActions.sharePlaylist
+         写出后经 FileProvider 换成可授权的 content:// uri 再 ACTION_SEND 出去。
+
+         **为什么只暴露这一个子目录、而不是整个外部存储**：分享歌单只需要「把一个小文本
+         文件交给接收方」。若为图省事加 <external-path> 或 <root-path>，这个 provider
+         虽然 exported=false，但**任何**拿到 grant 的 App 都能读用户全盘文件——
+         为一个文本歌单把存储面扩到全盘是明确的安全倒退。
+         曲目音频本身走 MediaStore content:// uri 直接分享（见 ShareActions.shareSong
+         的注释），根本不需要 FileProvider。
+
+         与上面 update/ 的注释同一条原则：FileProvider 的路径表按「实际需要」最小化，
+         不要为了走捷径把 cover/、Music/ 之类的大面目录塞进来。 -->
+    <files-path name="share" path="share/" />
 </paths>

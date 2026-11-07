@@ -72,6 +72,12 @@ fun SongActionsSheet(
         state.isEditablePlaylist(playlistContextId) &&
         state.isSongInPlaylist(playlistContextId, song.id)
     val favorite = state.isFavorite(song.id)
+    // 系统集成动作（分享 / 设为铃声）：宿主经 LocalSystemActions 提供，未接线时两项都不渲染。
+    // 走 CompositionLocal 而不是加形参：本面板有 5 个调用点，为新动作改 8 处签名
+    // 既扩大并行开发冲突面，也让「再加一个系统动作」的边际成本居高不下（见 SystemActions.kt）。
+    val sys = LocalSystemActions.current
+    val onShareSong = sys.songShareAction(song)
+    val onSetRingtone = sys.songRingtoneAction(song)
     GlassSheet(visible = visible && sub == SongActionSub.None, onDismiss = onDismiss, title = song.title) {
         SheetAction(
             icon = GlassIcons.PlayNext,
@@ -107,9 +113,16 @@ fun SongActionsSheet(
         SheetAction(
             icon = GlassIcons.Disc,
             label = "查看专辑",
+            // 副标题是**展示文案**：用纯专辑名（song.album），不是定位 id
             subtitle = song.album,
             onClick = {
-                state.openDetail(DetailTarget(DetailTarget.Kind.Album, song.album))
+                // 定位必须用 albumIdOf(song)：专辑分组键改造后是
+                // (专辑名, 专辑艺术家) 二元组，`DetailTarget.Kind.Album` 按这个 id 匹配。
+                // 旧实现直接传 song.album（纯专辑名），两只同名专辑会进到同一张详情页
+                // ——更隐蔽的是「同专辑名的另一张」可能根本不包含当前这首歌，
+                // 用户点「查看专辑」看到一张陌生专辑，还以为是 App 抽风。
+                // albumIdOf 与分组用的是同一个编码函数（AppState.albumId），不会分叉。
+                state.openDetail(DetailTarget(DetailTarget.Kind.Album, state.albumIdOf(song)))
                 onDismiss()
             },
         )
@@ -141,6 +154,36 @@ fun SongActionsSheet(
             ),
             onClick = { sub = SongActionSub.Info },
         )
+        // ── 系统集成：分享 / 设为铃声（P0-5 A）──
+        //
+        // 放在「歌曲信息」之后的末段而不是插在播放动作中间：分享/设铃声是低频动作，
+        // 而「下一首播放/收藏/加入歌单」是高频动作——把低频项压在顶部会把高频项挤出
+        // 面板首屏（GlassSheet 内容区限高 420dp，8 项已接近上限）。
+        //
+        // 两项都可能为 null（宿主未接线 / Compose Preview）：为 null 就不渲染，
+        // 绝不渲染一个点了没反应的菜单项——这比没有这项更伤。
+        if (onShareSong != null) {
+            SheetAction(
+                icon = GlassIcons.Share,
+                label = "分享歌曲",
+                subtitle = if (song.mediaUri == null) "这首歌没有音频文件，将分享歌名" else "发送给朋友",
+                onClick = {
+                    onShareSong()
+                    onDismiss()
+                },
+            )
+        }
+        if (onSetRingtone != null) {
+            SheetAction(
+                icon = GlassIcons.Bell,
+                label = "设为铃声",
+                subtitle = if (song.mediaUri == null) "这首歌没有可用的音频文件" else "来电铃声",
+                onClick = {
+                    onSetRingtone()
+                    onDismiss()
+                },
+            )
+        }
     }
     AddToPlaylistSheet(visible = visible && sub == SongActionSub.AddTo, onDismiss = onDismiss, state = state, song = song)
     SongInfoSheet(visible = visible && sub == SongActionSub.Info, onDismiss = onDismiss, state = state, song = song)
@@ -193,7 +236,7 @@ private fun PlaylistPickRow(playlist: DemoPlaylist, added: Boolean, onClick: () 
     }
 }
 
-/** 歌曲信息面板：标题 / 艺术家 / 专辑 / 时长 / 格式 / 文件夹 */
+/** 歌曲信息面板：标题 / 艺术家 / 专辑 / 碟号与音轨 / 时长 / 格式 / 文件夹 */
 @Composable
 fun SongInfoSheet(
     visible: Boolean,
@@ -206,24 +249,55 @@ fun SongInfoSheet(
         InfoRow("标题", song.title)
         InfoRow("艺术家", song.artist)
         InfoRow("专辑", song.album)
+        // 专辑艺术家：只在**与曲目艺术家不同**时才单列一行。
+        // 绝大多数普通专辑的专辑艺术家就等于曲目艺术家，此时多一行只是重复信息；
+        // 而合辑（专辑艺术家 = "Various Artists"）恰恰是用户最需要看到它的场景。
+        // 判据与分组口径一致（albumArtist 空串 = 标签缺失），空则整行不出现。
+        if (song.albumArtist.isNotBlank() && song.albumArtist != song.artist) {
+            InfoRow("专辑艺术家", song.albumArtist)
+        }
         // 未知字段（0/空）不占行：扫描未取到的标签不展示空值噪声
         if (song.genre.isNotBlank()) InfoRow("流派", song.genre)
         if (song.year > 0) InfoRow("年份", song.year.toString())
+        // 碟号只在多碟专辑出现：单碟专辑 discNo 恒为 0（未知）或 1，单独列一行没有信息量
+        if (song.discNo > 1) InfoRow("碟号", song.discNo.toString())
         if (song.trackNo > 0) InfoRow("音轨", song.trackNo.toString())
         InfoRow("时长", song.duration)
-        InfoRow("格式", songFormatText(song, live))
+        // ── 格式：诚实性标注（审计 01 报告 14a）──
+        // 关键取舍：mimeToCodec 是**真实容器格式**的映射（APE 就是 APE），它回答「这是什么」；
+        // 而 playable 回答「本机能不能播」。两者必须分开——若为了让「APE 不许说自己 APE」
+        // 而把 APE 从映射表里删掉，用户就再也看不到这是 APE 文件了，那是把「不诚实」
+        // 换成了「信息缺失」，问题没解决。所以在格式串后面追加一句明确的「不支持播放」，
+        // 让用户在点播放之前就知道结果，而不是点了才收到一个错误提示。
+        val formatText = songFormatText(song, live)
+        if (song.playable) {
+            InfoRow("格式", formatText)
+        } else {
+            // 颜色用 tertiary 而非 error 红：这是**客观能力说明**不是故障，
+            // 曲库里有它、能看能搜能看信息，只是本地播不了，不该用报错色制造焦虑
+            InfoRow(
+                "格式",
+                "$formatText（当前设备不支持播放）",
+                valueColor = LocalGlassColors.current.textTertiary,
+            )
+        }
         InfoRow("文件夹", song.folder)
     }
 }
 
 @Composable
-private fun InfoRow(label: String, value: String) {
+private fun InfoRow(
+    label: String,
+    value: String,
+    /** 值文本颜色：默认主要文字色；「能力说明」类灰色信息（如格式不支持）用 tertiary 降级 */
+    valueColor: androidx.compose.ui.graphics.Color = LocalGlassColors.current.textPrimary,
+) {
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(label, color = LocalGlassColors.current.textTertiary, fontSize = 13.sp, lineHeight = 18.sp, modifier = Modifier.width(72.dp))
-        Text(value, color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, lineHeight = 18.sp, modifier = Modifier.weight(1f))
+        Text(value, color = valueColor, fontSize = 13.sp, lineHeight = 18.sp, modifier = Modifier.weight(1f))
     }
 }
 
@@ -275,6 +349,9 @@ fun CollectionActionsSheet(
         state.renamePlaylist(target.id, newName)
         onDismiss()
     }
+    // 系统集成动作（分享歌单）：宿主经 LocalSystemActions 提供，未接线时该项不渲染。
+    // 与 SongActionsSheet 同一套机制，理由见 SystemActions.kt 的 KDoc
+    val sys = LocalSystemActions.current
     GlassSheet(visible = visible && !showRename && !showDeleteConfirm, onDismiss = onDismiss, title = title) {
         SheetAction(
             icon = GlassIcons.Play,
@@ -328,6 +405,23 @@ fun CollectionActionsSheet(
                 onClick = {
                     onDismiss()
                     onExportM3u?.invoke()
+                },
+            )
+        }
+        // ── 分享歌单（P0-5 A）──
+        // 与「导出 M3U」并列而不合并：两者语义不同——导出是「存到自己选的位置」，
+        // 分享是「直接发给别人」。实现上分享正是「导出到私有临时目录 + ACTION_SEND」，
+        // 但用户心智里是两个动作（就像相册里「导出」和「分享」并存）。
+        // 已接线且歌单非空才出现（空歌单分享毫无意义，null 时不渲染）。
+        val onSharePlaylist = sys.playlistShareAction(title, tracks)
+        if (onSharePlaylist != null) {
+            SheetAction(
+                icon = GlassIcons.Share,
+                label = "分享歌单",
+                subtitle = "${tracks.size} 首 · 以 M3U8 歌单文件发送",
+                onClick = {
+                    onDismiss()
+                    onSharePlaylist()
                 },
             )
         }

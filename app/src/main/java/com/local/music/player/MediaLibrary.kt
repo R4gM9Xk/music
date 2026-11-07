@@ -142,6 +142,15 @@ object MediaLibrary {
             MediaStore.Audio.Media.DATE_ADDED,
             MediaStore.Audio.Media.DATE_MODIFIED,
             MediaStore.Audio.Media.SIZE,
+            // ── 专辑模型（P0：同名不同艺术家的专辑被合成一张 / 专辑内曲序是字母序）──
+            // 三列都在 MediaStore.MediaColumns 上声明（Audio.Media 继承自它），minSdk 35 恒可用：
+            // ALBUM_ARTIST 自 API 30 起、DISC_NUMBER / YEAR 更早，无需 Build.VERSION 分支。
+            // 但**取值**不可假设非空：MediaProvider 对不同容器/标签的填充率差异很大
+            // （尤其 DISC_NUMBER，很多 MP3 根本不带 TPOS），一律按「空/NULL = 未知」处理，
+            // 且用 getColumnIndex（非 OrThrow）+ 负索引守卫，个别 OEM provider 漏列时不至于整次扫描崩掉。
+            MediaStore.Audio.Media.ALBUM_ARTIST,
+            MediaStore.Audio.Media.DISC_NUMBER,
+            MediaStore.Audio.Media.YEAR,
         )
         // 不带 selection：is_music/duration 在部分扫描路径下不可靠（adb 推送扫成 NULL），
         // 全量拉回外部音频后按 RELATIVE_PATH 分组——不限定 Music/，Download/QQ 等任意
@@ -161,6 +170,15 @@ object MediaLibrary {
             val colDateAdded = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
             val colDateModified = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_MODIFIED)
             val colSize = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
+            // 专辑模型三列用 getColumnIndex（**非** OrThrow）：上面 projection 已显式请求，
+            // 正常 provider 一定有；个别 ROM 的 MediaProvider 对 DISC_NUMBER 之类漏列时
+            // 返回 -1，取值走「未知」默认值即可，不该让整次扫描抛异常失败
+            val colAlbumArtist = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM_ARTIST)
+            val colDiscNo = cursor.getColumnIndex(MediaStore.Audio.Media.DISC_NUMBER)
+            val colYear = cursor.getColumnIndex(MediaStore.Audio.Media.YEAR)
+            /** 负索引（该 provider 没有此列）安全取串：列缺失 = 未知，统一空串 */
+            fun str(col: Int): String? = if (col >= 0) cursor.getString(col) else null
+            fun num(col: Int): Int = if (col >= 0) cursor.getInt(col) else 0
 
             while (cursor.moveToNext()) {
                 // P2-19 取消检查：命中即 break（不抛异常），保证下面的 use{} 正常关 cursor。
@@ -223,6 +241,25 @@ object MediaLibrary {
                                 MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id,
                             ).toString(),
                             dateAddedSec = cursor.getLong(colDateAdded),
+                            // ── 专辑模型三列从**本次 cursor** 覆盖，而不是沿用旧记录 ──
+                            // 这是本改造最容易漏的一处：缓存命中走的是 `c.copy(...)`，
+                            // 旧记录里 albumArtist/discNo/year 要么是空（上一版缓存没这几个键），
+                            // 要么是上一轮扫描时的值。若不在复用路径覆盖，用户升级后
+                            // **只要缓存还命中，这三列就永远是空的**，看起来就像「改了没生效」，
+                            // 而且只有删缓存重扫才会好——正是最难排查的那类 bug。
+                            // 这三列取自 cursor（纯 SQL 列，无解码成本），复用路径覆盖它们
+                            // 不会破坏「增量扫描跳过解码」这个初衷。
+                            albumArtist = str(colAlbumArtist)
+                                ?.trim()
+                                ?.takeIf { it.isNotEmpty() && it != "<unknown>" }
+                                .orEmpty(),
+                            discNo = num(colDiscNo),
+                            year = num(colYear).takeIf { it in 1..9999 } ?: c.year,
+                            // 能否播放沿用旧记录：它取决于 codec，而 codec 不在 cursor 里，
+                            // 复用路径拿不到 MIME（拿它就要重跑 MediaExtractor，等于放弃增量）。
+                            // 这是可接受的：格式不会因为换了个扫描轮次就变，除非用户换了文件，
+                            // 而换文件会改变 mtime/size → 指纹不命中 → 走全量提取，届时自然重算
+                            playable = c.playable,
                             // 不再解码位图（全库常驻数百 MB 的根因），只留 artworkUri：
                             // 由 ArtThumb 在真正要画时经 ArtworkBitmapCache 按需解码（LRU 24MB）
                             coverBitmap = null,
@@ -240,6 +277,21 @@ object MediaLibrary {
                 val coverBitmap = meta.cover
                 val retrieverDurationMs = meta.durationMs
                 val format = meta.format
+                // ── 专辑模型三列（审计 02 报告最致命缺口②）──
+                // 取值时机放在这里（而不是文件开头的 cursor 段）是因为它紧邻 DemoSong 构造，
+                // 读者能一眼看到「列索引 → 归一 → 落字段」这条链，不用来回跳。
+                // 归一口径：空串 / "<unknown>" 都算「标签缺失」→ 空串，
+                // 由 AppState.albumGroupKey 回退到 artist；不在这里直接填 artist，
+                // 是因为「缺失」与「就等于曲目艺术家」在分组语义上必须可区分（合辑场景）。
+                val albumArtist = str(colAlbumArtist)
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() && it != "<unknown>" }
+                    .orEmpty()
+                // 碟号：MediaStore 存的是字符串（可能为 "1" 或 "1/2"），取不出来按 0 = 未知
+                val discNo = num(colDiscNo)
+                // 年份：优先用 MediaStore 的 YEAR 列，取不到（0）再回退标签里的年份。
+                // 两条路都有值但不同时以 MediaStore 为准——它是文件系统侧的权威声明
+                val year = num(colYear).takeIf { it in 1..9999 } ?: meta.tags.year
                 val durationMs = if (cursorDurationMs > 1000) cursorDurationMs else (retrieverDurationMs ?: 0L)
                 val durationSec = (durationMs / 1000).toInt().coerceAtLeast(1)
 
@@ -282,8 +334,15 @@ object MediaLibrary {
                     art = fallbackArt(songs.size),
                     folder = folder,
                     genre = meta.tags.genre,
-                    year = meta.tags.year,
+                    year = year,
                     trackNo = meta.tags.trackNo,
+                    albumArtist = albumArtist,
+                    discNo = discNo,
+                    // 能否播放：MIME 判得出来就用 MIME 的结论；MIME 都没取到（MediaExtractor
+                    // 打不开该容器）时退回扩展名判定。注意 `format?.playable ?: isPlayablePath(...)`
+                    // 的短路顺序——不能用 `?: true`，那等于把「没取到 MIME」一律乐观判可播，
+                    // 而 .ape 这类文件的典型特征恰恰就是 MediaExtractor 也解不开
+                    playable = format?.playable ?: isPlayablePath(dataPath),
                     mediaUri = uri.toString(),
                     // 位图不留驻（同上：改为按需解码）；palette 仍取一次缩略图算色
                     coverBitmap = null,
@@ -594,6 +653,8 @@ object MediaLibrary {
         val sampleRateHz: Int,
         val bitDepth: Int,
         val bitrateKbps: Int,
+        /** 本机引擎能否播放该容器的 MIME（判定口径见 [isPlayableMime]）；null = 没取到 MIME */
+        val playable: Boolean? = null,
     )
 
     private val mimeToCodec = mapOf(
@@ -604,6 +665,65 @@ object MediaLibrary {
         "audio/ogg" to "OGG", "audio/opus" to "OPUS", "audio/amr" to "AMR",
         "audio/midi" to "MIDI",
     )
+
+    /**
+     * 本机播放引擎**明确解不了**的容器 MIME（黑名单，口径见 [isPlayableMime]）。
+     *
+     * 与 [mimeToCodec] 的分工是这件事的关键：
+     * - [mimeToCodec] 回答「这是什么格式」（**展示用**，含 APE/WMA 这类引擎解不了的）
+     * - 本集合回答「本机明确不能播」（**能力用**）
+     *
+     * ## 为什么第一版用白名单、真机回归后改成了黑名单（决策变更记录）
+     *
+     * 第一版的理由是「白名单漏一个只会多标一次不支持，代价小」——**这个推理漏了
+     * 一个真实的设备事实**：Android 平台 MediaExtractor 对 FLAC 常报 `audio/raw`
+     * （PCM 解封装输出而非 `audio/flac`），WAV 也常报 `audio/raw`。白名单没有
+     * `audio/raw` → **整个无损曲库被误标为「当前设备不支持播放」**。真机（API 36
+     * 模拟器）实测：全部 FLAC/WAV 条目 playable=false，而这些歌实际都能正常播放
+     * （dumpsys media_session 显示 PLAYING）。信息面板的错误标注比「不标注」更糟
+     * ——那正是审计 14a 批评的「说了做不到」的镜像：「做得到却说做不到」。
+     *
+     * 黑名单的取舍反过来了：冷门格式漏标一次「能播」→ 用户点播放得到引擎的错误
+     * 横幅（引擎自己会说「音频格式不支持播放」，还有坏文件自动跳过兜底），代价是
+     * 一次点击；而白名单错杀是**整类格式永久带错误角标**，代价是每天看一眼。
+     * 引擎侧已有错误处理与跳过链路兜底，黑名单的失败模式是可控的。
+     */
+    private val unsupportedMime = setOf(
+        // Media3 开箱（无 FFmpeg 扩展）确定解不了的容器/编码。
+        // APE(Wavpack 系 Monkey's Audio)、WMA、WavPack、DSD、TAK、TTA、MPC
+        // 均不在 AOSP MediaExtractor 的解析能力内。
+        "audio/ape", "audio/x-ape", "audio/x-ms-wma", "audio/wavpack", "audio/x-wavpack",
+        "audio/dsf", "audio/dff", "audio/x-dsd", "audio/tak", "audio/tta", "audio/musepack",
+        "audio/mpc", "audio/aiff", "audio/x-aiff", "audio/x-ape-file",
+    )
+
+    /** 引擎明确**不支持**的扩展名（无 MIME 时的兜底判据，也是给 UI 的明确说法来源） */
+    private val unsupportedExtensions = setOf(
+        "APE", "WMA", "WV", "DSF", "DFF", "TAK", "TTA", "MPC", "AIFF", "AIFFC",
+    )
+
+    /**
+     * 判定该 MIME 对应的格式在本机能否播放。
+     *
+     * **为什么真机回归后从白名单改为黑名单**：见 [unsupportedMime] 的注释。
+     * 一句话总结——白名单在真实设备上会把 FLAC/WAV 的 `audio/raw` MIME 错杀，
+     * 把「能播的整类格式」标成「不支持」；黑名单的失败模式（冷门格式漏标）由
+     * 引擎侧错误横幅 + 坏文件自动跳过兜底，代价小一个数量级。
+     */
+    private fun isPlayableMime(mime: String): Boolean = mime.lowercase() !in unsupportedMime
+
+    /**
+     * 无 MIME（MediaExtractor 打不开该容器）时按扩展名兜底判定能否播放。
+     *
+     * 走这条路说明 MediaExtractor 已经解不开这个文件了 —— 但**不能据此直接判不支持**：
+     * MediaExtractor 对某些能播的容器（个别 WAV/AIFF 变体）也会失败，那种情况下
+     * 平台解码器仍可能正常播放。所以这里只对「扩展名明确属于已知不支持集合」的判 false，
+     * 余下一律 true（乐观），避免把能播的文件误标成不能播。
+     */
+    private fun isPlayablePath(dataPath: String): Boolean {
+        val ext = dataPath.substringAfterLast('.', "").uppercase()
+        return ext !in unsupportedExtensions
+    }
 
     /** MIME → 编码名（播放校准与扫描共用） */
     fun codecFromMime(mime: String): String =
@@ -670,6 +790,10 @@ object MediaLibrary {
                         codec = mimeToCodec[mime]
                             ?: mime.substringAfter('/').uppercase().ifEmpty { "音频" },
                         sampleRateHz = intOf(MediaFormat.KEY_SAMPLE_RATE),
+                        // 能否播放按 **MIME** 判定（不是 codec 名）：codec 名是展示用的，
+                        // 而「引擎解不解得开」是 Media3 按 sampleMimeType 路由 renderer 的，
+                        // 所以判据必须和被判定对象同源，否则会出现「显示 APE 被判成可播」这类错位
+                        playable = isPlayableMime(mime),
                         bitDepth = if (intOf(MediaFormat.KEY_PCM_ENCODING) != 0) {
                             pcmEncodingToBitDepth(intOf(MediaFormat.KEY_PCM_ENCODING))
                         } else {
@@ -744,6 +868,10 @@ object MediaLibrary {
      * adb 可直推该目录、免任何权限，作兜底）。
      * 返回 null = 两个候选都不存在；候选存在但无有效时间戳行时降级为纯文本
      * 单行歌词（见 [parseLrcOrPlainText]），不再与「无文件」混同。
+     *
+     * 桌面歌词（P0-8）**刻意不复用本方法**：本文件已封板（历史任务锁定，改可见性也是改），
+     * 悬浮窗侧的 [com.local.music.lyrics.DesktopLyricsLoader] 平移了同一套候选路径逻辑，
+     * 并复用 public 的 [parseLrc] 保证两处解析行为逐比特一致——见其类注释的「同步清单」。
      */
     private fun readLrc(context: Context, audioPath: String): List<LyricLine>? {
         // 注意：文件名取 basename 后再剥扩展名——不能对**整条路径**用 substringBeforeLast('.')，
@@ -925,6 +1053,13 @@ object MediaLibrary {
                 genre = o.optString("genre", ""),
                 year = o.optInt("year", 0),
                 trackNo = o.optInt("trackNo", 0),
+                // 旧缓存（v3 之前）没有这三个键：opt* 默认值 = 空串/0/true，
+                // 正好落到「标签缺失 + 可播放」的安全默认，与 DemoSong 字段默认值一致。
+                // playable 默认 **true** 而不是 false：老缓存条目大多是真能播的常规格式，
+                // 默认 false 会把升级后首屏所有歌全标成「不支持」，那才是事故
+                albumArtist = o.optString("albumArtist", ""),
+                discNo = o.optInt("discNo", 0),
+                playable = o.optBoolean("playable", true),
                 mediaUri = o.optString("mediaUri").ifEmpty { null },
                 coverBitmap = null, // 按需解码（ArtworkBitmapCache）：全库常驻数百 MB 的根因
                 artworkUri = artworkUri,
@@ -1001,6 +1136,14 @@ object MediaLibrary {
                     put("genre", s.genre)
                     put("year", s.year)
                     put("trackNo", s.trackNo)
+                    // ── 专辑模型三列（v3 缓存不带这些键 → 读侧 opt* 带默认值兜底）──
+                    // 不升 CACHE_VERSION 是刻意的：升版会让**所有**老用户首次启动强制全量重扫
+                    // （万首库分钟级），代价远大于收益。这三个键都是「缺省即可用」的纯增量字段，
+                    // 读侧默认值 + 下一次增量扫描的复用路径覆盖（见 load() 里 c.copy 那段的注释）
+                    // 已经能让老缓存平滑收敛到新值，不需要整库作废。
+                    put("albumArtist", s.albumArtist)
+                    put("discNo", s.discNo)
+                    put("playable", s.playable)
                     put("mediaUri", s.mediaUri ?: "")
                     put("dataPath", s.id.removePrefix("f")) // 稳定 id = "f" + 文件绝对路径
                     put("artworkUri", s.artworkUri ?: "")

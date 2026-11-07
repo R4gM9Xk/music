@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  封面占位图：无封面时的兜底。
+
+  为什么要有「占位」而不是把 ImageView 隐藏：隐藏会让横条布局在「有封面/无封面」
+  两首歌之间切换时左右跳动（标题起始位置横移 ~48dp），观感上就是「小部件在闪」。
+  用固定尺寸的占位块，布局骨架永远稳定。
+
+  视觉：深色圆角块 + 中央一圈淡涟漪，呼应应用图标的「液态波纹」母题
+  （见 drawable/ic_launcher_foreground.xml），但只用单色描边，避免在桌面上过于抢眼。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+
+    <!-- 底板 -->
+    <path
+        android:fillColor="#FF2A2A31"
+        android:pathData="M0,0 L96,0 L96,96 L0,96 Z" />
+
+    <!-- 涟漪 1（外圈环，evenOdd 挖空） -->
+    <path
+        android:fillColor="#3DFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M30,48 a18,18 0 1,0 36,0 a18,18 0 1,0 -36,0 Z M34,48 a14,14 0 1,0 28,0 a14,14 0 1,0 -28,0 Z" />
+
+    <!-- 涟漪 2（内圈环） -->
+    <path
+        android:fillColor="#66FFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M41,48 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0 Z M44,48 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0 Z" />
+
+    <!-- 圆心水滴 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M46.5,48 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0 Z" />
+</vector>

@@ -61,6 +61,11 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
@@ -233,15 +238,18 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        GlassIconButton(onClick = {
-                            val f = flight
-                            if (f != null) {
-                                // 收起回来源页（playerOrigin），而不是硬编码曲库
-                                f.beginExit(state.currentSong) { state.closePlayer() }
-                            } else {
-                                state.closePlayer()
-                            }
-                        }) {
+                        GlassIconButton(
+                            onClick = {
+                                val f = flight
+                                if (f != null) {
+                                    // 收起回来源页（playerOrigin），而不是硬编码曲库
+                                    f.beginExit(state.currentSong) { state.closePlayer() }
+                                } else {
+                                    state.closePlayer()
+                                }
+                            },
+                            modifier = Modifier.semantics { contentDescription = "收起播放页" },
+                        ) {
                             Icon(GlassIcons.Down, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
                         }
                         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
@@ -249,16 +257,19 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text("来自「${state.queueSource ?: "本地音乐"}」", color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
                         }
-                        GlassIconButton(onClick = {
-                            // 播放选项面板挂根层宿主（照抄 modal.show 模式；重复打开即整组重建，状态无残留）
-                            modal.show {
-                                PlaybackOptionsSheet(
-                                    visible = modal.visible,
-                                    onDismiss = modal::requestDismiss,
-                                    state = state,
-                                )
-                            }
-                        }) {
+                        GlassIconButton(
+                            onClick = {
+                                // 播放选项面板挂根层宿主（照抄 modal.show 模式；重复打开即整组重建，状态无残留）
+                                modal.show {
+                                    PlaybackOptionsSheet(
+                                        visible = modal.visible,
+                                        onDismiss = modal::requestDismiss,
+                                        state = state,
+                                    )
+                                }
+                            },
+                            modifier = Modifier.semantics { contentDescription = "更多播放选项" },
+                        ) {
                             Icon(GlassIcons.More, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
                         }
                     }
@@ -437,6 +448,8 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         Spacer(Modifier.width(12.dp))
                         ConsoleIcon(
                             onClick = { state.toggleFavorite(song.id) },
+                            contentDescription = if (state.isFavorite(song.id)) "取消收藏" else "收藏",
+                            stateDescription = if (state.isFavorite(song.id)) "已收藏" else "未收藏",
                             modifier = Modifier.graphicsLayer { alpha = softAlpha() },
                         ) {
                             Icon(
@@ -463,6 +476,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                     )
                                 }
                             },
+                            contentDescription = "打开播放队列",
                             modifier = Modifier.graphicsLayer { alpha = softAlpha() },
                         ) {
                             Icon(GlassIcons.Queue, null, Modifier.size(21.dp),
@@ -499,11 +513,20 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        ConsoleIcon(onClick = state::toggleShuffle, modifier = Modifier.graphicsLayer { alpha = softAlpha() }) {
+                        ConsoleIcon(
+                            onClick = state::toggleShuffle,
+                            contentDescription = "随机播放",
+                            stateDescription = if (state.shuffleOn) "已开启" else "已关闭",
+                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
+                        ) {
                             Icon(GlassIcons.Shuffle, null, Modifier.size(20.dp),
                                 tint = if (state.shuffleOn) auroraAccentColor() else LocalGlassColors.current.textSecondary)
                         }
-                        ConsoleIcon(onClick = { state.prev() }, modifier = Modifier.graphicsLayer { alpha = softAlpha() }) {
+                        ConsoleIcon(
+                            onClick = { state.prev() },
+                            contentDescription = "上一首",
+                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
+                        ) {
                             Icon(GlassIcons.Prev, null, Modifier.size(28.dp),
                                 tint = LocalGlassColors.current.textSecondary)
                         }
@@ -516,6 +539,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         )
                         ConsoleIcon(
                             onClick = { state.next() },
+                            contentDescription = "下一首",
                             modifier = Modifier
                                 .trackFlight(FlightKeys.PlayerNext)
                                 .graphicsLayer { alpha = sharedInnerAlpha() },
@@ -523,7 +547,16 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             Icon(GlassIcons.Next, null, Modifier.size(28.dp),
                                 tint = LocalGlassColors.current.textSecondary)
                         }
-                        ConsoleIcon(onClick = state::cycleRepeat, modifier = Modifier.graphicsLayer { alpha = softAlpha() }) {
+                        ConsoleIcon(
+                            onClick = state::cycleRepeat,
+                            contentDescription = "循环模式",
+                            stateDescription = when (state.repeatMode) {
+                                RepeatMode.Off -> "顺序播放"
+                                RepeatMode.All -> "列表循环"
+                                RepeatMode.One -> "单曲循环"
+                            },
+                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
+                        ) {
                             Box(Modifier.size(20.dp)) {
                                 Icon(GlassIcons.Repeat, null, Modifier.size(20.dp),
                                     tint = if (state.repeatMode != RepeatMode.Off) {
@@ -848,11 +881,23 @@ private fun PlayPauseButton(
                     strokeWidth = 1.dp.toPx(),
                 )
             }
+            // 读屏语义：整个 66dp 圆是一个可点按钮。contentDescription 固定为「播放/暂停」这一对
+            // 动作名的**当前动作**，stateDescription 单独表达「正在播放/已暂停」——
+            // 二者分开是 TalkBack 的正确用法：前者答「点它会怎样」，后者答「现在是什么状态」。
+            // 只把状态塞进 contentDescription 会让读屏每次念一长串且丢失 role。
+            .semantics {
+                this.role = Role.Button
+                contentDescription = if (playing) "暂停" else "播放"
+                stateDescription = if (playing) "正在播放" else "已暂停"
+            }
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Icon(
-            if (playing) GlassIcons.Pause else GlassIcons.Play, null,
+            if (playing) GlassIcons.Pause else GlassIcons.Play,
+            // 语义已由外层 Box 的 semantics{} 完整承担（含 role/state）；
+            // Icon 再挂一份会和父节点重复播报两遍，故此处 null 是**有意为之**，不是漏补
+            contentDescription = null,
             Modifier.size(26.dp), tint = LocalGlassColors.current.textPrimary,
         )
     }
@@ -862,7 +907,9 @@ private fun PlayPauseButton(
 @Composable
 private fun ConsoleIcon(
     onClick: () -> Unit,
+    contentDescription: String,
     modifier: Modifier = Modifier,
+    stateDescription: String? = null,
     content: @Composable () -> Unit,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
@@ -870,6 +917,13 @@ private fun ConsoleIcon(
         modifier
             .pressScale(interactionSource, pressed = 0.88f)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+            // 语义挂在这个 Box 上（它就是 clickable 节点）：role=Button + 文案 + 可选状态。
+            // 子 Icon 一律传 null，避免读屏把同一句话念两遍。
+            .semantics {
+                this.role = Role.Button
+                this.contentDescription = contentDescription
+                if (stateDescription != null) this.stateDescription = stateDescription
+            }
             .padding(6.dp),
     ) { content() }
 }

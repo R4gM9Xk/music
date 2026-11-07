@@ -41,7 +41,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -311,7 +313,20 @@ private fun DetailHeader(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        GlassIconButton(onClick = { state.backFromDetail() }) {
+        // 读屏（无障碍 P0-4）：这是一个只画了 ← 箭头的玻璃圆钮，**没有任何可见文字**。
+        // 旧实现完全没挂语义——TalkBack 停上去只念「按钮」，盲用户在详情页里找不到
+        // 返回入口（Android 系统返回手势对读屏用户存在，但读屏用户更依赖显式按钮，
+        // 且这是页面上唯一的返回控件，缺描述等于该功能对特定人群不存在）。
+        // role + contentDescription 都补：GlassIconButton 内部只有 clickable（无 role），
+        // 不补 role 读屏不会提示「双击激活」。
+        GlassIconButton(
+            onClick = { state.backFromDetail() },
+            modifier = Modifier.semantics {
+                this.role = Role.Button
+                this.contentDescription = DetailA11y.BACK
+            },
+        ) {
+            // 有意 null、非遗漏：语义已挂在外层圆钮上，子图标再给描述会重复播报
             Icon(GlassIcons.Back, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
         }
         Text(data.header, color = LocalGlassColors.current.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
@@ -339,7 +354,10 @@ private fun DetailHeader(
                         )
                     }
                 },
-                modifier = Modifier.semantics { contentDescription = "添加歌曲" },
+                modifier = Modifier.semantics {
+                    this.role = Role.Button
+                    this.contentDescription = DetailA11y.ADD_SONGS
+                },
                 size = 36.dp,
             ) {
                 Icon(GlassIcons.Plus, null, Modifier.size(19.dp), tint = LocalGlassColors.current.textPrimary)
@@ -364,8 +382,16 @@ private fun DetailHeader(
                     )
                 }
             },
+            // 读屏（无障碍 P0-4）：与返回钮同款——只有 ⋯ 图形、无可见文字，
+            // 旧实现完全无描述。这是集合操作面板（播放全部/重命名/删除歌单/导出 M3U）
+            // 的**唯一入口**，缺描述等于整组集合管理功能对读屏用户不可达。
+            modifier = Modifier.semantics {
+                this.role = Role.Button
+                this.contentDescription = DetailA11y.MORE
+            },
             size = 36.dp,
         ) {
+            // 有意 null、非遗漏：语义已挂在外层圆钮上
             Icon(GlassIcons.More, null, Modifier.size(19.dp), tint = LocalGlassColors.current.textPrimary)
         }
     }
@@ -411,20 +437,33 @@ private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
                         .clip(CircleShape)
                         .background(palette.seed)
                         .clickable(interactionSource = playInteraction, indication = null) { onPlayAll(false) }
+                        // 读屏（无障碍 P0-4）：胶囊内有「播放」二字可念，但 clickable 只提供
+                        // onClick，读屏不会提示「按钮 / 双击激活」。补 role 即可，不写
+                        // contentDescription——可见文字「播放」本身就是最好的描述，
+                        // 写死会与之双源漂移。子图标有意 null（文字已表达同一件事）。
+                        .semantics { this.role = Role.Button }
                         .padding(horizontal = 20.dp, vertical = 9.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
+                    // 有意 null、非遗漏：同行「播放」文字已表达语义
                     Icon(GlassIcons.Play, null, Modifier.size(16.dp), tint = Color.White)
                     Text("播放", color = Color.White, fontSize = 13.sp) // seed 实底上保持白字
                 }
                 // 随机：玻璃胶囊（玻璃底上用主题文字色，浅色下保持对比度）
-                GlassSurface(level = GlassLevel.Md, shape = CircleShape, onClick = { onPlayAll(true) }) {
+                // 读屏：GlassSurface 内部走 combinedClickable，同样不带 role，这里补上
+                GlassSurface(
+                    level = GlassLevel.Md,
+                    shape = CircleShape,
+                    onClick = { onPlayAll(true) },
+                    modifier = Modifier.semantics { this.role = Role.Button },
+                ) {
                     Row(
                         Modifier.padding(horizontal = 15.dp, vertical = 9.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
+                        // 有意 null、非遗漏：同行「随机」文字已表达语义
                         Icon(GlassIcons.Shuffle, null, Modifier.size(16.dp), tint = LocalGlassColors.current.textPrimary)
                         Text("随机", color = LocalGlassColors.current.textPrimary, fontSize = 13.sp)
                     }
@@ -565,4 +604,21 @@ private fun Modifier.detailCardSegment(isFirst: Boolean, isLast: Boolean): Modif
                 }
             }
         }
+}
+
+/**
+ * 歌单/专辑详情页顶栏按钮的读屏文案（无障碍 P0-4）。
+ *
+ * 这一页的顶栏是「纯图标、零可见文字」的：← 返回、＋ 添加歌曲、⋯ 更多。
+ * 对明眼用户，图标形状 + 位置约定就够；对读屏用户，没有描述的图标节点等于不存在。
+ * 三个文案集中在这里，下一轮 task-5 抽取 strings.xml 时整体搬走即可。
+ *
+ * 注意顶部「播放 / 随机」两个胶囊**不在**此列：它们有可见文字「播放」「随机」，
+ * 读屏靠节点内文字即可朗读，只补了 role = Button，不写死 contentDescription
+ * （写死会和界面文字形成两个来源，改文案时极易只改一处）。
+ */
+private object DetailA11y {
+    const val BACK = "返回"
+    const val ADD_SONGS = "添加歌曲"
+    const val MORE = "更多歌单操作"
 }

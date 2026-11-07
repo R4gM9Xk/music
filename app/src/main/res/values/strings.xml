@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  字符串资源（i18n 基础设施）—— 审计 03 缺口3 / 04 #11 的落地载体。
+
+  ## 这份文件为什么只覆盖「一部分」文案（诚实说明，不是遗漏）
+
+  全仓中文字面量实测 833 处（含测试与注释外的 UI 串），一次性全量抽取会同时改动
+  20+ 个 Kotlin 文件，在「已验证 137 条单测全绿」的封板状态下引入的回归风险
+  远高于收益。所以本轮采用**基础设施先行 + 高价值文案优先**：
+
+  已抽取（本文件）：
+  - 播放器主控与状态（播放/暂停/上一首/下一首/随机/循环/收藏）
+  - 曲库与歌单页的主要空态、错误态、权限引导
+  - 设置页的组标题与关键开关文案
+  - 分享 / 设为铃声 / 崩溃日志 / 桌面歌词（本轮新增功能的全部用户可见文案）
+  - 通知与小部件的核心文案
+
+  未抽取（下一轮的确定工作项，已记录在交付说明里）：
+  - AppState 内部的动态拼接文案（如「已恢复 X 首，Y 首未找到」这类带参数的句子，
+    抽取时要同时改调用点拼接方式，属于机械但必须成批做的活）
+  - 调试/日志用字符串（不需要翻译，按惯例留在代码里）
+  - 测试文件里的中文字面量（不面向用户，不抽）
+
+  ## 命名约定
+
+  `screen_element_state`：屏幕_元素_状态，例如 `player_btn_play` / `library_empty_title`。
+  这样 `grep R.string.player_` 能一次看到播放页的全部文案，便于后续补翻译时按屏核对。
+-->
+<resources>
+
+    <!-- ── 通用 ── -->
+    <string name="common_cancel">取消</string>
+    <string name="common_confirm">确定</string>
+    <string name="common_delete">删除</string>
+    <string name="common_rename">重命名</string>
+    <string name="common_share">分享</string>
+    <string name="common_retry">重试</string>
+    <string name="common_unknown_artist">未知艺术家</string>
+    <string name="common_unknown_album">未知专辑</string>
+    <string name="common_unknown_genre">未知流派</string>
+    <string name="common_no_lyrics">♪ 暂无歌词</string>
+
+    <!-- ── 播放器主控（无障碍文案与界面文案共用同一份，见 03 缺口2） ── -->
+    <string name="player_btn_collapse">收起播放页</string>
+    <string name="player_btn_more">更多播放选项</string>
+    <string name="player_btn_play">播放</string>
+    <string name="player_btn_pause">暂停</string>
+    <string name="player_btn_prev">上一首</string>
+    <string name="player_btn_next">下一首</string>
+    <string name="player_btn_shuffle">随机播放</string>
+    <string name="player_btn_repeat">循环模式</string>
+    <string name="player_btn_queue">打开播放队列</string>
+    <string name="player_btn_favorite">收藏</string>
+    <string name="player_btn_unfavorite">取消收藏</string>
+    <string name="player_state_playing">正在播放</string>
+    <string name="player_state_paused">已暂停</string>
+    <string name="player_state_favorited">已收藏</string>
+    <string name="player_state_not_favorited">未收藏</string>
+    <string name="player_state_shuffle_on">已开启</string>
+    <string name="player_state_shuffle_off">已关闭</string>
+    <string name="player_repeat_off">顺序播放</string>
+    <string name="player_repeat_all">列表循环</string>
+    <string name="player_repeat_one">单曲循环</string>
+    <string name="player_progress_desc">播放进度</string>
+    <string name="player_source_local">本地音乐</string>
+
+    <!-- ── 曲库 / 歌单 ── -->
+    <string name="library_tab_songs">歌曲</string>
+    <string name="library_tab_albums">专辑</string>
+    <string name="library_tab_artists">艺术家</string>
+    <string name="library_tab_folders">文件夹</string>
+    <string name="library_tab_genres">流派</string>
+    <string name="library_tab_playlists">歌单</string>
+    <string name="library_empty_no_songs_title">还没有歌曲</string>
+    <string name="library_empty_no_permission_title">需要音乐访问权限</string>
+    <string name="library_empty_no_permission_desc">授权后才能扫描本机音乐</string>
+    <string name="library_scanning">扫描中…</string>
+
+    <!-- ── 设置 ── -->
+    <string name="settings_section_appearance">外观</string>
+    <string name="settings_section_playback">播放</string>
+    <string name="settings_section_library">曲库</string>
+    <string name="settings_section_data">数据</string>
+    <string name="settings_section_about">关于</string>
+    <string name="settings_crash_logs">崩溃日志</string>
+    <string name="settings_crash_logs_empty">暂无记录</string>
+    <string name="settings_crash_logs_clear">清空崩溃日志</string>
+    <string name="settings_desktop_lyrics">桌面歌词</string>
+    <string name="settings_desktop_lyrics_on">播放中显示悬浮歌词，可拖动</string>
+    <string name="settings_desktop_lyrics_off">未开启 · 需悬浮窗权限</string>
+
+    <!-- ── 分享 / 设为铃声（本轮新增） ── -->
+    <string name="action_share_song">分享歌曲</string>
+    <string name="action_set_ringtone">设为铃声</string>
+    <string name="action_share_playlist">分享歌单</string>
+    <string name="share_no_app">没有可用的分享应用</string>
+    <string name="ringtone_no_support">当前系统不支持在应用内设为铃声</string>
+
+    <!-- ── 播放错误（坏文件自动跳过 / 格式不支持） ── -->
+    <string name="error_file_missing">音频文件已丢失或不可读</string>
+    <string name="error_format_unsupported">音频格式不支持播放</string>
+    <string name="error_file_missing_skipped">音频文件已丢失或不可读，已跳过</string>
+    <string name="error_format_unsupported_skipped">音频格式不支持播放，已跳过</string>
+    <string name="error_skip_limit">连续跳过 %1$d 首仍无法播放，已暂停自动跳过</string>
+    <string name="error_engine_disconnected">播放服务连接已断开</string>
+    <string name="error_engine_connect_failed">播放服务连接失败，无法播放本地音频</string>
+    <string name="format_unsupported_hint">%1$s（当前设备不支持播放）</string>
+
+    <!-- ── 备份恢复（re-match 报告，带参数） ── -->
+    <string name="restore_report_all_matched">已恢复 %1$d 首</string>
+    <string name="restore_report_partial">已恢复 %1$d 首，%2$d 首未找到（文件路径已变化）</string>
+    <string name="restore_report_none">备份中的 %1$d 首均未找到（文件路径已变化）</string>
+
+    <!-- ── 小部件 ── -->
+    <!-- widget_desc_wide / widget_desc_square 在 widget_strings.xml（小部件那条线的独立文件，
+         此处若再定义会 Duplicate resources——两份描述文案取 widget_strings.xml 的详细版本） -->
+    <string name="widget_label">音乐播放器</string>
+    <string name="widget_not_playing">未在播放</string>
+
+</resources>
