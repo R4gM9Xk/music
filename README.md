@@ -1,10 +1,4 @@
-# project/ —— ColorOS 音乐（液态玻璃流 UI 复刻）
 
-真实可构建的 Android 工程：`app` 壳 + `core:ui` 基础层 + 5 个 feature 模块。
-
-> 早期版本这里曾是一份「反编译骨架推断产物」说明（17 个推断模块、依赖关系靠 import 猜），
-> 其中 9 个 core 子模块只有一份自述「参考骨架」的 `build.gradle.kts`、没有任何源码，
-> 既不参与构建也不被任何模块引用，已整体删除。想要那份历史推断记录请翻 git 历史。
 
 ## 模块
 
@@ -24,8 +18,3 @@ project/
     └── settings/              设置
 ```
 
-## 怎么用
-
-- 想知道「应用分几层、谁依赖谁」→ 看 `settings.gradle.kts` 与各模块 `build.gradle.kts`。
-- 想知道「用了哪些库、什么版本」→ 看 `gradle/libs.versions.toml`。
-- 想真正编译 → 见 `release.sh`（本机固定使用 workbuddy-ai 下的 JDK 17 与 Gradle 8.13）。
