@@ -301,6 +301,25 @@ class MediaControllerEngine(
                     // **刻意不下发 artworkUri**（F2）：它指向应用私有 cache 的 file:// 路径，
                     // 系统进程读不到（真机 EACCES / 模拟器 ENOENT，每次切歌刷屏）。
                     // 封面改由 [withArtwork] 内嵌小 JPEG，见 CoverArtBitmap 类注释。
+                    //
+                    // ## 时长必须显式下发（游戏助手接入，2026-11-08）
+                    //
+                    // 系统从 MediaItem 的 metadata 里**不读**时长——ExoPlayer 要在真正
+                    // prepare 完当前曲之后才填 `player.duration`。而各厂商游戏助手 /
+                    // 车机 / 蓝牙设备的音乐卡片，绝大多数是按 MediaSession 的
+                    // **队列元数据**一次性拉取列表（封面/歌名/时长），拉取那一刻队尾那些
+                    // 还没 prepare 的曲目时长全是 UNKNOWN。
+                    // 表现：游戏助手的进度条只在当前曲上正常，列表里其它曲显示 "--:--"，
+                    // 有的面板干脆因为拿不到时长而不渲染进度条。
+                    //
+                    // `SongSpec.durationMs` 在扫描期就有了（MediaStore / MediaMetadataRetriever），
+                    // 只是历史上**没往 metadata 里放**。这里补上：
+                    // - 0 或负数表示扫描时取不到（未知），此时不写，保持 UNKNOWN 语义
+                    //   ——写 0 会被系统当成「零长度音频」，比未知更糟（进度条直接满格）；
+                    // - 用 Long 毫秒，与 media3 的 METADATA_KEY_DURATION 口径一致。
+                    .apply {
+                        if (durationMs > 0L) setDurationMs(durationMs)
+                    }
                     .build(),
             )
             .build()
