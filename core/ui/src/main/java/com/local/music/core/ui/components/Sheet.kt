@@ -61,16 +61,17 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import kotlin.math.roundToInt
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.LocalThemeFraction
 import com.local.music.core.ui.theme.auroraAccentColor
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.roundToInt
 
 /**
  * 模态面板全局宿主状态：同一时刻最多一个面板（单 content 槽）。
@@ -389,7 +390,7 @@ fun GlassSheet(
                             .fillMaxWidth()
                             .background(veil)
                             .navigationBarsPadding()
-                            .padding(start = 20.dp, end = 20.dp, top = 10.dp, bottom = 16.dp),
+                            .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap12.dp, bottom = S.Gap16.dp),
                     ) {
                         // 顶部拖拽把手
                         Box(
@@ -411,7 +412,7 @@ fun GlassSheet(
                             color = LocalGlassColors.current.textPrimary,
                             modifier = Modifier
                                 .align(Alignment.CenterHorizontally)
-                                .padding(top = 10.dp, bottom = 6.dp),
+                                .padding(top = S.Gap12.dp, bottom = 6.dp),
                         )
                         // E5 面板高度：固定 420dp → 屏幕高度的 65%。
                         //
@@ -509,9 +510,9 @@ fun SheetAction(
             // 语义挂在 clickable 同一个节点上（与 Chrome.MiniBarButton / PlayerScreen.ConsoleIcon
             // 同款写法），整行合并为单个 Button 节点，见上方 KDoc
             .semantics(mergeDescendants = true) { this.role = Role.Button }
-            .padding(horizontal = 6.dp, vertical = 10.dp),
+            .padding(horizontal = 6.dp, vertical = S.Gap12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
     ) {
         Box(
             Modifier
@@ -558,7 +559,7 @@ private fun SectionLabel(text: String) {
         text,
         color = LocalGlassColors.current.textTertiary,
         style = GlassText.SectionLabelMicro,
-        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 10.dp, bottom = 4.dp),
+        modifier = Modifier.padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap12.dp, bottom = 4.dp),
     )
 }
 
@@ -618,7 +619,7 @@ fun QueueSheet(
                 "队列是空的 · 去曲库挑一首开始播放",
                 color = glass.textTertiary, style = GlassText.Body,
                 textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 32.dp),
+                modifier = Modifier.fillMaxWidth().padding(vertical = S.Gap32.dp),
             )
             return@GlassSheet
         }
@@ -639,7 +640,7 @@ fun QueueSheet(
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(start = 20.dp, end = 20.dp, top = 10.dp, bottom = 4.dp),
+                .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap12.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(

@@ -29,10 +29,11 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.AuroraPalette
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 
 /**
  * 主题色色板（F2）：圆形色点网格，选中项带描边 + 对勾语义。
@@ -50,11 +51,11 @@ fun ThemeColorSwatches(
     modifier: Modifier = Modifier,
 ) {
     val glass = LocalGlassColors.current
-    Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(S.Gap12.dp)) {
         seeds.chunked(5).forEachIndexed { rowIndex, row ->
             Row(
                 Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
             ) {
                 row.forEachIndexed { colIndex, color ->
                     // 全局索引（跨行连续）：读屏序号与色板展示顺序一一对应
@@ -122,7 +123,7 @@ fun AuroraMiniPreview(
             style = GlassText.Caption,
             modifier = Modifier
                 .align(Alignment.BottomStart)
-                .padding(start = 12.dp, bottom = 10.dp),
+                .padding(start = S.Gap12.dp, bottom = S.Gap12.dp),
         )
     }
 }

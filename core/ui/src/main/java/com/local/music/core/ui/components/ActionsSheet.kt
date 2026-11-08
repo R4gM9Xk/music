@@ -40,6 +40,7 @@ import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.auroraAccentColor
 
 /**
@@ -251,7 +252,7 @@ fun AddToPlaylistSheet(
                     }
                 },
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(S.Gap8.dp))
         }
         SheetAction(
             icon = GlassIcons.Plus,
@@ -288,9 +289,9 @@ private fun PlaylistPickRow(playlist: DemoPlaylist, added: Boolean, onClick: () 
             .clip(RoundedCornerShape(R.Card14.dp))
             .pressScale(interactionSource, pressed = 0.98f)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 9.dp),
+            .padding(horizontal = 6.dp, vertical = S.Gap8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
     ) {
         ArtThumb(playlist.art, Modifier.size(40.dp), RoundedCornerShape(R.Thumb10.dp), bordered = true)
         Column(Modifier.weight(1f)) {
@@ -362,7 +363,7 @@ private fun InfoRow(
     valueColor: androidx.compose.ui.graphics.Color = LocalGlassColors.current.textPrimary,
 ) {
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
+        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = S.Gap8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(label, color = LocalGlassColors.current.textTertiary, style = GlassText.Body, modifier = Modifier.width(72.dp))
@@ -520,7 +521,7 @@ fun CollectionActionsSheet(
             leading = null,
             onSearch = { commitRename() },
         )
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(S.Gap8.dp))
         SheetAction(
             icon = GlassIcons.Edit,
             label = "保存",
@@ -540,7 +541,7 @@ fun CollectionActionsSheet(
             "「$title」将从歌单列表移除，歌单内的 ${tracks.size} 首曲目关系一并清除，此操作不可撤销。",
             color = LocalGlassColors.current.textSecondary,
             style = GlassText.Body,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = S.Gap8.dp),
         )
         Spacer(Modifier.height(4.dp))
         SheetAction(
@@ -609,7 +610,7 @@ fun AddSongsSheet(
             onValueChange = { query = it },
             hint = "搜索歌曲或艺术家",
         )
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(S.Gap12.dp))
         if (songs.isEmpty()) {
             // 空态：曲库未装载 / 搜索无结果
             Box(Modifier.fillMaxWidth().height(120.dp), contentAlignment = Alignment.Center) {
@@ -638,7 +639,7 @@ fun AddSongsSheet(
                 }
             }
         }
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(S.Gap12.dp))
         SheetAction(
             icon = GlassIcons.Plus,
             label = "添加 ${selected.size} 首",

@@ -1857,6 +1857,11 @@ class AppState(
         return ((sleepTimerDeadlineMs - clock()) / 1000L).toInt().coerceAtLeast(0)
     }
 
+    /**
+     * 三态循环的**基元**（Off→All→One→Off）。播放页 UI 已不再直接调它——屏幕上只有一枚
+     * 「播放模式」按钮，走 [cyclePlayMode]；这个函数保留是因为「循环三态」本身仍是独立语义，
+     * 单测（AppStateQueueTest「cycleRepeat 三态轮转并下发引擎」）也以它为基元断言引擎下发。
+     */
     fun cycleRepeat() {
         repeatMode = when (repeatMode) {
             RepeatMode.Off -> RepeatMode.All
@@ -1864,6 +1869,69 @@ class AppState(
             RepeatMode.One -> RepeatMode.Off
         }
         engine?.setRepeatMode(repeatMode == RepeatMode.All, repeatMode == RepeatMode.One)
+        scheduleSave()
+    }
+
+    /**
+     * 播放模式合并按钮的唯一入口：顺序播放 → 列表循环 → 单曲循环 → 随机播放 → 顺序播放。
+     *
+     * ## 为什么收敛在 state 层，而不是让 UI 拼两次调用
+     *
+     * 这四个「态」是 ([shuffleOn], [repeatMode]) 两个持久化字段的**联合状态**。若让 UI 自己
+     * `when` 出下一态再分别调 [toggleShuffle] / [cycleRepeat]，一次点击就变成「读两字段 →
+     * 算下一态 → 写两字段 → 各自下发 → 各自 scheduleSave」：中途任何一次重组都会看到半迁移
+     * 状态（shuffle 已开、repeat 还停在 One），而且一次点击写两次盘。收敛到这里后：
+     * 一次进入、一次下发、一次存盘。
+     *
+     * ## 四态 ⇄ 持久化字段的映射（字段名与语义一律不动，见 SettingsStore / AppStateSnapshot）
+     *
+     * | 视觉态   | shuffleOn | repeatMode | restore 时的读法                    |
+     * |----------|-----------|------------|-------------------------------------|
+     * | 顺序播放 | false     | Off        | shuffle=false 且 repeat=Off          |
+     * | 列表循环 | false     | All        | shuffle=false 且 repeat=All          |
+     * | 单曲循环 | false     | One        | shuffle=false 且 repeat=One          |
+     * | 随机播放 | true      | All        | **只看 shuffleOn**（true 即随机）    |
+     *
+     * 显示侧（PlayerScreen 的 `playModeOf`）用同一张表反查；`shuffleOn = true` 时忽略
+     * repeatMode —— 这条容错让旧快照/其它入口产生的「随机 + Off」「随机 + One」也稳定显示
+     * 成「随机播放」，不会出现「按钮显示顺序播放、实际却在随机」这种错位。
+     *
+     * ## 为什么「随机」要把 repeatMode 一并抬到 All
+     *
+     * 随机 + repeat=Off 的真实行为是「把队列打散后播到尽头就静默停下」：引擎侧 Media3
+     * 在队尾没有 next 且 repeat off；演示模式走 [next] 的 stopAtEnd 分支。而用户点「随机」
+     * 的意图几乎总是「一直随机放下去」。所以随机态把 repeat 抬到 All —— 这也让四态与
+     * 「循环三档 × 随机开关」六种组合中的四种构成一一对应，剩下两种（随机+Off、随机+One）
+     * 只可能来自旧版本快照或「随机播放全部」入口（[playCollection] 的 shuffle 参数只改
+     * shuffleOn），显示时一律归入「随机」，并在下一次点击时收敛回四态之一。
+     */
+    fun cyclePlayMode() {
+        val nextShuffle: Boolean
+        val nextRepeat: RepeatMode
+        when {
+            // 随机 → 顺序：repeat 必须一起熄掉，否则「顺序播放」的引擎仍会在队尾回绕
+            shuffleOn -> {
+                nextShuffle = false
+                nextRepeat = RepeatMode.Off
+            }
+            repeatMode == RepeatMode.Off -> {
+                nextShuffle = false
+                nextRepeat = RepeatMode.All
+            }
+            repeatMode == RepeatMode.All -> {
+                nextShuffle = false
+                nextRepeat = RepeatMode.One
+            }
+            // 单曲 → 随机（repeat 抬到 All，见上方 KDoc）
+            else -> {
+                nextShuffle = true
+                nextRepeat = RepeatMode.All
+            }
+        }
+        shuffleOn = nextShuffle
+        repeatMode = nextRepeat
+        engine?.setRepeatMode(nextRepeat == RepeatMode.All, nextRepeat == RepeatMode.One)
+        engine?.setShuffleMode(nextShuffle)
         scheduleSave()
     }
 

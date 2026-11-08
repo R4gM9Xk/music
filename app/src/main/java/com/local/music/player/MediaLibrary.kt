@@ -961,28 +961,32 @@ object MediaLibrary {
         return out.sortedBy { it.timeSec }.distinct()
     }
 
-    /** 封面取色：Palette 主色 → HSV 派生整套 AuroraPalette */
+    /**
+     * 封面取色：从位图提**一个** seed 色，派生整套 AuroraPalette 一律走 [AuroraPalette.fromSeed]。
+     *
+     * 视觉审计 A3 改造前这里有第三套公式（seed2 = s×0.7/v×1.25、seed3 = s×0.45/v×1.5、
+     * deep = s×0.85/v×0.38、deep2 = s×0.8/v×0.13），与 fromSeed 的系数完全不同：
+     * 同一个色相「手选」和「封面恰好取到」会得到两种深浅，切歌时氛围在两套公式间跳，
+     * 取色 400ms 交叉渐变掩盖不了这种色相/明度偏移。现在只剩这一个派生源。
+     *
+     * 本函数因此只负责采样的**前两步**：
+     * 1. 用 Palette API 挑 swatch（vibrant → muted → dominant 依次降级）；
+     * 2. 把 swatch 的代表色 `swatch.rgb` 原样当作 seed 交给 fromSeed。
+     * 不再做「中性化/防脏色」的手工 HSV 缩放——那部分逻辑已经上移到 fromSeed 的彩度门控里
+     * （中性 seed 不注入假饱和，纯灰封面得到纯灰极光底），在这里重复一遍只会再次分叉两套公式。
+     *
+     * **线程与性能**：保持纯 CPU、无位图拷贝（`asAndroidBitmap()` 只是把 Compose 的
+     * [androidx.compose.ui.graphics.ImageBitmap] 包一层 Android 视图，不复制像素）、无 IO；
+     * Palette 量化本就要遍历缩略图，与改造前同一量级（改造只减少了一次 HSV 派生，
+     * 不再额外分配 float 数组）。调用方在解码/扫描线程调它，fromSeed 是纯函数，
+     * 不需要主线程，也没有 @Composable/Context 依赖。
+     */
     fun paletteFromBitmap(bitmap: androidx.compose.ui.graphics.ImageBitmap): AuroraPalette {
         val swatch = Palette.from(bitmap.asAndroidBitmap()).maximumColorCount(24).generate().let { p ->
             p.vibrantSwatch ?: p.mutedSwatch ?: p.dominantSwatch
         } ?: return GlassPalettes.Purple
-        val rgb = swatch.rgb
-        val hsv = FloatArray(3)
-        android.graphics.Color.RGBToHSV(
-            android.graphics.Color.red(rgb), android.graphics.Color.green(rgb), android.graphics.Color.blue(rgb), hsv,
-        )
-        fun color(sMul: Float, vMul: Float): androidx.compose.ui.graphics.Color {
-            val s = (hsv[1] * sMul).coerceIn(0f, 1f)
-            val v = (hsv[2] * vMul).coerceIn(0f, 1f)
-            return androidx.compose.ui.graphics.Color(android.graphics.Color.HSVToColor(floatArrayOf(hsv[0], s, v)))
-        }
-        return AuroraPalette(
-            seed = color(1f, 1f),
-            seed2 = color(0.7f, 1.25f),
-            seed3 = color(0.45f, 1.5f),
-            deep = color(0.85f, 0.38f),
-            deep2 = color(0.8f, 0.13f),
-        )
+        // 无封面/取色失败时回落品牌靛紫（与 fromSeed 无关，是「没有 seed」的兜底语义）
+        return AuroraPalette.fromSeed(Color(swatch.rgb))
     }
 
     /** 无封面歌曲的占位风格：按序循环 6 种演示封面 */

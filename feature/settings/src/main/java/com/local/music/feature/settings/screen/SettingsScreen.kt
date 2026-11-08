@@ -62,6 +62,7 @@ import com.local.music.core.ui.theme.GlassIntensity
 import com.local.music.core.ui.theme.MotionIntensity
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 import kotlinx.coroutines.delay
 
 /**
@@ -238,14 +239,14 @@ fun SettingsScreen(
                                 AuroraMiniPreview(
                                     palette = previewSeed?.let { AuroraPalette.fromSeed(it) } ?: state.palette,
                                 )
-                                Spacer(Modifier.height(16.dp))
+                                Spacer(Modifier.height(S.Gap16.dp))
                                 // A1 字号 token：本节小标题与全 App 分组标题同档（12sp + 0.3 字距）——
                                 // 层级靠**字距**表达而不是靠一个游离的 12sp 裸值；颜色仍是 tertiary 保持弱层级
                                 Text(
                                     "预设色板",
                                     style = GlassText.SectionLabel,
                                     color = LocalGlassColors.current.textTertiary,
-                                    modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
+                                    modifier = Modifier.padding(start = 4.dp, bottom = S.Gap8.dp),
                                 )
                                 ThemeColorSwatches(
                                     seeds = AuroraPalette.PresetSeeds,
@@ -254,7 +255,7 @@ fun SettingsScreen(
                                     selected = state.effectiveSeed,
                                     onSelect = { state.setCustomSeed(it.toArgb()) },
                                 )
-                                Spacer(Modifier.height(12.dp))
+                                Spacer(Modifier.height(S.Gap12.dp))
                                 // 恢复默认：清掉自定义 → 回到「跟随封面 / 品牌」二态
                                 if (state.customSeedArgb != null) {
                                     SheetAction(
@@ -740,7 +741,7 @@ fun SettingsScreen(
                                             current.changelog,
                                             color = LocalGlassColors.current.textSecondary,
                                             style = GlassText.Body,
-                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = S.Gap8.dp),
                                         )
                                     }
                                     Spacer(Modifier.height(6.dp))
@@ -754,7 +755,7 @@ fun SettingsScreen(
                                             },
                                             color = LocalGlassColors.current.textTertiary,
                                             style = GlassText.Micro,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = S.Gap8.dp),
                                         )
                                     } else {
                                         SheetAction(
@@ -801,7 +802,7 @@ fun SettingsScreen(
 @Composable
 private fun SettingsCard(content: @Composable () -> Unit) {
     GlassSurface(
-        modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
+        modifier = Modifier.fillMaxWidth().padding(start = S.Gap20.dp, end = S.Gap20.dp, bottom = S.Gap16.dp),
         level = GlassLevel.Md,
         shape = RoundedCornerShape(R.Card18.dp),
     ) {

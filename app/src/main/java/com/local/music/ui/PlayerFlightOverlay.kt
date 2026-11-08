@@ -62,14 +62,32 @@ import kotlin.math.roundToInt
 /**
  * 共享元素飞行覆盖层：6 个替身（玻璃面板 / 封面 / 歌名 / 作者 / 播放钮 / 下一首）。
  * - 几何读 [PlayerFlight.snapshot]（两端 rect 边缘线性插值 = 中心直线平移 + 尺寸线性增长）
- * - R角 / 字号 / 图标尺寸 / 玻璃填充与模糊半径 / 圆钮底透明度 全部同一 t 同帧插值
+ * - R角 / 字号 / **行高** / 图标尺寸 / 玻璃填充与模糊半径 / 圆钮底透明度 全部同一 t 同帧插值
  * - 歌词模式收起时封面不飞（原地淡出），其余照常
  * - 纯绘制层：无 pointerInput，不挡触摸；结尾 12% 与真身交叉淡入消除像素差
  * - P2-12/P3-15：t 不进本层组合期——几何/样式 lerp 全部下沉到布局期（offset/layout
  *   lambda）与绘制期（graphicsLayer/drawBehind lambda）读取，飞行 500ms 内整层零重组；
  *   等待期（enteringWait）强制 t=0，样式不被上一轮中止残留的半程 t 污染（半形态渲染）。
- *   仅有的两个组合期读取点受 API 限制（haze 样式对象、Text 字号参数），各自收窄进
+ *   仅有的两个组合期读取点受 API 限制（haze 样式对象、Text 字号/行高参数），各自收窄进
  *   最小重组域 [FlightGlassPanel] / [FlightLabel]，不再牵动整层。
+ *
+ * ## C2（歌名出卡 + 封面放大）之后，本文件需要什么、不需要什么
+ *
+ * **不需要改**：所有替身的几何**端点本身**。它们全部来自 `trackFlight` 在渲染后实测的
+ * root rect 快照（[PlayerFlight.snapshot]），真身挪到哪里，端点就到哪里。歌名从玻璃卡内
+ * 搬到卡外、控制台变矮、封面变大——这些都是「真身 rect 变了」，替身自动跟随，不需要在
+ * 本文件里重算任何坐标。这正是不该在 UI 里硬编码端点数值的理由。
+ *
+ * **必须改**（本轮已改，逐条见各调用点注释）：
+ * 1. 歌名替身的 `sizeTo` 16→20、新增 `lineFrom/lineTo`（21→26）、字重 SemiBold→Bold
+ *    —— 真身换了排版档（Heading → Title），字号/行高/字重都不再一致；
+ * 2. 副标题两端补 `lineFrom/lineTo`（14→16，两端都是 Caption，等值是**精确端点**）；
+ * 3. 与之无关但一并核过：`PlayerGlass` 的 rect 变小后，[FlightGlassPanel] 的 R28 圆角与
+ *    描边画法仍然成立（它按 size 自适应画，无硬编码宽高）。
+ *
+ * **必须在 PlayerScreen 侧同步**（不在本文件，列出以免漏）：歌名组出卡后不再是玻璃卡的
+ * 子节点，透明度必须自己挂 `playerSharedAlpha × sheetAlpha`——否则退出飞行时替身已经
+ * 淡出、真身歌名还亮着，收尾明显错拍。
  */
 @Composable
 fun PlayerFlightOverlay(
@@ -280,8 +298,22 @@ fun PlayerFlightOverlay(
                 color = glass.textPrimary,
                 // sizeFrom 必须对齐迷你条真身（Chrome.kt 15sp）：旧 13.5sp 让替身文字在
                 // 点按瞬间缩小、基线上浮，落地交叉淡化时又跳回去
-                sizeFrom = 15f, sizeTo = 16f,
-                fontWeight = FontWeight.SemiBold,
+                sizeFrom = 15f, sizeTo = 20f,
+                // **sizeTo 从 16 改成 20（C2 歌名出卡）**：播放页歌名已从 GlassText.Heading
+                // （16 SemiBold 22）升到 GlassText.Title（20 Bold 26）——出卡之后它是页面主角，
+                // 必须与二级页页名同档（理由见 PlayerScreen 的 titleBlock KDoc）。
+                // 这个数**漏改的后果是隐性的**：飞行途中一切正常，只有落地那 12% 交叉窗里
+                // 替身字比真身瘦一圈，两个同名文本叠着淡入淡出，看起来像「文字抖了一下」。
+                // 行高同样要跟进：只改字号不改行高会让替身的行盒比真身矮 4dp，
+                // 落地时整行基线上跳（Text 的 maxLines=1 下，行高决定盒子高度与文字垂直位置）。
+                lineFrom = 21f, lineTo = 26f,
+                fontWeight = FontWeight.Bold,
+                // **字重从 SemiBold 改成 Bold**，原因同上：GlassText.Title 是 Bold。
+                // 字重无法 lerp（FontWeight 是离散枚举，跨档插值会跳变），所以取**终点值**
+                // 并对 MiniTitle 端接受一点差异：迷你条的歌名是 RowStrong（15 SemiBold），
+                // 替身以 Bold 起步会比真身粗约一档——但这段差异只存在于起飞的 500ms 内、
+                // 且替身此刻正在放大与位移（用户注意力在运动上），落地端才是需要逐像素一致
+                // 的那一端（交叉淡化就发生在那里）。取起点值则相反：落地会「变细」。
                 rect = titleRect,
                 tAt = tAt,
             )
@@ -290,6 +322,7 @@ fun PlayerFlightOverlay(
                 text = song.artist,
                 color = glass.textSecondary,
                 sizeFrom = 11f, sizeTo = 12f,
+                lineFrom = 14f, lineTo = 16f,
                 fontWeight = null,
                 rect = artistRect,
                 tAt = tAt,
@@ -298,7 +331,10 @@ fun PlayerFlightOverlay(
             FlightLabel(
                 text = song.subtitle,
                 color = glass.textSecondary,
+                // 副标题两端都是 GlassText.Caption（12/16），迷你条艺术家端是同一 token，
+                // 所以 sizeFrom 与 lineFrom 在这里**不是插值用的近似值**，而是精确端点。
                 sizeFrom = 11f, sizeTo = 12f,
+                lineFrom = 14f, lineTo = 16f,
                 fontWeight = null,
                 rect = artistRect,
                 tAt = tAt,
@@ -454,6 +490,18 @@ private val FlightPanelShape = RoundedCornerShape(R.Player28.dp)
  * 与真身的逐像素一致），因此 t 在此节点组合期读取。读取被隔离在这一个最小重组域：
  * 飞行期每帧只有这两个小 Text 重组，几何（offset/size）仍在布局期读取，不牵动整层。
  * [alphaProvider] 供双文本内容交叉淡化用（歌者行 artist→subtitle），绘制期读，零重组。
+ *
+ * ## 为什么行高也要插值（[lineFrom] / [lineTo]）
+ *
+ * 旧实现只 lerp 字号、行高留空（走 Text 默认行高）。在那套端点下没暴露问题，因为两端
+ * 字号（15↔16、11↔12）只差 1sp，默认行高的差异不到 1dp。C2 之后歌名终点是 26sp 行高
+ * （GlassText.Title），起点是 21sp（RowStrong）——**差 5dp**。行高在 maxLines=1 时决定
+ * 行盒高度，而行盒高度决定文字在盒内的垂直位置：不插值的话，替身的文字基线在整段飞行里
+ * 停在「按字号算的默认行高」上，落地交叉窗里与真身那一行**错开约 2–3dp** 且逐帧收敛，
+ * 表现为「两行字在互相咬合」——这是最难归因的一类错位（静止看不错，动起来晃）。
+ *
+ * 端点值口径：`lineFrom/lineTo` 传的是**行高 sp 数**，与真身 TextStyle 逐项对应
+ * （迷你条 RowStrong 21 / 播放页 Title 26；两端的副标题都是 Caption 16）。
  */
 @Composable
 private fun FlightLabel(
@@ -461,15 +509,22 @@ private fun FlightLabel(
     color: Color,
     sizeFrom: Float,
     sizeTo: Float,
+    lineFrom: Float,
+    lineTo: Float,
     fontWeight: FontWeight?,
     rect: (Float) -> Rect,
     tAt: () -> Float,
     alphaProvider: (() -> Float)? = null,
 ) {
+    // t 只读一次：字号与行高必须来自**同一帧的同一个 t**，分两次读 tAt() 在
+    // 动画驱动下虽然同帧同值（Animatable.value 不会在一次读取间变化），但一旦日后
+    // 改成 spring/手动驱动就会出现「字号按 t₁、行高按 t₂」的半帧不一致——顺手钉死。
+    val t = tAt()
     Text(
         text,
         color = color,
-        fontSize = lerp(sizeFrom, sizeTo, tAt()).sp,
+        fontSize = lerp(sizeFrom, sizeTo, t).sp,
+        lineHeight = lerp(lineFrom, lineTo, t).sp,
         fontWeight = fontWeight,
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,

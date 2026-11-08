@@ -54,6 +54,7 @@ import com.local.music.core.ui.state.LibraryGroup
 import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.auroraAccentColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
@@ -100,9 +101,9 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
             // 滚出视口即被销毁 → 焦点丢失、键盘收起；滚回来 LaunchedEffect(autoFocus) 重跑
             // 又会自己弹键盘。常驻组合后两个问题一起消失，Field.kt 无需改动）
             Row(
-                Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 14.dp),
+                Modifier.fillMaxWidth().padding(start = S.Gap20.dp, end = S.Gap20.dp, top = 2.dp, bottom = S.Gap16.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp), // 与 GlassTabs 筛选行同族同距（原 10）
+                horizontalArrangement = Arrangement.spacedBy(S.Gap8.dp), // 与 GlassTabs 筛选行同族同距（原 10）
             ) {
                 GlassTextField(
                     value = query,
@@ -149,7 +150,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                                 // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
                                 color = LocalGlassColors.current.textTertiary, style = GlassText.Body,
                                 textAlign = TextAlign.Center,
-                                modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
+                                modifier = Modifier.fillMaxWidth().padding(top = S.Gap24.dp),
                             )
                         }
                     } else {
@@ -159,8 +160,8 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         // 点击 chip 写回历史（addSearchHistory 会去重并移到最前）
                         item(key = "history-chips") {
                             FlowRow(
-                                Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                Modifier.fillMaxWidth().padding(start = S.Gap20.dp, end = S.Gap20.dp, bottom = S.Gap16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(S.Gap8.dp),
                             ) {
                                 state.searchHistory.forEach { keyword -> GlassChip(keyword) {
                                     state.addSearchHistory(keyword)
@@ -178,6 +179,10 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                                 // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
                                 color = LocalGlassColors.current.textTertiary, style = GlassText.Body,
                                 textAlign = TextAlign.Center,
+                                // 空态顶部偏移 56dp **刻意不入 S 刻度**：它不是「段落之间的间距」，
+                                // 而是把那一行字推到视口视觉中心附近的一次性几何量。刻度最高档 32，
+                                // 就近取 32 会让空态贴在筛选行下方、读作「列表第一行」而不是「没有结果」；
+                                // 取 64 又会被软键盘/横屏压到看不见。这类定位量按几何推导保留裸值。
                                 modifier = Modifier.fillMaxWidth().padding(top = 56.dp),
                             )
                         }
@@ -240,7 +245,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                                     // 与「取消」同档：两者都是可点的强调文字，视觉应当等重
                                     color = auroraAccentColor(), style = GlassText.BodyMedium,
                                     modifier = Modifier
-                                        .padding(start = 20.dp, end = 20.dp, bottom = 14.dp)
+                                        .padding(start = S.Gap20.dp, end = S.Gap20.dp, bottom = S.Gap16.dp)
                                         .pressScale(expandInteraction, pressed = 0.92f)
                                         .clickable(
                                             interactionSource = expandInteraction, indication = null,
@@ -255,7 +260,7 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         }
                     }
                 }
-                item(key = "search-bottom-inset") { Spacer(Modifier.height(16.dp)) } // 原 18，归 16 刻度
+                item(key = "search-bottom-inset") { Spacer(Modifier.height(S.Gap16.dp)) } // 原 18，归 16 刻度
             }
             // 单曲面板打开时 Chrome 让位（与 PlayerScreen 控制台同策略）：
             // graphicsLayer alpha 只隐不卸——keepOnDispose 的迷你条飞行几何保持冻结；
@@ -308,8 +313,8 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
 @Composable
 private fun AlbumRow(pair: List<LibraryGroup>, state: AppState) {
     Row(
-        Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        Modifier.fillMaxWidth().padding(start = S.Gap20.dp, end = S.Gap20.dp, bottom = S.Gap12.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
     ) {
         pair.forEach { album ->
             PlaylistCard(
@@ -354,7 +359,7 @@ private fun GlassChip(text: String, onClick: () -> Unit) {
             // A1：12sp 裸字号 → GlassText.Caption（12 Normal 16）。芯片与列表副标题同字号，
             // 但视觉上更小：它靠胶囊形与低对比度退到背景，不靠字号
             style = GlassText.Caption,
-            modifier = Modifier.padding(horizontal = 13.dp, vertical = 7.dp),
+            modifier = Modifier.padding(horizontal = S.Gap12.dp, vertical = S.Gap8.dp),
         )
     }
 }

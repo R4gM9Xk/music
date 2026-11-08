@@ -56,6 +56,7 @@ import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 
@@ -339,17 +340,23 @@ fun MiniPlayerBar(
         // 但「有模糊 ≠ 不可辨」：经 blur + 白 tint 后透字仍有 4.3:1 局部对比
         // （自身歌名 8.7:1，即透字达到自身文字的 50%），深色模式下浅色幽灵字压在
         // 深玻璃上尤其刺眼。
-        // 唯一杠杆是 scrim（主题同向：深色压黑、浅色提白），它独立于 blur 也能压死透字
-        // —— 这里**刻意不再加重 blur**：scrim alpha 已达 0.80，模糊结果对最终像素的
-        // 可见贡献只剩 20%，再加大半径肉眼不可辨，只是白烧 GPU（RenderEffect 半径翻倍
-        // 采样开销显著上升）。详见 GlassColors.chromeScrim 的推导。
+        //
+        // **为什么这里不加大 blur 半径，而是靠 scrim**（2026-11-08 定量结案）：
+        // 用户问过「能否改用加高斯模糊解决」。算过了，不可行，三个独立原因：
+        //   1. 高斯模糊保均值 —— 它只能抹掉笔画形状（高频），抹不掉「整行文字把这块
+        //      玻璃整体提亮」的低频项。半径推到无穷大的下界是 1.20:1（现在 1.40:1）；
+        //   2. 残幅 ∝ 1/r（线性增益）：26→48dp 只换来 1.40→1.18，而 scrim +0.06
+        //      （GPU 零增量）同样能到 1.25；
+        //   3. 退化路径下 blur 收益恒为 0（软件渲染/无 RenderEffect 时 haze 静默
+        //      退化为纯 tint），而降低 scrim 的代价会**全额兑现**。
+        // 完整算式见 GlassColors.chromeScrim 的 KDoc 与 GlassSurface 的 KDoc。
         scrim = glass.chromeScrim,
         onClick = onClick,
     ) {
         Row(
-            Modifier.fillMaxSize().padding(horizontal = 12.dp),
+            Modifier.fillMaxSize().padding(horizontal = S.Gap12.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
         ) {
             ArtThumb(
                 song.art,
@@ -415,7 +422,7 @@ fun MiniPlayerBar(
         Box(
             Modifier
                 .align(Alignment.BottomStart)
-                .padding(horizontal = 12.dp)
+                .padding(horizontal = S.Gap12.dp)
                 .fillMaxWidth()
                 .height(2.5.dp)
                 .clip(RoundedCornerShape(2.dp))
@@ -497,6 +504,14 @@ fun GlassNavBar(
         // 局部对比 11.4:1，达到自身标签 11.8:1 的 96% —— 几乎完全穿透。
         // 与迷你条同一档 scrim；blur 作用于条**背后**的背景采样，不会糊掉自身图标与标签
         // （它们画在 haze 结果之上）。
+        //
+        // 导航栏是「加大 blur 换 scrim」这条路线里**先被封死**的一档，两个原因：
+        //   1. 它只有 58dp 高，而 haze 会把背景图层按半径外扩采样（Rect.inflate）。
+        //      半径超过条高量级后，采样窗越过上下边界，把更远处的列表内容卷进来 ——
+        //      透字没压掉，反而混入本不属于条内的内容；
+        //   2. 低频下界更高（11.4:1 起点）：scrim=0.80 时即使 r→∞ 也只能到 1.33:1。
+        // 若真要把 scrim 降到 0.74，导航栏需 r≈455dp（现值的 22.8 倍）才守住 1.5:1 ——
+        // 在这个半径下它早已不是「一条导航栏」，而是整屏模糊。详见 chromeScrim 的 KDoc。
         scrim = glass.chromeScrim,
     ) {
         Row(Modifier.fillMaxSize()) {
@@ -590,7 +605,9 @@ fun GlassChrome(
         modifier
             .fillMaxWidth()
             .navigationBarsPadding() // 手势条悬浮于 chrome 之下（对应设计稿 homebar）
-            .padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
+            // 底距 10dp → S.Gap12（归位口径「10 就近取让留白不缩小的一档」）。
+            // 这是 chrome 与手势条之间的呼吸缝，略松比略挤安全：收紧会让胶囊压到手势区。
+            .padding(start = S.Gap12.dp, end = S.Gap12.dp, bottom = S.Gap12.dp),
     ) {
         MiniPlayerBar(song, playing, progressProvider, onOpenPlayer, onPlayPause, onNext, hasSongs = hasSongs)
         Spacer(Modifier.height(NavBarBottomInsetSpacer))
@@ -612,12 +629,16 @@ object NavLabel {
 }
 
 /**
- * 主屏列表底部避让高度：悬浮 Chrome（迷你条 62 + 间距 8 + 导航 58 + 底距 10 ≈ 138dp）+ 余量。
+ * 主屏列表底部避让高度：悬浮 Chrome（迷你条 62 + 间距 8 + 导航 58 + 底距 12 = 140dp）+ 余量 6dp。
  *
  * 单点定义的原因：曲库/歌单/设置三个主屏原本各自硬编码 `Spacer(height = 146.dp)`，
  * Chrome 高度一改就要同步改三处，漏一处就是最后一行被迷你条盖住（且很难在评审里发现）。
+ *
+ * 注：底距由 10dp 归位到 [S.Gap12] 后，实际占用从 138 涨到 140dp；146 仍有 6dp 余量，
+ * **不需要跟着改**。但若将来继续加大 chrome 组件高度，这里必须同步——
+ * 6dp 已经不宽裕，再加就会真的盖住最后一行。
  */
 val ChromeBottomInset: androidx.compose.ui.unit.Dp = 146.dp
 
 /** 迷你条与导航胶囊之间的间距（[ChromeBottomInset] 的构成之一，避免两处魔数漂移） */
-private val NavBarBottomInsetSpacer = 8.dp
+private val NavBarBottomInsetSpacer = S.Gap8.dp

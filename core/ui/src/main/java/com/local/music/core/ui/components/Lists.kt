@@ -59,6 +59,7 @@ import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.auroraAccentColor
 
 /**
@@ -205,7 +206,7 @@ fun PageHeader(
     action2Label: String? = null,
 ) {
     Row(
-        modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 12.dp),
+        modifier.fillMaxWidth().padding(start = S.Gap20.dp, end = S.Gap20.dp, top = 4.dp, bottom = S.Gap12.dp),
         verticalAlignment = Alignment.Bottom,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
@@ -213,7 +214,7 @@ fun PageHeader(
         // 同时**删掉**原来的 letterSpacing = (-0.6).sp（B5）：负字距是拉丁排版的压排手段，
         // CJK 字形等宽且笔画已顶到字身框，压字距只会让笔画互相挤，30sp 大标题上尤其明显。
         Text(title, color = LocalGlassColors.current.textPrimary, style = GlassText.Display)
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp)) {
             if (action2Icon != null && onAction2 != null) {
                 GlassIconButton(
                     onClick = onAction2,
@@ -260,9 +261,9 @@ fun GlassSearchBox(
         onClick = onClick,
     ) {
         Row(
-            Modifier.fillMaxSize().padding(horizontal = 16.dp),
+            Modifier.fillMaxSize().padding(horizontal = S.Gap16.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(S.Gap8.dp),
         ) {
             // 装饰性图标，**有意 null、非遗漏**：整条胶囊作为 GlassSurface 的可点区域，
             // 语义由同一行里的 text（占位符「搜索歌曲、专辑、艺术家」或已输入词）承担。
@@ -293,8 +294,8 @@ fun GlassTabs(
         modifier
             .fillMaxWidth()
             .horizontalScroll(rememberScrollState())
-            .padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+            .padding(start = S.Gap20.dp, end = S.Gap20.dp, bottom = S.Gap16.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap8.dp),
     ) {
         tabs.forEachIndexed { index, label ->
             val on = index == selected
@@ -327,7 +328,7 @@ fun GlassTabs(
                         this.role = Role.Tab
                         this.selected = on
                     }
-                    .padding(horizontal = 15.dp, vertical = 7.dp),
+                    .padding(horizontal = S.Gap16.dp, vertical = S.Gap8.dp),
             ) {
                 // A1：13sp 档 token 化。选中态用 BodyMedium（13 Medium）、未选中用 Body（13 Normal）——
                 // 与改造前「fontSize 13 + 字重条件」的观感完全一致，只是把「选中加粗」这个层级
@@ -406,9 +407,9 @@ fun SongRow(
                 this.role = Role.Button
                 if (selected) this.selected = true
             }
-            .padding(horizontal = 14.dp, vertical = 9.dp),
+            .padding(horizontal = S.Gap12.dp, vertical = S.Gap8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
     ) {
         ArtThumb(
             song.art, Modifier.size(48.dp),
@@ -530,7 +531,7 @@ fun SectionHeader(text: String, modifier: Modifier = Modifier) {
     // 所以这个 +0.3 不是装饰而是语义，必须跟 token 一起走，不能留在这里裸写
     Text(
         text, style = GlassText.SectionLabel, color = LocalGlassColors.current.textTertiary,
-        modifier = modifier.padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 8.dp),
+        modifier = modifier.padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap16.dp, bottom = S.Gap8.dp),
     )
 }
 
@@ -587,7 +588,7 @@ fun PlaylistCard(
                 Modifier
                     .fillMaxWidth()
                     .background(glass.lo)
-                    .padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 12.dp),
+                    .padding(start = S.Gap12.dp, end = S.Gap12.dp, top = S.Gap12.dp, bottom = S.Gap12.dp),
             ) {
                 Text(title, color = LocalGlassColors.current.textPrimary, style = GlassText.BodyMedium,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -644,9 +645,9 @@ fun SettingRow(
                     Modifier
                 },
             )
-            .padding(horizontal = 16.dp, vertical = 13.dp),
+            .padding(horizontal = S.Gap16.dp, vertical = S.Gap12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
     ) {
         Box(
             Modifier

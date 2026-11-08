@@ -31,7 +31,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
@@ -44,15 +44,14 @@ import com.local.music.core.ui.components.CollectionActionsSheet
 import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.DetailTarget
-import com.local.music.core.ui.components.GlassLevel
+import com.local.music.core.ui.components.EmptyPlaylistCard
+import com.local.music.core.ui.components.GlassEmptyState
 import com.local.music.core.ui.components.GlassSearchBox
-import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassTabs
 import com.local.music.core.ui.components.LocalModalState
 import com.local.music.core.ui.components.ModalSheet
 import com.local.music.core.ui.components.PageHeader
 import com.local.music.core.ui.components.PlaylistCard
-import com.local.music.core.ui.components.SettingRow
 import com.local.music.core.ui.components.SongActionsSheet
 import com.local.music.core.ui.components.SheetAction
 import com.local.music.core.ui.components.SongRow
@@ -64,6 +63,7 @@ import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 
 /**
  * 首页曲库：大标题 + 玻璃搜索 + tab 胶囊；6 个 tab 均接真实内容——
@@ -177,7 +177,11 @@ fun LibraryScreen(
                 GlassSearchBox(
                     text = "搜索歌曲、专辑、艺术家", placeholder = true,
                     onClick = { state.screen = GlassScreen.Search },
-                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 12.dp),
+                    modifier = Modifier.padding(
+                        // S 间距 token 接线：20 = PageMargin、12 = Gap12。
+                        // top = 2 属 0–6dp 微缝（搜索框与页头之间的光学缝），按规范保持裸值
+                        start = S.PageMargin.dp, end = S.PageMargin.dp, top = 2.dp, bottom = S.Gap12.dp,
+                    ),
                 )
             }
             item {
@@ -191,7 +195,16 @@ fun LibraryScreen(
                 // 空曲库单独给一条空态（权限被拒时是应用内唯一的「去授权」入口）
                 0 -> if (songs.isEmpty()) {
                     item(key = "library-empty") {
-                        LibraryEmptyState(audioDenied, onRequestAudioPermission)
+                        // 「去设置页扫描」：直接切到设置屏（等价于点底部导航的「设置」）。
+                        // 本轮写域不含 GlassApp（导航宿主），所以用 state.screen 这个既有
+                        // 单点入口，而不是往 LibraryScreen 加一个新回调参数——那要么改
+                        // GlassApp 的调用点，要么留一个没人传的空默认值（假入口）。
+                        // 扫描入口确实只在设置页（「扫描音乐」行），没有更近的目的地
+                        LibraryEmptyState(
+                            audioDenied = audioDenied,
+                            onRequestAudioPermission = onRequestAudioPermission,
+                            onOpenSettings = { state.screen = GlassScreen.Settings },
+                        )
                     }
                 } else {
                     items(songs, key = { it.id }) { song ->
@@ -209,7 +222,10 @@ fun LibraryScreen(
                 1 -> {
                     val groups = state.albumGroups()
                     if (groups.isEmpty()) {
-                        item(key = "tab-empty-1") { TabEmptyState("还没有专辑") }
+                        item(key = "tab-empty-1") {
+                            // 图标复用既有 Disc（唱片）：专辑就是唱片，不需要新画一枚
+                            TabEmptyState(GlassIcons.Disc, "还没有专辑", "扫描到的本地音乐会自动按专辑归类")
+                        }
                     } else {
                         groups.chunked(2).forEach { pair ->
                             // LazyColumn 的 item key 必须唯一，而**专辑名**不唯一：两张同名
@@ -218,8 +234,13 @@ fun LibraryScreen(
                             // 所以 item key 用分组唯一标识 id，而不是展示名 key。
                             item(key = "album:${pair.first().id}") {
                                 Row(
-                                    Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    // S 间距 token：20 = PageMargin（页边距）、12 = Gap12（卡片行距）。
+                                    // 两列卡片的水平缝与下方卡片行距同取 12——它们表达的是同一件事
+                                    //「相邻卡片之间的呼吸」，不该是两个独立的数
+                                    Modifier.fillMaxWidth().padding(
+                                        start = S.PageMargin.dp, end = S.PageMargin.dp, bottom = S.Gap12.dp,
+                                    ),
+                                    horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
                                 ) {
                                     pair.forEach { album ->
                                         PlaylistCard(
@@ -253,7 +274,10 @@ fun LibraryScreen(
                 2 -> {
                     val groups = state.artistGroups()
                     if (groups.isEmpty()) {
-                        item(key = "tab-empty-2") { TabEmptyState("还没有艺术家") }
+                        item(key = "tab-empty-2") {
+                            // 图标复用既有 User（人形）：艺术家 = 人，同样不需要新画
+                            TabEmptyState(GlassIcons.User, "还没有艺术家", "本地音乐扫描后会按艺术家自动归类")
+                        }
                     } else {
                         groups.forEach { group ->
                             item(key = "artist:${group.key}") {
@@ -278,7 +302,10 @@ fun LibraryScreen(
                 3 -> {
                     val groups = state.folderGroups(state.excludedFolders)
                     if (groups.isEmpty()) {
-                        item(key = "tab-empty-3") { TabEmptyState("还没有文件夹") }
+                        item(key = "tab-empty-3") {
+                            // 图标复用既有 Folder：这一档语义最直白
+                            TabEmptyState(GlassIcons.Folder, "还没有文件夹", "扫描到的音乐所在目录会显示在这里")
+                        }
                     } else {
                         groups.forEach { group ->
                             item(key = "folder:${group.key}") {
@@ -303,7 +330,11 @@ fun LibraryScreen(
                 4 -> {
                     val groups = state.genreGroups()
                     if (groups.isEmpty()) {
-                        item(key = "tab-empty-4") { TabEmptyState("还没有流派") }
+                        item(key = "tab-empty-4") {
+                            // 图标：新画的 Tag（标签）。流派没有既有图标可用，而「随便挑一枚
+                            // 近似的」会让空态图标退化成装饰纹样——五个 tab 必须逐档可辨
+                            TabEmptyState(GlassIcons.Tag, "还没有流派", "曲目文件里的流派标签会汇总到这里")
+                        }
                     } else {
                         groups.forEach { group ->
                             item(key = "genre:${group.key}") {
@@ -330,15 +361,44 @@ fun LibraryScreen(
                     val wallPlaylists = (state.visibleBuiltInPlaylists() + state.userPlaylists)
                         .map { state.resolvePlaylist(it.id) ?: it } // 计数实时化 + 失效 id 过滤
                     if (wallPlaylists.isEmpty()) {
-                        item(key = "tab-empty-5") { TabEmptyState("还没有歌单") }
+                        item(key = "tab-empty-5") {
+                            // 图标：新画的 NoteList（双音符 + 符杠）。刻意不用「清单」构图——
+                            // 那与既有 Queue（播放队列）撞形，会让两个不同概念在图标层混淆
+                            TabEmptyState(GlassIcons.NoteList, "还没有歌单", "点右上角 ＋ 可以新建歌单")
+                        }
                     } else {
                         wallPlaylists.chunked(2).forEach { pair ->
                             item(key = "playlist:${pair.first().id}") {
                                 Row(
-                                    Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    // S 间距 token：20 = PageMargin（页边距）、12 = Gap12（卡片行距）。
+                                    // 两列卡片的水平缝与下方卡片行距同取 12——它们表达的是同一件事
+                                    //「相邻卡片之间的呼吸」，不该是两个独立的数
+                                    Modifier.fillMaxWidth().padding(
+                                        start = S.PageMargin.dp, end = S.PageMargin.dp, bottom = S.Gap12.dp,
+                                    ),
+                                    horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
                                 ) {
                                     pair.forEach { playlist ->
+                                        // §11.1 ⑤：0 首歌的歌单卡走空态特化（封面中央一枚
+                                        // 小图标 + 「去添加歌曲」）。1:1 封面改版后一张空卡
+                                        // 有一半面积是纯占位纹样，读起来像「封面没加载出来」
+                                        // 而不是「这个歌单还没加歌」。
+                                        // 点击行为不变（仍进详情页），不新增交互路径。
+                                        if (playlist.tracks.isEmpty()) {
+                                            EmptyPlaylistCard(
+                                                title = playlist.title, meta = playlist.meta, art = playlist.art,
+                                                onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, playlist.id)) },
+                                                onLongClick = {
+                                                    collectionActions(
+                                                        DetailTarget(DetailTarget.Kind.Playlist, playlist.id),
+                                                        playlist.title,
+                                                        playlist.tracks,
+                                                    )
+                                                },
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            return@forEach
+                                        }
                                         PlaylistCard(
                                             title = playlist.title, meta = playlist.meta, art = playlist.art,
                                             onClick = { state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, playlist.id)) },
@@ -396,6 +456,7 @@ private fun GroupRow(
     Row(
         modifier
             .fillMaxWidth()
+            // 6dp：整行外边距，属 0–6dp 微缝豁免（它让按压底色落在卡片圆角内），保持裸值
             .padding(horizontal = 6.dp)
             // C4：14dp 即 R 刻度里的 Card14（列表行容器），不再裸写数值
             .clip(RoundedCornerShape(R.Card14.dp))
@@ -413,9 +474,14 @@ private fun GroupRow(
             // 不写 contentDescription：title/meta 是可见文字，clickable 自带
             // mergeDescendants 会按子树顺序拼出描述，写死反而形成双源漂移。
             .semantics { this.role = Role.Button }
-            .padding(horizontal = 14.dp, vertical = 9.dp),
+            // S 接线：横向 = PageMargin − 行外边距 6dp，**这是几何推导量而非自由间距** ——
+            // 6 + 14 = 20 正是全 App 的页边距，行文字因此与页头大标题、搜索框左缘落在同一条线上。
+            // 直接归位到 Gap12 会把这行文字推到 18dp，与同屏 SongRow（Lists.kt，同样是 6+14）
+            // 差 2dp：同一个 LazyColumn 里两种左缘，比不归位更难解释。
+            // 纵向 9 → 8：标准归位（就近向下），行高仍由 48dp 缩略图撑开，观感不变
+            .padding(horizontal = (S.PageMargin - 6).dp, vertical = S.Gap8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
     ) {
         ArtThumb(
             art, Modifier.size(48.dp), RoundedCornerShape(R.Thumb10.dp),
@@ -439,54 +505,73 @@ private fun GroupRow(
 }
 
 /**
- * 各 tab 通用空态（P3-38）：居中提示，样式对齐歌曲 tab 的中性空态。
+ * 各 tab 通用空态：图标 / 标题 / 副标题三件套。
+ *
+ * **为什么每个 tab 必须给各自不同的图标**（而不是五个 tab 共用一枚「空盒子」）：
+ * 空态图标是用户唯一的「我是哪个 tab、这里本该有什么」的线索。曲库六个 tab 都长着
+ * 同一张脸时，切 tab 的反馈就只剩标题文字一行——而那正是 E2 要消灭的「一句灰字」。
+ *
+ * **为什么这里没有 CTA**（三件套的第三件在五个 tab 上都是空的）：
+ * 这五个 tab 的空态都没有一个**能直达**的动作。新建歌单在歌单页、加歌在详情页、
+ * 扫描在设置页——硬塞一个「去设置页」等于每条空态都指向同一个地方，
+ * 用户点进去还要自己找对应入口。空态 CTA 的原则是「一枚、且它真的解决问题」，
+ * 做不到就宁可不给（见 [GlassEmptyState] 的 KDoc）。副标题已经把「怎么会有内容」
+ * 说清楚了，这是本档能给的最诚实的引导。
  */
 @Composable
-private fun TabEmptyState(text: String) {
-    Text(
-        text,
-        color = LocalGlassColors.current.textTertiary,
-        // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
-        style = GlassText.Body,
-        textAlign = TextAlign.Center,
-        modifier = Modifier.fillMaxWidth().padding(28.dp),
-    )
+private fun TabEmptyState(icon: ImageVector, title: String, subtitle: String) {
+    GlassEmptyState(icon = icon, title = title, subtitle = subtitle)
 }
 
 /**
- * 歌曲 tab 的空态。
+ * 歌曲 tab 的空态——两档，且必须在图标/标题/CTA 三处都不同。
  *
- * 为什么需要它：READ_MEDIA_AUDIO 被拒后 GlassApp 只做 abandonPendingPlayback + markLibrarySettled，
- * 曲库页就只是一个空列表——用户看不到任何「为什么空」和「怎么补救」，唯一的再授权入口在设置页，
- * 而这正是权限被拒后最容易流失的路径。所以在空态里直接给出可点的授权入口。
+ * **为什么需要它**：READ_MEDIA_AUDIO 被拒后 GlassApp 只做 abandonPendingPlayback +
+ * markLibrarySettled，曲库页就只是一个空列表。若此时显示成「曲库里还没有歌曲」，
+ * 用户会去找歌、去换目录、去怀疑软件坏了——而真正要做的是授权。**状态错报比没有状态更糟。**
  *
  * 授权成功后的重扫由 GlassApp 的权限回调负责，这里只负责发起请求，不做本地状态猜测。
+ *
+ * ## 两档的差异（E2 要求「三处都要不同」）
+ * | | 图标 | 标题 | CTA |
+ * |---|---|---|---|
+ * | 权限被拒 | Mic（麦克风=音频权限） | 未获得音乐与音频访问权限 | 去授权（seed 实底胶囊） |
+ * | 库里没歌 | MusicNote（音符=没有歌） | 曲库里还没有歌曲 | 去设置页扫描 |
+ *
+ * **为什么权限被拒档去掉了原来的 SettingRow 玻璃卡外壳**：那句话与动作是并排的两段
+ * 玻璃行文字，没有图标层级也没有唯一可点的形状——它是「没有空态组件时的替代品」。
+ * 三件套成立之后，同一个信息用标题 + 副标题 + 胶囊表达，层级更清楚。
+ * 标题文案逐字保留（「未获得音乐与音频访问权限」），副标题去掉「点击」二字
+ * ——旧文案里的「点击」是在教用户点**那一行**，而现在动作已经是一枚有明确形状的按钮，
+ * 再把「点击」写进副标题会与按钮自身的语义重复。
+ * 代价是它与设置页那枚权限行不再长得一样；这可以接受，因为两者此刻**职责不同**
+ * （设置页那行是「一个设置项」，这里是「一屏为什么空」）。
+ *
+ * **「去设置页扫描」这枚 CTA 是本轮新接的交互**（增-U7：空态引导死文案）：
+ * 旧实现是一句不可点的祈使句。它落在设置页「扫描音乐」行 —— 那是唯一的扫描入口。
  */
 @Composable
-private fun LibraryEmptyState(audioDenied: Boolean, onRequestAudioPermission: () -> Unit) {
+private fun LibraryEmptyState(
+    audioDenied: Boolean,
+    onRequestAudioPermission: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
     if (audioDenied) {
-        // 复用设置页同款 SettingRow：同一件事（音频权限）在两个入口的视觉与文案保持一致
-        GlassSurface(
-            modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 12.dp),
-            level = GlassLevel.Md,
-            shape = RoundedCornerShape(R.Card18.dp),
-        ) {
-            SettingRow(
-                GlassIcons.Mic,
-                "未获得音乐与音频访问权限",
-                "点击授权后即可扫描本地曲库",
-                onClick = onRequestAudioPermission,
-            )
-        }
+        GlassEmptyState(
+            icon = GlassIcons.Mic,
+            title = "未获得音乐与音频访问权限",
+            subtitle = "授权后即可扫描并播放本地音乐",
+            // 应用内唯一的授权入口，历史审计明确记录过不可移除
+            actionLabel = "去授权",
+            onAction = onRequestAudioPermission,
+        )
     } else {
-        // 中性空态：没权限问题、就是库里没歌（新装/全被过滤）。不新造交互，只提示去设置页扫描
-        Text(
-            "曲库里还没有歌曲 · 去设置页扫描音乐",
-            color = LocalGlassColors.current.textTertiary,
-            // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
-            style = GlassText.Body,
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 28.dp),
+        GlassEmptyState(
+            icon = GlassIcons.MusicNote,
+            title = "曲库里还没有歌曲",
+            subtitle = "可能还没有扫描，或扫描结果被过滤条件排除了",
+            actionLabel = "去设置页扫描",
+            onAction = onOpenSettings,
         )
     }
 }

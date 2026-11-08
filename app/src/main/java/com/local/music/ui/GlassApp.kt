@@ -105,6 +105,7 @@ import com.local.music.core.ui.theme.GlassTheme
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.MotionIntensity
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 import com.local.music.feature.library.screen.LibraryScreen
 import com.local.music.feature.player.screen.PlayerScreen
 import com.local.music.feature.playlist.screen.PlaylistDetailScreen
@@ -1286,7 +1287,7 @@ fun GlassApp() {
                         Modifier
                             .align(Alignment.TopCenter)
                             .statusBarsPadding()
-                            .padding(top = 8.dp)
+                            .padding(top = S.Gap8.dp)
                             .fillMaxWidth(),
                     ) {
                         // 文件 IO 结果提示（D2/D3：导出/导入/备份恢复）：4s 自动消退。
@@ -1398,7 +1399,7 @@ private fun TopBanner(
     GlassSurface(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp)
+            .padding(horizontal = S.Gap20.dp)
             .semantics {
                 this.role = Role.Button
                 // 动作名而不是内容替换：见函数 KDoc
@@ -1436,6 +1437,10 @@ private fun TopBanner(
             style = GlassText.Body,
             maxLines = maxLines,
             overflow = TextOverflow.Ellipsis,
+            // 胶囊内光学 padding，豁免 S 刻度（同「胶囊内 padding 不入刻度」的既有规则）：
+            // 横向 14 要给 Error 档左缘那条 3dp 色条留出视觉间距，纵向 10 是单行/多行
+            // 都能接受的居中量。两者都是**这块胶囊内部**的对齐参数，换成刻度值反而会
+            // 让 3dp 色条贴住文字、或让两行文案上下发挤。
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
         )
     }

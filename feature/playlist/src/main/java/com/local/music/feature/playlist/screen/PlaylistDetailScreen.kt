@@ -67,6 +67,7 @@ import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.onSeedColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
@@ -161,7 +162,7 @@ fun PlaylistDetailScreen(
                     // 保留下来的 14dp 下内距：改前它是 GlassSurface 自己的外距（卡片底边到下一元素
                     // 的呼吸），卡去掉后这段空白仍需要——否则最后一行会紧贴迷你条。上方的 6dp
                     // （卡片内距）则按 E1 一并去掉，让首行直接承接 Hero 的 16dp 下距。
-                    Column(Modifier.fillMaxWidth().padding(bottom = 14.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(bottom = S.Gap16.dp)) {
                         // 拖拽域 = 自建歌单的 addedTracks 序；列表随页面滚动（autoscroll 关闭：
                         // 页面滚动容器含头图等额外内容，视口估算不成立，长歌单 v1 可接受）
                         // dataVersion = 内容指纹（id 序列）：拖拽期间收藏/播放计数等任何写库
@@ -185,7 +186,7 @@ fun PlaylistDetailScreen(
                         }
                         if (data.tracks.isEmpty()) EmptyTracksHint()
                     }
-                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(S.Gap16.dp))
                 }
             } else {
                 // 不可重排分支：真懒加载。原先 repeat(data.tracks.size) 一次性组合全部行
@@ -230,7 +231,7 @@ fun PlaylistDetailScreen(
                         }
                     }
                     // 底部避让（原 18，归 16 刻度）
-                    item(key = "detail-bottom-inset") { Spacer(Modifier.height(16.dp)) }
+                    item(key = "detail-bottom-inset") { Spacer(Modifier.height(S.Gap16.dp)) }
                 }
             }
 
@@ -290,9 +291,9 @@ private fun DetailHeader(
 ) {
     val modal = LocalModalState.current
     Row(
-        Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 12.dp),
+        Modifier.fillMaxWidth().padding(start = S.Gap20.dp, end = S.Gap20.dp, top = 2.dp, bottom = S.Gap12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
     ) {
         // 读屏（无障碍 P0-4）：这是一个只画了 ← 箭头的玻璃圆钮，**没有任何可见文字**。
         // 旧实现完全没挂语义——TalkBack 停上去只念「按钮」，盲用户在详情页里找不到
@@ -394,9 +395,9 @@ private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
     // 这里在 DetailHero 函数体（组合期）取一次，两个消费点共用同一个色值。
     val onSeed = onSeedColor()
     Row(
-        Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 16.dp),
+        Modifier.fillMaxWidth().padding(start = S.Gap20.dp, end = S.Gap20.dp, top = 4.dp, bottom = S.Gap16.dp),
         verticalAlignment = Alignment.Bottom,
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap16.dp),
     ) {
         ArtThumb(
             data.art,
@@ -421,8 +422,8 @@ private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
             Spacer(Modifier.height(6.dp))
             // A1：meta 12sp → GlassText.Caption（12 Normal 16），与全 App 副标题同档
             Text(data.meta, color = LocalGlassColors.current.textSecondary, style = GlassText.Caption)
-            Spacer(Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Spacer(Modifier.height(S.Gap12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(S.Gap8.dp)) {
                 // 播放：seed 填充胶囊 + seed 色投影
                 val playInteraction = remember { MutableInteractionSource() }
                 Row(
@@ -441,7 +442,7 @@ private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
                         // contentDescription——可见文字「播放」本身就是最好的描述，
                         // 写死会与之双源漂移。子图标有意 null（文字已表达同一件事）。
                         .semantics { this.role = Role.Button }
-                        .padding(horizontal = 20.dp, vertical = 9.dp),
+                        .padding(horizontal = S.Gap20.dp, vertical = S.Gap8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
@@ -461,7 +462,7 @@ private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
                     modifier = Modifier.semantics { this.role = Role.Button },
                 ) {
                     Row(
-                        Modifier.padding(horizontal = 15.dp, vertical = 9.dp),
+                        Modifier.padding(horizontal = S.Gap16.dp, vertical = S.Gap8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
@@ -529,7 +530,7 @@ private fun EmptyTracksHint() {
         "这里还没有歌曲",
         // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
         color = LocalGlassColors.current.textTertiary, style = GlassText.Body,
-        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = S.Gap24.dp),
         textAlign = TextAlign.Center,
     )
 }

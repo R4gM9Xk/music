@@ -39,6 +39,8 @@ import com.local.music.core.ui.components.CollectionActionsSheet
 import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.DetailTarget
+import com.local.music.core.ui.components.EmptyPlaylistCard
+import com.local.music.core.ui.components.GlassEmptyState
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassTextField
@@ -55,6 +57,7 @@ import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.S
 
 /**
  * 歌单库：2×2 玻璃封面墙（常驻 + 用户自建，各自带参进详情，长按 = 集合操作面板）
@@ -126,7 +129,7 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                                 }
                             },
                         )
-                        Spacer(Modifier.height(8.dp))
+                        Spacer(Modifier.height(S.Gap8.dp))
                         SheetAction(
                             icon = GlassIcons.Plus,
                             label = "创建歌单",
@@ -156,10 +159,35 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                 .map { state.resolvePlaylist(it.id) ?: it } // 计数实时化 + 失效 id 过滤
             wallPlaylists.chunked(2).forEach { pair ->
                 Row(
-                    Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    // S：20 = PageMargin、12 = Gap12（与曲库页歌单 tab 的卡片栅格同一组值——
+                    // 同一个封面墙在两处出现，间距必须逐像素一致）
+                    Modifier.fillMaxWidth().padding(
+                        start = S.PageMargin.dp, end = S.PageMargin.dp, bottom = S.Gap12.dp,
+                    ),
+                    horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
                 ) {
                     pair.forEach { playlist ->
+                        // §11.1 ⑤：0 首歌的歌单卡走空态特化（封面中央一枚小图标 +
+                        // 「去添加歌曲」）。1:1 封面后一张空卡有一半面积是纯占位纹样，
+                        // 读起来像「封面没加载出来」而不是「这个歌单还没加歌」。
+                        // 点击行为不变（仍进详情页），不新增交互路径。
+                        if (playlist.tracks.isEmpty()) {
+                            EmptyPlaylistCard(
+                                title = playlist.title, meta = playlist.meta, art = playlist.art,
+                                onClick = {
+                                    state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, playlist.id))
+                                },
+                                onLongClick = {
+                                    collectionActions(
+                                        DetailTarget(DetailTarget.Kind.Playlist, playlist.id),
+                                        playlist.title,
+                                        playlist.tracks,
+                                    )
+                                },
+                                modifier = Modifier.weight(1f),
+                            )
+                            return@forEach
+                        }
                         PlaylistCard(
                             title = playlist.title, meta = playlist.meta, art = playlist.art,
                             onClick = {
@@ -182,9 +210,25 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                 }
             }
 
+            // 歌单墙整体为空（内建歌单被删光、且没有自建歌单）：此前这里什么都不画，
+            // 页面直接跳到「我喜欢的」，用户看到的是一页没有「新建」提示的空屏。
+            // 本轮按 E2 补一条空态；CTA 用页头那枚 ＋ 是同一个动作，但**不在空态里再放
+            // 一枚按钮**——同一屏出现两个「新建歌单」，多的那个只会让人犹豫点哪个
+            if (wallPlaylists.isEmpty()) {
+                GlassEmptyState(
+                    icon = GlassIcons.NoteList,
+                    title = "还没有歌单",
+                    subtitle = "点右上角 ＋ 可以新建一个歌单",
+                )
+            }
+
             SectionHeader("我喜欢的")
             GlassSurface(
-                modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
+                // S：14 → 16（归位表「14 在区块之间的留白 → 16」）。这里是「歌单墙」与
+                // 「我喜欢的」两个区块的接缝，收紧到 12 会把两组内容粘成一段
+                modifier = Modifier.fillMaxWidth().padding(
+                    start = S.PageMargin.dp, end = S.PageMargin.dp, bottom = S.Gap16.dp,
+                ),
                 level = GlassLevel.Md,
                 shape = RoundedCornerShape(R.Card18.dp),
             ) {
@@ -268,9 +312,12 @@ private fun FavoriteRow(
             // 补 role 后读屏念「收藏，12 首，按钮，双击激活」。
             // 不写 contentDescription：title/meta 已是可见文字，mergeDescendants 自动合并。
             .semantics { this.role = Role.Button }
-            .padding(horizontal = 14.dp, vertical = 9.dp),
+            // S 接线：横向 = PageMargin − 行外边距 6dp，**几何推导量**（6 + 14 = 20 = 页边距，
+            // 行文字与页头大标题同一条左缘；归位到 Gap12 会与曲库页同款行差 2dp，见
+            // LibraryScreen.GroupRow 的同一处说明）。纵向 9 → 8 是标准归位
+            .padding(horizontal = (S.PageMargin - 6).dp, vertical = S.Gap8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
     ) {
         ArtThumb(art, Modifier.size(48.dp), RoundedCornerShape(R.Thumb10.dp), bordered = true)
         Column(Modifier.weight(1f)) {

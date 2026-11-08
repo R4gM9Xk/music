@@ -1,9 +1,17 @@
 package com.local.music.feature.player.screen
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.EnterExitState
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.updateTransition
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -40,6 +48,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -55,6 +64,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
@@ -63,6 +74,7 @@ import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -108,10 +120,12 @@ import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.auroraAccentColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlin.math.roundToInt
@@ -120,8 +134,28 @@ import kotlin.math.roundToInt
  * 播放页 · 歌词主角
  * - 统一舞台：歌词 rail / 唯一封面 / 纯音乐文案共存，modeT 插值几何——
  *   封面永不卸载，歌词⇄封面即封面在「左上 64dp 小窗 ⇄ 居中大方块」间边放大边直线平移
- * - 28dp 圆角毛玻璃控制台：收藏 / 队列 / 随机 / 三态循环 全部接入 AppState
+ * - **歌名组出卡**（视觉审计 C2）：歌名/副标题是**裸内容**（无容器无描边），落在封面正下方；
+ *   收藏/队列跟着出卡、与歌名同排右侧。玻璃控制台只留进度/时间/控制键，高度从 202dp 收到 152dp。
+ * - 播放模式是**一枚**四态按钮（顺序 → 列表循环 → 单曲循环 → 随机），图标形变动效 + 1.2s 标签反馈
  * - 迷你条进入/收起走共享元素飞行（Flight.kt 状态机 + 覆盖层替身）
+ *
+ * ## 为什么歌名必须出卡（而不是「卡内放大」）
+ *
+ * 卡片是一个**容器**，容器内的元素天然读作「容器的一个字段」。歌名在卡里时，它和进度条、
+ * 收藏钮是同一层级的三个字段——这正切断了「封面 ⇄ 歌名」这条唯一的归属关系。
+ * 出卡后歌名与封面共享同一片裸背景，两者的间距（S.Gap12）小于它们与卡的间距，
+ * 于是「这张封面叫这个名字」由**构图**表达，不再靠字号大小暗示。
+ *
+ * ## 飞行系统的对端几何（改布局 = 改对端，两处必须同时改）
+ *
+ * 歌名/副标题/播放键/下一首是共享元素真身，[com.local.music.ui.PlayerFlightOverlay] 按
+ * `trackFlight` 回填的实测 rect 画替身——所以**只要真身 rect 由实测得出，飞行本身自动跟随**。
+ * 但有两处不能自动跟随、必须在这里同步想清楚：
+ * 1. **替身的字号/行高插值**要把终点改成新真身（歌名 16sp→**20sp Bold**、行高 22→26），
+ *    否则落地那一刻替身字比真身瘦一圈（见 FlightLabel 的 sizeFrom/sizeTo/lineFrom/lineTo）；
+ * 2. **透明度曲线**：歌名原先在卡内，退出时靠卡的 `playerSharedAlpha` 一起渐出；出卡后
+ *    它不再是卡的子节点，必须**自己**用 `sharedAlpha`（= playerSharedAlpha × sheetAlpha），
+ *    否则退出飞行时歌名会一直亮到播放页离场（比别的元素晚 300ms 硬消失）。
  */
 @Composable
 fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
@@ -236,7 +270,12 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         Modifier
                             .fillMaxWidth()
                             .graphicsLayer { alpha = flight?.softAlpha() ?: 1f }
-                            .padding(start = 20.dp, end = 20.dp, top = if (landscape) 0.dp else 6.dp),
+                            .padding(
+                                start = S.PageMargin.dp,
+                                end = S.PageMargin.dp,
+                                // 6dp：顶栏与下方舞台之间的光学缝，属 0–6dp 微缝豁免档（不参与 S 刻度）
+                                top = if (landscape) 0.dp else 6.dp,
+                            ),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
@@ -301,6 +340,11 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         val pureMusic = lyrics == null && song.mediaUri != null
 
                         // 封面两端 rect（舞台本地 px）：左上 64dp 小窗 ⇄ 居中大方块
+                        //
+                        // 下面三个是**几何参数不是间距**，保持裸值（S 刻度管的是「元素之间隔多远」，
+                        // 不管「元素自身多大、锚在哪」）：64 = 歌词端小窗边长；22/14 = 小窗相对舞台
+                        // 左上角的偏移——G1 保护带的 78dp 底边就是 14+64 推出来的，改这三个数要
+                        // 同步改 LyricRail 的 topGuardPx，否则歌词会从封面底下穿出来。
                         val smallSize = with(density) { 64.dp.toPx() }
                         val smallLeft = with(density) { 22.dp.toPx() }
                         val smallTop = with(density) { 14.dp.toPx() }
@@ -311,9 +355,34 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         // 于是 96dp 的边长被压成「宽 96 / 高 76」的**椭圆**，且 offset 后
                         // 叠到顶栏标题上。封面尺寸必须 ≤ 舞台高，否则非方即溢。
                         // 横屏真正变大靠的是 §布局 的双栏（舞台拿到整列高度），不是改这个下限。
-                        val bigSize = minOf(with(density) { 280.dp.toPx() }, stageW, stageH * 0.92f)
-                        val bigCenterY = stageH / 2f -
-                            if (pureMusic) with(density) { (18.dp + 20.dp).toPx() / 2f } else 0f
+                        //
+                        // ## C2（本轮）：旧 280dp 硬上限取消，改「宽度导向 + 边缘留白」推导
+                        //
+                        // 旧式 `min(280dp, stageW, stageH*0.92)` 让 411dp 宽机型只用到 68% 的
+                        // 可用宽度——封面被一个与设备无关的常数锁死，屏幕越大留白越多。
+                        // 新式分两步：先按宽度扣掉两侧留白得到「宽度档」，再按舞台高扣掉纯音乐
+                        // 预留与 8% 呼吸得到「高度档」，取小。两个档次都**由舞台实测尺寸推导**，
+                        // 不含任何常量上限，所以屏幕变宽/变高时封面跟着长。
+                        //
+                        // **为什么仍然是正圆角方块（不会重现椭圆）**：`Modifier.size(side)` 被父
+                        // 约束 coerce 才会变成椭圆，而这里 side ≤ stageW − 2×留白 < stageW 且
+                        // side ≤ 0.92×(stageH − 预留) < stageH，两条边都**严格小于**父约束——
+                        // coerce 无从发生。这正是「封面边长 ≤ min(stageW, stageH)」这条硬约束的
+                        // 代码表达（任务要求保留，不能破）。
+                        //
+                        // 边缘留白取 S.Gap20（20dp）：视觉审计 C2 建议 24–32dp，但在 411dp 宽机型上
+                        // 24 会把封面压回 363dp 以下；20 是「取整到 S 刻度后的下限」——封面与屏幕
+                        // 边缘的呼吸感仍在，同时与歌名组的左边距**同值**，于是封面左缘和歌名左缘
+                        // 在宽度受限的机型上天然对齐（见 titleBlock）。
+                        val coverEdgePx = with(density) { S.Gap20.dp.toPx() }
+                        // 纯音乐空态文案（封面下方 20dp 起、Micro 行高 14 + 折行余量 ≈ 18）预留 38dp。
+                        // 这个数**必须从封面可用高度里扣**：不扣的话，高度受限的机型上文案会被
+                        // 推出舞台、压进歌名组（文案是 offset 定位的，不受舞台高度裁剪）。
+                        val pureMusicReservePx = if (pureMusic) with(density) { 38.dp.toPx() } else 0f
+                        val availH = (stageH - pureMusicReservePx - stageH * 0.08f).coerceAtLeast(0f)
+                        val bigSize = minOf(stageW - coverEdgePx * 2f, availH).coerceAtLeast(0f)
+                        // 封面中心：扣掉预留后那段区域的中心（纯音乐时整体上移半个预留高）
+                        val bigCenterY = (stageH - pureMusicReservePx) / 2f
                         val smallRect = Rect(smallLeft, smallTop, smallLeft + smallSize, smallTop + smallSize)
                         val bigRect = Rect(
                             stageW / 2f - bigSize / 2f, bigCenterY - bigSize / 2f,
@@ -403,8 +472,13 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             }
 
 
-            // ── 玻璃控制台（背景真模糊：采样舞台区）。玻璃本体/歌名/副标题/播放/下一首 = 共享真身；
-            //    收藏/队列/进度/时间/随机/上一首/循环 = 非共享原地淡入淡出。
+            // ── 共享/非共享的归属（歌名组出卡后重新分组，这条注释必须跟着改）──
+            //  - **共享真身**（有 flight key，飞行期由覆盖层替身接管，收尾交叉淡入）：
+            //    玻璃控制台根层 PlayerGlass、播放键 PlayerPlay、下一首 PlayerNext
+            //    ——它们仍在卡内；歌名 PlayerTitle / 副标题 PlayerArtist 已随 [titleBlock]
+            //    出卡，但它们**依然是共享真身**（key 不变、语义不变），只是换了父节点。
+            //  - **非共享**（原地 softAlpha 淡入淡出）：收藏 / 队列 / 进度 / 时间 / 上一首 /
+            //    播放模式钮。它们没有对应替身，飞行期只让自己消失/出现。
             //    底部面板打开时控制台整体让位：读全局 ModalState（含退场期，与 GlassApp 对
             //    Chrome 的门控同源）——面板滑出全程保持隐藏，退场时长到 content 清空后才复位
             val sheetOpen = modal.isOpen
@@ -420,6 +494,26 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             // 同一系数会平方衰减（中点 0.25），交叉淡化亮度凹陷加深——退出期恒 1 交给根层
             val sharedInnerAlpha = { (flight?.playerSharedInnerAlpha() ?: 1f) * sheetAlpha }
             val softAlpha = { (flight?.softAlpha() ?: 1f) * sheetAlpha }
+
+            // ── 播放模式标签（1.2s 后消失）──
+            //
+            // 状态放在**屏幕级**而不是按钮内：标签要渲染在底部提示行（见下方 hint 的选型注释），
+            // 那是按钮的兄弟节点、隔着整个 GlassSurface。按钮只负责「我切到哪一档了」这一句
+            // 事件（onModeChanged 回调），停留计时在屏幕级做。
+            //
+            // 为什么用 `LaunchedEffect(modeLabel)` 而不是按钮内自增 token：
+            // 文案本身是 key —— 同一档连点两次（理论上不会发生，四态环每次都变）不会重启计时，
+            // 而不同档之间必然重启。这比维护一个额外计数器少一份状态、也少一类「计数与文案
+            // 不同步」的 bug。
+            var modeLabel by remember { mutableStateOf<String?>(null) }
+            LaunchedEffect(modeLabel) {
+                if (modeLabel == null) return@LaunchedEffect
+                // 1200ms 是**阅读时长**（四个字的词组 + 一次视线下移），不是动效时长，
+                // 所以刻意不乘 GlassMotion.scale：克制档下若也跟着缩，用户会看不清
+                // 自己刚按出了什么模式。
+                delay(1_200)
+                modeLabel = null
+            }
             // 2.2-D：拖动进度条时的预览比例（null = 未拖动，显示真实进度）。
             //
             // 为什么用「持有 State 对象 + 传 provider lambda」而不是直接读 Float：
@@ -432,15 +526,126 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             // 专为此加），文档写明「供『已播时长』跟随手指变化」，但全仓没有任何调用点
             // 传过它 —— 于是拖动时轨道跟手、时间数字一动不动，松手才跳。
             val previewFraction = remember { mutableStateOf<Float?>(null) }
+
+            // ── 歌名组（**卡外裸内容**：无容器、无描边、无底色）──
+            //
+            // 它和舞台、控制台是**平级**的三个抽屉：舞台（封面/歌词）→ 歌名组 → 玻璃控制台。
+            // 歌名组不吃玻璃、不吃描边，于是它与封面共享同一片背景，两者构成一个视觉单元；
+            // 而它到控制台之间隔着一整块玻璃的边界，层级差由**材质**表达而不是字号。
+            //
+            // ## 为什么标题用 GlassText.Title（20 Bold 26）而不是 Heading（16 SemiBold 22）
+            //
+            // 视觉审计 C2 的原话是「歌名 16sp 是控制台的『附件』而非页面主角」。出卡只解决
+            // 「是不是附件」的一半问题：歌名与卡分离了，但如果仍是 16sp，它在整屏的最高层级
+            // 还是低于 20sp 的二级页标题（详情页 / 歌单页的页名），于是「播放页的主角」比
+            // 「歌单页的标题」还弱——这违背 C2 的初衷。GlassType 阶梯里 20sp 只有一档
+            // （Title = 二级页大标题），它正是「这一页的名字」的语义档；播放页的主角就该是
+            // 这一档。加粗（Title 是 Bold 而非 Heading 的 SemiBold）另有一层原因：裸文字
+            // 失去了玻璃卡提供的边界，字重是它唯一还能拿到的「前景性」补偿。
+            //
+            // ## 为什么收藏/队列与歌名同排（而不是留在控制台里或控制台上方右对齐）
+            //
+            // 这两个动作属于**这首歌**，不属于播放控制（播放/上一首/下一首属于「播放」这个
+            // 行为）。它们原本与歌名同处卡内一行，正是按「属于这首歌」归的组；歌名移出卡时
+            // 若把它们留下，会出现「歌名在卡外、收藏在卡内」这种归属撕裂——用户会找不到
+            // 收藏钮（它在视觉上隶属于控制台那组了）。
+            //
+            // 与「控制台上方右对齐」方案相比，同排的额外好处是**省一整行高度**：竖屏总共
+            // 只有 ~150dp 的可支配高度（见下），单独一行图标钮要吃掉 40dp，等于封面少 40dp。
+            // 同排则完全免费：歌名两行（26+16）本就比两个 33dp 圆钮高，这一行的高度由文字决定。
+            val titleBlock: @Composable () -> Unit = {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(
+                            start = S.PageMargin.dp,
+                            end = S.PageMargin.dp,
+                            // 上 12dp = 封面与歌名之间的呼吸（小于它到控制台的整个玻璃厚度）；
+                            // 下 12dp = 歌名组与卡片之间的留白。两端同值不是偷懒：这里要的是
+                            // 「歌名组居中于封面与卡片之间」的对称，不是「更靠近卡片」的偏心。
+                            top = S.Gap12.dp,
+                            bottom = S.Gap12.dp,
+                        ),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(
+                        Modifier
+                            .weight(1f)
+                            // 整组共用一个 alpha 门控，且取的是**共享真身**曲线 sharedAlpha
+                            // （playerSharedAlpha × sheetAlpha）——这条不能省，原因见文件头
+                            // KDoc 第 2 点：出卡后它不再是玻璃卡的子节点，卡的渐隐不再顺带
+                            // 带走它，必须自己挂同一根曲线，否则收起飞行时歌名会比别的东西
+                            // 晚消失近 300ms。
+                            .graphicsLayer { alpha = sharedAlpha() },
+                    ) {
+                        // trackFlight 挂在**文本节点本身**（不是一个包装 Box）：飞行替身的
+                        // rect 直接对应文字的排版盒，虚线才有意义。加包装会多出零高/全高
+                        // 两种不同量法，端点一律偏。
+                        Text(song.title, color = LocalGlassColors.current.textPrimary, style = GlassText.Title,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.trackFlight(FlightKeys.PlayerTitle))
+                        // 副标题仍是 Caption（12/16）：它与列表副标题同档，是「歌名之下的
+                        // 一行注脚」。不出卡时它是卡内的第二行；出卡后它依然是第二行——
+                        // 出卡改变的是**容器归属**，不是文字之间的相对层级。
+                        Text(song.subtitle, color = LocalGlassColors.current.textSecondary, style = GlassText.Caption,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.trackFlight(FlightKeys.PlayerArtist))
+                    }
+                    Spacer(Modifier.width(S.Gap12.dp))
+                    // 收藏/队列是**非共享**元素（没有 flight key）：飞行期按 softAlpha 原地
+                    // 淡入淡出，与它们的旧行为一致——这条不能因为搬进歌名组就跟着换成
+                    // sharedAlpha，否则飞行中途会有一段时间「收藏钮凭空消失又出现」。
+                    ConsoleIcon(
+                        onClick = { state.toggleFavorite(song.id) },
+                        contentDescription = if (state.isFavorite(song.id)) "取消收藏" else "收藏",
+                        stateDescription = if (state.isFavorite(song.id)) "已收藏" else "未收藏",
+                        modifier = Modifier.graphicsLayer { alpha = softAlpha() },
+                    ) {
+                        Icon(
+                            if (state.isFavorite(song.id)) GlassIcons.HeartFilled else GlassIcons.Heart, null,
+                            Modifier.size(21.dp), tint = LocalGlassColors.current.textPrimary,
+                        )
+                    }
+                    ConsoleIcon(
+                        onClick = {
+                            modal.show {
+                                QueueSheet(
+                                    visible = modal.visible,
+                                    onDismiss = modal::requestDismiss,
+                                    queue = state.queue,
+                                    currentIndex = state.queueIndex,
+                                    onPick = { index ->
+                                        state.playSong(state.queue[index], state.queue)
+                                        modal.requestDismiss()
+                                    },
+                                    onMove = state::moveQueueItem,
+                                    onRemove = state::removeQueueItem,
+                                    onClearUpNext = state::clearUpNext,
+                                    isPlaying = state.playing,
+                                )
+                            }
+                        },
+                        contentDescription = "打开播放队列",
+                        modifier = Modifier.graphicsLayer { alpha = softAlpha() },
+                    ) {
+                        Icon(GlassIcons.Queue, null, Modifier.size(21.dp),
+                            tint = LocalGlassColors.current.textSecondary)
+                    }
+                }
+            }
+
             val consoleBlock: @Composable () -> Unit = {
             GlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
                     // P2-⑤：横屏收紧外边距与底部留白，控制台少占的高度全部给舞台
                     .padding(
-                        start = 16.dp,
-                        end = 16.dp,
-                        bottom = if (landscape) 6.dp else 14.dp,
+                        start = S.Gap16.dp,
+                        end = S.Gap16.dp,
+                        // 竖屏 14dp → 12dp（S 刻度就近归位）：控制台是页面最后一块内容，
+                        // 它下方只剩提示行，两者之间的视觉关系本来就是「一组」，不该比
+                        // 卡内的行间距更松。横屏 6dp 落在微缝豁免档，保持裸值。
+                        bottom = if (landscape) 6.dp else S.Gap12.dp,
                     )
                     .trackFlight(FlightKeys.PlayerGlass)
                     .graphicsLayer { alpha = sharedAlpha() },
@@ -450,77 +655,19 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             ) {
                 Column(
                     Modifier.padding(
-                        start = 18.dp,
-                        end = 18.dp,
-                        top = if (landscape) 8.dp else 14.dp,
-                        bottom = if (landscape) 8.dp else 16.dp,
+                        // 卡内边距：18 → 16（S 刻度）。出卡后卡里只剩进度/时间/控制键，
+                        // 全是「满宽元素」，18 的偏心内距失去了存在的理由（18 原本是为了
+                        // 让歌名文字与卡缘对齐得更松）。16 同时是 S 刻度上的值。
+                        start = S.Gap16.dp,
+                        end = S.Gap16.dp,
+                        // 上下边距重算：旧值 14/16 是按「三行内容（歌名+进度+控制键）」配的
+                        // 呼吸。现在只剩「进度/时间/控制键」，上下各 12 即可——卡的高度从
+                        // 旧 202dp 收到 152dp（推导见文件头），省下的 50dp 全部归封面。
+                        top = if (landscape) S.Gap8.dp else S.Gap12.dp,
+                        bottom = if (landscape) S.Gap8.dp else S.Gap12.dp,
                     ),
                 ) {
-                    // 歌曲信息 + 收藏 + 队列
-                    //
-                    // **为什么本轮不让歌名「出卡」**（视觉审计 C2 / B2 的原始建议）：
-                    // 歌名与副标题挂着 FlightKeys.PlayerTitle / PlayerArtist，播放键/下一首同理
-                    // （PlayerPlay / PlayerNext）。PlayerFlightOverlay 的起止 rect 是**按这些节点的
-                    // 实测位置**推出的——把它们从玻璃卡里搬出去（哪怕只挪 20dp 垂直），
-                    // 飞行两端几何就要重算，覆盖层替身会与真身在飞行途中错位。
-                    // 那是飞行系统的重写，属独立轮次；本轮只做**不动布局**的层级修正（字号 token）。
-                    // 同理不做「封面放大」：封面 rect 由 stageW/stageH 推导，放大需重排整页高度分配。
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            // A1：Heading（16 SemiBold 22）——字号/字重与旧裸值一致，补齐 22 行高
-                            Text(song.title, color = LocalGlassColors.current.textPrimary, style = GlassText.Heading,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier
-                                    .trackFlight(FlightKeys.PlayerTitle)
-                                    .graphicsLayer { alpha = sharedInnerAlpha() })
-                            // A1：Caption（12/16）——与列表副标题同档，去掉裸 12sp 的默认行高
-                            Text(song.subtitle, color = LocalGlassColors.current.textSecondary, style = GlassText.Caption,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier
-                                    .trackFlight(FlightKeys.PlayerArtist)
-                                    .graphicsLayer { alpha = sharedInnerAlpha() })
-                        }
-                        Spacer(Modifier.width(12.dp))
-                        ConsoleIcon(
-                            onClick = { state.toggleFavorite(song.id) },
-                            contentDescription = if (state.isFavorite(song.id)) "取消收藏" else "收藏",
-                            stateDescription = if (state.isFavorite(song.id)) "已收藏" else "未收藏",
-                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
-                        ) {
-                            Icon(
-                                if (state.isFavorite(song.id)) GlassIcons.HeartFilled else GlassIcons.Heart, null,
-                                Modifier.size(21.dp), tint = LocalGlassColors.current.textPrimary,
-                            )
-                        }
-                        ConsoleIcon(
-                            onClick = {
-                                modal.show {
-                                    QueueSheet(
-                                        visible = modal.visible,
-                                        onDismiss = modal::requestDismiss,
-                                        queue = state.queue,
-                                        currentIndex = state.queueIndex,
-                                        onPick = { index ->
-                                            state.playSong(state.queue[index], state.queue)
-                                            modal.requestDismiss()
-                                        },
-                                        onMove = state::moveQueueItem,
-                                        onRemove = state::removeQueueItem,
-                                        onClearUpNext = state::clearUpNext,
-                                        isPlaying = state.playing,
-                                    )
-                                }
-                            },
-                            contentDescription = "打开播放队列",
-                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
-                        ) {
-                            Icon(GlassIcons.Queue, null, Modifier.size(21.dp),
-                                tint = LocalGlassColors.current.textSecondary)
-                        }
-                    }
-
-                    // 进度：轨道 + 时间
-                    Spacer(Modifier.height(12.dp))
+                    // 进度：轨道 + 时间（歌名组已出卡，这里从第一行开始就是进度）
                     Box(Modifier.graphicsLayer { alpha = softAlpha() }) {
                         // 传取值函数：进度 10Hz 变，以 Float 传入会让整个控制台（含歌词区外的
                         // 音量/模式行）每 tick 重组。绘制期读才是这套 UI 的既有做法。
@@ -545,21 +692,35 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         TotalTimeText(state)
                     }
 
-                    // 控制键：随机 / 上一首 / 播放 / 下一首 / 循环（三态）
+                    // 控制键：播放模式（四态合一）/ 上一首 / 播放 / 下一首
+                    //
+                    // ## 为什么随机与循环必须合成一枚按钮（用户指定，QQ 音乐同款）
+                    //
+                    // 改前是两个独立图标钮：随机（开/关二态）+ 循环（三态）。这在**语义上**
+                    // 是两个正交开关，但在**用户心智上**只有一个问题——"这首歌放完怎么办"。
+                    // 两个控件同时亮着时，用户要先把两个状态在心里组合一次才知道会发生什么：
+                    // 随机开着 + 单曲循环 = ? （答案：单曲循环赢，随机不生效——这个优先级
+                    // 规则在任何 UI 上都没有被表达过）。合成一枚四态按钮后，「当前模式」成为
+                    // 一个可命名的**单一状态**，并且用一次点击就能遍历，不再有隐藏的优先级。
+                    //
+                    // 代价是牺牲独立性：用户不能表达「随机 + 单曲循环」。这是**有意**的取舍，
+                    // 依据是「随机播放单曲」本身就是无意义组合（随机一首再无限重复它）。
+                    //
+                    // ## 四态与持久化字段
+                    // `shuffleOn` / `repeatMode` 两个字段名与语义**一字未改**（旧快照、旧入口、
+                    // 引擎下发全部照旧），映射与派生逻辑收敛在 AppState.cyclePlayMode() 的
+                    // KDoc 里（一张表，读它即可）。
                     Row(
                         Modifier.fillMaxWidth().padding(top = 10.dp, start = 2.dp, end = 2.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        ConsoleIcon(
-                            onClick = state::toggleShuffle,
-                            contentDescription = "随机播放",
-                            stateDescription = if (state.shuffleOn) "已开启" else "已关闭",
+                        PlayModeButton(
+                            state = state,
+                            // 按钮只上报「切到哪一档了」，停留计时的 State 在屏幕级（见上方 modeLabel）
+                            onModeChanged = { modeLabel = it },
                             modifier = Modifier.graphicsLayer { alpha = softAlpha() },
-                        ) {
-                            Icon(GlassIcons.Shuffle, null, Modifier.size(20.dp),
-                                tint = if (state.shuffleOn) auroraAccentColor() else LocalGlassColors.current.textSecondary)
-                        }
+                        )
                         ConsoleIcon(
                             onClick = { state.prev() },
                             contentDescription = "上一首",
@@ -585,36 +746,12 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             Icon(GlassIcons.Next, null, Modifier.size(28.dp),
                                 tint = LocalGlassColors.current.textSecondary)
                         }
-                        ConsoleIcon(
-                            onClick = state::cycleRepeat,
-                            contentDescription = "循环模式",
-                            stateDescription = when (state.repeatMode) {
-                                RepeatMode.Off -> "顺序播放"
-                                RepeatMode.All -> "列表循环"
-                                RepeatMode.One -> "单曲循环"
-                            },
-                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
-                        ) {
-                            Box(Modifier.size(20.dp)) {
-                                Icon(GlassIcons.Repeat, null, Modifier.size(20.dp),
-                                    tint = if (state.repeatMode != RepeatMode.Off) {
-                                        auroraAccentColor()
-                                    } else {
-                                        LocalGlassColors.current.textSecondary
-                                    },
-                                )
-                                if (state.repeatMode == RepeatMode.One) {
-                                    // 单曲循环角标
-                                    Box(
-                                        Modifier
-                                            .align(Alignment.TopEnd)
-                                            .size(6.dp)
-                                            .clip(CircleShape)
-                                            .background(auroraAccentColor()),
-                                    )
-                                }
-                            }
-                        }
+                        // 右侧第 5 个位置是「配重」而非控件：播放模式在左、这一格在右，
+                        // 中间三枚是真正的播放控制。SpaceBetween 下若只有 4 个子项，
+                        // 播放键会被推到正中偏右，视觉重心与下方进度条对不齐。
+                        // 用等宽占位（而非把队列钮留在这里）是因为收藏/队列已随歌名出卡
+                        // 上移到卡外——那一组才是它们的新家，这里只是几何平衡。
+                        Spacer(Modifier.width(32.dp))
                     }
                 }
             }
@@ -634,7 +771,24 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             // 顺带修掉一处失真：空队列的占位曲（mediaUri == null）现在也走这里不出字。
             // 它的舞台上压根没有这句（stageBlock 的 pureMusic 要求 mediaUri != null），
             // 旧实现却在提示行对它宣称「纯音乐，请欣赏」——占位曲不是纯音乐，是**没有歌**。
+            //
+            // ## 播放模式标签复用本行（B 任务）
+            //
+            // 四态按钮切换后需要一个「一眼可读」的模式名（「列表循环」四个字，图标承载不了）。
+            // 三条候选路线里只有本行可行：
+            // - 按钮上方浮出 → 被玻璃卡的 `clip(RoundedCornerShape(R.Player28))` 裁掉
+            //   （按钮是卡内最底一行，向上 20dp 正好压进时间行）；
+            // - 按钮旁 overlay → 会顶飞 SpaceBetween 那一行的配重（测量参与与否必须选一个，
+            //   而这条提示行的**高度本来就是恒定的**，加一段文字零成本）；
+            // - 新建全局浮层 → 任务明令禁止。
+            // 本行的既有契约正好是「恒定一行、恒定高度、可换文案」——它本来就是为
+            // 「不出字也要占位」设计的，模式标签只是又一个消费者。
+            //
+            // 优先级：模式标签 > 操作提示。理由：模式标签是**对刚才那次点击的回复**
+            // （1.2s 后消失），操作提示是**常驻教学**；瞬态反馈必须压过常驻文案，
+            // 否则用户点了按钮却在提示行读到「左右滑动切换封面」，反馈等于丢失。
             val hint: String? = when {
+                modeLabel != null -> modeLabel
                 lyrics == null -> null
                 showLyrics -> "点击歌词行可跳转 · 左右滑动切换封面 / 歌词"
                 else -> "左右滑动切换封面 / 歌词"
@@ -687,6 +841,12 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             .fillMaxHeight(),
                         verticalArrangement = Arrangement.Center,
                     ) {
+                        // 横屏右侧栏的顺序：歌名组 → 控制台 → 提示行。
+                        // **歌名组必须在横屏也保留**：它承载 PlayerTitle/PlayerArtist 两个飞行
+                        // 真身键，横屏下若直接不渲染，横屏进入播放页时 `awaitRects(playerKeys)`
+                        // 会等不到这两个键 → 600ms 超时 → 整个飞行被中止（退化成硬切）。
+                        // 也就是说「横屏不显示歌名」这条看似合理的省空间方案，实际会打断飞行。
+                        titleBlock()
                         consoleBlock()
                         hintBlock()
                     }
@@ -698,6 +858,11 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         stageBlock()
                     }
                 }
+                // 竖屏顺序：舞台（weight 1f 吃剩余）→ 歌名组（固定高）→ 控制台（固定高）→ 提示行。
+                // 封面放大靠的就是「歌名组与控制台都是固定高、舞台吃剩下的一切」这条结构：
+                // 控制台从 202dp 收到 152dp、歌名组只占约 62dp（26+16 文字 + 上下 12 留白），
+                // 省下的高度**全部**自动流进舞台，无需再动任何尺寸公式。
+                titleBlock()
                 consoleBlock()
                 hintBlock()
             }
@@ -990,6 +1155,211 @@ private fun PlayPauseButton(
             // Icon 再挂一份会和父节点重复播报两遍，故此处 null 是**有意为之**，不是漏补
             contentDescription = null,
             Modifier.size(26.dp), tint = LocalGlassColors.current.textPrimary,
+        )
+    }
+}
+
+// ── 播放模式：四态合一按钮（用户指定，QQ 音乐同款）──────────────
+
+/**
+ * 播放模式四态。**这是持久化字段的联合视图，不是新状态**——
+ * 每次组合都由 ([AppState.shuffleOn], [AppState.repeatMode]) 现算，
+ * 不存在第三份真相（见 [AppState.cyclePlayMode] 的映射表）。
+ */
+private enum class PlayMode(
+    val label: String,
+    val icon: ImageVector,
+) {
+    Order("顺序播放", GlassIcons.PlayOrder),
+    ListLoop("列表循环", GlassIcons.PlayListLoop),
+    RepeatOne("单曲循环", GlassIcons.PlayRepeatOne),
+    Shuffle("随机播放", GlassIcons.PlayShuffle),
+    ;
+
+    /** 顺序播放是「无声模式」（无高亮）；其余三态亮强调色。语义：只有非默认态才需要被注意 */
+    val isAccent: Boolean get() = this != Order
+
+    /**
+     * 环形序的下一态——**与 [AppState.cyclePlayMode] 的四态环严格同构**。
+     *
+     * 这份重复看起来违反 DRY，但两边求的是不同的东西：AppState 算的是「下一对
+     * (shuffleOn, repeatMode) 字段值」，这里算的是「下一条给用户读的标签」。
+     * 硬要合并只能让 AppState 暴露一个 enum 出去（污染持久化层），或者让 UI 猜标签
+     * ——两者都比这 5 行代码更糟。若将来四态环变化，**两处都要改**，这是唯一的代价。
+     */
+    fun next(): PlayMode = when (this) {
+        Order -> ListLoop
+        ListLoop -> RepeatOne
+        RepeatOne -> Shuffle
+        Shuffle -> Order
+    }
+
+    companion object {
+        /**
+         * 从持久化字段反查视觉态。
+         *
+         * `shuffleOn` 优先：随机开着时**忽略** repeatMode。这条容错是必需的——
+         * 「随机 + Off」「随机 + One」这两种组合仍可能来自旧版本快照或
+         * [AppState.playCollection] 的 shuffle 入口（它只改 shuffleOn）。
+         * 若不忽略，用户会看到「按钮写着顺序播放、实际却在随机跳歌」。
+         */
+        fun of(shuffleOn: Boolean, repeat: RepeatMode): PlayMode = when {
+            shuffleOn -> Shuffle
+            repeat == RepeatMode.All -> ListLoop
+            repeat == RepeatMode.One -> RepeatOne
+            else -> Order
+        }
+    }
+}
+
+/**
+ * 四态播放模式按钮：单枚图标 + 形变过渡 + 通过 hint 行播报的 1.2s 模式标签。
+ *
+ * ## 形变动效（用户明确要求「记得加上相应动效」，QQ 音乐同款观感）
+ *
+ * 一次点击要表达两件事：**「换成了什么」** 和 **「这一下生效了」**。所以过渡分两层：
+ * 1. [AnimatedContent] 做图标**交叉形变**：旧图标淡出 + 缩到 0.72 + 逆时针转出 90°，
+ *    新图标同时从 0.72 弹回 1.0 + 顺时针转正。两者用的是**同一条** [GlassMotion.tweenPress]
+ *    曲线，于是「旧的转出去、新的转进来」是同一支舞，而不是两段各自播放的动画。
+ * 2. 一圈**强调色细环脉冲**：从图标位置向外扩散并淡出，是「点击已被接收」的即时回执
+ *    （按压缩放只有 0.88 且 180ms，快速连点时几乎读不出来）。
+ *
+ * ## 为什么这两层都不产生逐帧重组
+ *
+ * 旋转/缩放/alpha 全部写在 `graphicsLayer { }` 的 lambda 里，即**绘制期读**动画值；
+ * `AnimatedContent` 的 transition 只在内容切换的那一瞬重组一次，`animateFloat(transition)`
+ * 拿到的是 State，`.value` 只在绘制期被读。这与本仓既有纪律一致
+ * （见 ProgressTrack 的「绘制期读」注释、sheetAlpha 的注释）。
+ *
+ * ## 时长与曲线
+ *
+ * 走 [GlassMotion.tweenPress] / [GlassMotion.tweenHover]（全 App 唯一缓动曲线），
+ * 并**自动**被 `GlassMotion.scale`（设置页动效强度三档）乘过——
+ * 不新造曲线、不绕过强度设置。标签停留 1.2s 是**阅读时长**不是动效时长，
+ * 故意不参与强度缩放：克制档下若也跟着缩，用户会看不清自己按出了什么。
+ *
+ * ## 为什么标签不走「按钮上方浮出」的 overlay
+ *
+ * 试过，不可行：控制台的 [com.local.music.core.ui.components.GlassSurface] 用
+ * `clip(shape)` 裁内容（圆角矩形），而按钮位于卡内**最底一行**——标签向上偏移 20dp
+ * 正好压进上方的时间行（已播/总时长），向右/向下则直接被卡缘裁掉。
+ * 三条路都失败，于是改用**既有 hint 行**承载（见 [PlayerHintRow]）：它是一整屏唯一的
+ * 恒定装饰槽位，高度固定、不被裁剪、不参与任何测量竞争。
+ */
+@Composable
+private fun PlayModeButton(
+    state: AppState,
+    onModeChanged: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val glass = LocalGlassColors.current
+    val mode = PlayMode.of(state.shuffleOn, state.repeatMode)
+    val interactionSource = remember { MutableInteractionSource() }
+
+    // 环脉冲：每次切换从 0 走到 1。snapTo(0)+animateTo(1) 在同一协程里，
+    // 连续快点时旧动画被取消、新的从 0 重来（这正确：每次点击都该有完整的一次扩散）。
+    val ringPulse = remember { Animatable(1f) }
+    val scope = rememberCoroutineScope()
+
+    // ── 语义：清空子树后**自己写全**，保证落到**同一个可点节点**上 ──
+    //
+    // 这是本轮实测踩出来的，三代写法都不对，记下来避免后人重犯：
+    // ① `semantics{} then clickable{}` → 标签节点 clickable=false，旁边还有个空标签的
+    //    可点节点（标签与点击性分裂到两个节点）；
+    // ② `clickable{} then semantics{}`（ConsoleIcon 的写法）单独看没问题，但本按钮内层是
+    //    `AnimatedContent`——它给进出两个图标各建了语义节点，于是外层被识别成**容器**，
+    //    uiautomator 仍然把 clickable 归到父节点、标签留在子节点；
+    // ③ `semantics(mergeDescendants = true)` 会被 AnimatedContent 的两个过渡子树干扰，
+    //    合并结果仍不稳定。
+    //
+    // 最终解：`clearAndSetSemantics` —— 它**丢弃整个子树的语义**再由这里重建一个节点。
+    // 图标本来就是 contentDescription=null 的纯装饰，AnimatedContent 的过渡节点也不是给
+    // 读屏用的，全丢正是想要的。重建后 label / stateDescription / role 与 clickable
+    // 落在同一节点，TalkBack 与 uiautomator 都读到一致结果（实测 clickable=true）。
+    Box(
+        modifier
+            .pressScale(interactionSource, pressed = 0.88f)
+            .clickable(interactionSource = interactionSource, indication = null) {
+                state.cyclePlayMode()
+                onModeChanged(mode.next().label)
+                scope.launch {
+                    ringPulse.snapTo(0f)
+                    ringPulse.animateTo(1f, GlassMotion.tweenHover())
+                }
+            }
+            .clearAndSetSemantics {
+                this.role = Role.Button
+                this.contentDescription = "播放模式"
+                // stateDescription 承载四态中文：读屏用户靠它知道「现在是哪一档」，
+                // contentDescription 只回答「这是什么控件」。两者分开是 TalkBack 的正确用法。
+                this.stateDescription = mode.label
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        // 内层：纯布局 + 动画容器，不再挂任何语义（语义已由外层可点节点全权承担）
+        Box(
+            Modifier.padding(6.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            AnimatedContent(
+                targetState = mode,
+                transitionSpec = {
+                    // 进入端：淡入 + 从 0.72 弹回 1；退出端：淡出 + 缩到 0.72。
+                    // 两者同时进行（togetherWith），中途是两个半透明图标交叠——
+                    // 这正是「形变」而不是「换图」的关键：用户看到的是一枚图标在变，
+                    // 不是两枚图标在交替。
+                    fadeIn(GlassMotion.tweenPress<Float>()) +
+                        scaleIn(initialScale = 0.72f, animationSpec = GlassMotion.tweenPress()) togetherWith
+                        (fadeOut(GlassMotion.tweenPress<Float>()) +
+                            scaleOut(targetScale = 0.72f, animationSpec = GlassMotion.tweenPress()))
+                },
+                label = "playModeIcon",
+            ) { m ->
+                // 旋转按**本子树自己的进出进度**推：进入时 -90° → 0（顺时针转正），
+                // 退出时 0 → -90°（逆时针转出）。旧图标转出与新图标转正方向相反，
+                // 于是整段读作「旧的一枚转走、新的一枚转进来」，而不是「整块图标转了 90°」。
+                // 用 EnterExitState 而不是 0/1 布尔：AnimatedContent 的 Visible 态覆盖
+                // 进入完成与稳定两段，直接映射成「稳定 = 1」即可。
+                val rot by transition.animateFloat(label = "playModeRot") { state ->
+                    if (state == EnterExitState.Visible) 1f else 0f
+                }
+                Icon(
+                    m.icon,
+                    // 语义由外层 Box 全权承担；Icon 再挂一份会重复播报（与 PlayPauseButton 同款纪律）
+                    contentDescription = null,
+                    Modifier
+                        .size(20.dp)
+                        .graphicsLayer { rotationZ = (1f - rot) * -90f },
+                    tint = if (m.isAccent) auroraAccentColor() else glass.textSecondary,
+                )
+            }
+        }
+
+        // 环脉冲：matchParentSize 让它**不参与父级测量**（等价 fillMaxSize 但不影响
+        // 父 Box 的尺寸）——否则这枚环会把按钮撑大 4dp，把 SpaceBetween 的整行配重推歪。
+        //
+        // 强调色在**组合期**取一次存进局部量：auroraAccentColor() 是 @Composable（它要读
+        // LocalAuroraPalette + 主题态），而 drawBehind 的 lambda 是纯绘制期、不可调用
+        // composable。取色只依赖主题，不会逐帧变，所以组合期取一次是正确的粒度。
+        val ringColor = auroraAccentColor()
+        Box(
+            Modifier
+                .matchParentSize()
+                .graphicsLayer {
+                    val p = ringPulse.value
+                    alpha = if (p >= 1f) 0f else (1f - p) * 0.55f
+                    val s = 0.55f + p * 0.85f
+                    scaleX = s
+                    scaleY = s
+                }
+                .drawBehind {
+                    // 1.2dp 细环：与图标的 1.8/1.9 笔画不抢视觉，只做「扩散消失」的时间信号
+                    drawCircle(
+                        color = ringColor,
+                        radius = size.minDimension / 2f - 1.2.dp.toPx(),
+                        style = Stroke(1.2.dp.toPx()),
+                    )
+                },
         )
     }
 }
