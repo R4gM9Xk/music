@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -179,9 +178,26 @@ data class DropdownOption<T>(
 /**
  * 下拉列表本体：玻璃容器 + 逐项（选中项带对勾）。
  *
- * 宽度用 `widthIn(min = 168.dp)` 而不是撑满：三档的文本长度相近
- * （「通透/标准/浓郁」），固定下限能让三行等宽、对齐，不会因副标题长短不一把
- * 容器拉成参差的形状。
+ * ## 宽度：必须同时给上下界，只给 min 会撑满全屏（真机/模拟器实测踩到）
+ *
+ * 初版写的是 `widthIn(min = 168.dp).wrapContentWidth()`，意图是「按内容自适应、
+ * 至少 168dp」。但实测下拉弹出后**几乎占满屏宽**，原因有两层：
+ * 1. `widthIn` 只约束了**下界**，上界仍是父约束上限；
+ * 2. 内部 `Row` 用了 `fillMaxWidth()` —— 在 Popup 的宽松约束下它会一路填到父上限，
+ *    于是「自适应」被内部子项反推成了「撑满」。`wrapContentWidth` 挡不住：
+ *    它只调整自身在**已测量尺寸**内的对齐，不改变子项要求的宽度。
+ *
+ * 修法：给 `widthIn` 加上 `max`，并在内部改用 `fillMaxWidth()` 之外的写法——
+ * 这里保留 `fillMaxWidth()` 但它现在被外层的 max 约束住了（宽度上限唯一由外层决定，
+ * 内部只负责「填满外层给的宽度」，职责清晰）。
+ *
+ * 尺寸取值的理由：
+ * - **232dp 上限**：「填充与描边减淡，更通透」这类副标题最长，按 GlassText.Micro（11sp）
+ *   单行约需 `168dp` 正文 + 16dp×2 内边距 + 18dp 对勾位 ≈ 218dp，取 232dp 留一点余量。
+ *   相比屏宽 411dp 只占 56%，读作「挂在行尾的一块小板」而不是「整屏抽屉」。
+ * - **168dp 下限**：短文案（「通透/标准/浓郁」）下三行等宽、对勾列对齐，不会缩成窄条。
+ * - 副标题允许折行（maxLines = 2）：宁可让最长的两条折成两行，也不用被最长的副标题
+ *   反向撑宽整个列表——**宽度应由视觉意图决定，而不是由最长的那条文案决定**。
  */
 @Composable
 private fun <T> DropdownList(
@@ -192,11 +208,27 @@ private fun <T> DropdownList(
 ) {
     val glass = LocalGlassColors.current
     GlassSurface(
-        modifier = Modifier.widthIn(min = 168.dp).wrapContentWidth(),
+        // 上下界都要给：只写 min 时上界=父上限，会被内部 fillMaxWidth 撑满全屏
+        modifier = Modifier.widthIn(min = 168.dp, max = 232.dp),
         level = GlassLevel.Hi,
         shape = RoundedCornerShape(R.Card14.dp),
         // 下拉列表浮在设置行**之上**，是真正的悬浮层 → Hi 档（描边 + 顶线全保留），
-        // 与面板同一逻辑。不加 scrim：它下面就是设置页本身，不需要压透字。
+        // 与面板同一逻辑。
+        //
+        // ## 必须传 scrim（模拟器全量测试发现的透字缺陷，2026-11-08）
+        //
+        // 初版这里没传 scrim，注释写的是「它下面就是设置页本身，不需要压透字」——
+        // 这个判断是错的。实测下拉展开时，下层设置行文字（「动效强度」「过渡动画的快慢…」）
+        // 直接透上来与列表项文字重叠，可读性明显受损。
+        //
+        // 错在哪：本项目自己那套 `chromeScrim` 的推导结论就是「haze blur 生效 ≠ 透字不可辨，
+        // 必须靠 scrim 压对比」。而下拉浮层比 chrome **更需要**它——chrome 压的是滚动列表，
+        // 下拉压的是**同样带文字的设置行**，两者都是高对比文字，叠加后字形互相干扰。
+        //
+        // 用 `chromeScrim` 同一档：语义都是「悬浮在别的内容之上、需要压掉背景文字」。
+        // 不新开 token，因为这正是 chromeScrim 定义要解决的场景。
+        blur = GlassLevel.Hi,
+        scrim = glass.chromeScrim,
     ) {
         Column(Modifier.padding(vertical = 6.dp)) {
             options.forEach { option ->
