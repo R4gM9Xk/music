@@ -41,6 +41,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -67,7 +68,6 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.lerp
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -98,6 +98,7 @@ import com.local.music.core.ui.state.RestoreReport
 import com.local.music.core.ui.state.ThemeMode
 import com.local.music.core.ui.state.restoreReportMessage
 import com.local.music.core.ui.theme.GlassMotion
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LibraryOrigin
 import com.local.music.core.ui.theme.LocalLibraryOrigin
 import com.local.music.core.ui.theme.GlassTheme
@@ -858,8 +859,20 @@ fun GlassApp() {
                 val playerOpen = state.screen == GlassScreen.Player
                 val baseScreen = if (playerOpen) state.playerOrigin else state.screen
                 // 下层随播放页升起而后退，营造纵深（0 = 正常，1 = 完全后退）
+                //
+                // **退出飞行期间提前回稳**（衔接修复①）：旧实现只看 playerOpen，而收起时
+                // playerOpen 要等飞行跑到 t≤0.15 才翻 false —— 于是 500ms 飞行的最后
+                // ~165ms（迷你条真身淡入窗口）里，真身仍被压在 0.962~0.989 的缩放里，
+                // 替身却稳稳落在 unscaleMini 还原出的 1.0 几何上：双影错位最宽可达 ~14px，
+                // 落地后底栏还要再花 ~245ms 才「长」到 1.0，观感就是落地那一下「顿一下再撑开」。
+                // 把 phase != Exiting 并入条件：点收起即开始回稳，420ms 回稳与 500ms 飞行
+                // 并行，进入 12% 落地窗口时缩放已到 ~0.998（错位 <1px），且「背景随收起前移」
+                // 的纵深叙事也更连贯。
+                // 中止路径安全：abort()/忙时中止都会把 phase 立刻置 Idle → 条件回退为
+                // playerOpen（仍是 1f），不会出现「播放页还开着但背景已复原」的跳变。
+                val recededForExit = flight.phase == PlayerFlight.Phase.Exiting
                 val recede by animateFloatAsState(
-                    targetValue = if (playerOpen) 1f else 0f,
+                    targetValue = if (playerOpen && !recededForExit) 1f else 0f,
                     animationSpec = GlassMotion.tweenSheet(),
                     label = "playerRecede",
                 )
@@ -906,7 +919,22 @@ fun GlassApp() {
                         )
                         .trackFlight(FlightKeys.AppRoot, keepOnDispose = true),
                 ) {
-                    AuroraBackground()
+                    // 根层极光（视觉审计 D4 / 增-P2-B）：播放页完全盖住它之后停表。
+                    //
+                    // 改前：播放页覆盖层自带一份极光（见下方 playerOpen 分支），根层这份
+                    // 被完全遮住却仍在逐帧重绘三条 infinite tween——纯浪费 GPU。
+                    // 现在按 recede 门控：稳态全开/全关时单份极光在跑，420ms 过渡期两份
+                    // 并存（softAlpha 交叉淡化需要下面那份真的在动，否则过渡看起来是静止的）。
+                    //
+                    // **recede 不能直接进组合期读**：它是 animateFloatAsState 的值，每帧变，
+                    // 直接 `if (recede < 1f)` 会让整个 GlassApp（含曲库列表/Chrome/覆盖层）
+                    // 在 420ms 内逐帧重组——这正是本文件压暗层注释里点名的错误写法。
+                    // 用 derivedStateOf 把连续值折成**布尔**：只有「走满 1f」那一刻结果才变，
+                    // 组合期只重组两次（开、关），过渡期零额外重组。
+                    val rootAuroraVisible by remember { derivedStateOf { recede < 1f } }
+                    if (rootAuroraVisible) {
+                        AuroraBackground()
+                    }
 
                     // 后退层：内容 + chrome 一起随播放页升起而后退（缩放由 recede 驱动）。
                     // hazeSource 的父层被缩放会让模糊采样产生约 4% 偏移，只在 420ms 过渡期存在
@@ -932,12 +960,14 @@ fun GlassApp() {
                                 .graphicsLayer { alpha = flight.baseContentAlpha() },
                         ) {
                             if (!state.librarySettled) {
-                                // 启动收敛中（曲库缓存/首扫未到）：不渲染任何演示内容
+                                // 启动收敛中（曲库缓存/首扫未到）：不渲染任何演示内容。
+                                // 视觉审计 B1/E2：这是「首帧用户看到的唯一文字」，用 Caption 档
+                                // 而不是 12sp 裸值——它是状态说明，不该比正式内容更轻也不该更重
                                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                     Text(
                                         "正在整理曲库…",
                                         color = LocalGlassColors.current.textSecondary,
-                                        fontSize = 12.sp,
+                                        style = GlassText.Caption,
                                     )
                                 }
                             } else AnimatedContent(
@@ -1259,13 +1289,22 @@ fun GlassApp() {
                             .padding(top = 8.dp)
                             .fillMaxWidth(),
                     ) {
-                        // 文件 IO 结果提示（D2/D3：导出/导入/备份恢复）：4s 自动消退
+                        // 文件 IO 结果提示（D2/D3：导出/导入/备份恢复）：4s 自动消退。
+                        // 视觉审计 E2：按消息内容判档——失败类给 Error 色条，
+                        // 成功类保持中性。判据用消息前缀（横幅的唯一数据源就是这一条 String，
+                        // 为它引入结构化状态会牵动 8 个写入点；而中文失败文案在本工程是
+                        // 统一的「X 失败：原因」句式，前缀判据与实际语义一致）。
                         ioMessage?.let { message ->
                             LaunchedEffect(message) {
                                 delay(4000)
                                 ioMessage = null
                             }
-                            TopBanner(message, maxLines = 3) { ioMessage = null }
+                            TopBanner(
+                                message,
+                                maxLines = 3,
+                                onClick = { ioMessage = null },
+                                tone = if (message.contains("失败")) BannerTone.Error else BannerTone.Neutral,
+                            )
                         }
                         // 备份恢复的 re-match 报告（P0-5 B）：冷启动/后台恢复也可能产生
                         // （备份文件恢复那条路径已经就地消费掉了自己的报告，走到这里的一般
@@ -1278,9 +1317,17 @@ fun GlassApp() {
                                 delay(9000)
                                 state.consumeRestoreReport()
                             }
-                            TopBanner(restoreReportMessage(report), maxLines = 3) {
-                                state.consumeRestoreReport()
-                            }
+                            // 恢复报告里有「N 首未找到」这类坏消息时给 Error 档——
+                            // 但注意它是**信息性**的（「12 首未找到」不等于操作失败，
+                            // 是换设备/删歌后的正常结果），所以只有措辞里带「失败」才升档，
+                            // 未找到仍保持中性。这就是为什么判据不是「有坏消息」而是「操作失败」。
+                            val text = restoreReportMessage(report)
+                            TopBanner(
+                                text,
+                                maxLines = 3,
+                                onClick = { state.consumeRestoreReport() },
+                                tone = if (text.contains("失败")) BannerTone.Error else BannerTone.Neutral,
+                            )
                         }
                         // 播放错误提示条（4s 自动消退，点击关闭）
                         state.playbackError?.let { message ->
@@ -1289,7 +1336,13 @@ fun GlassApp() {
                                 state.dismissPlaybackError()
                             }
                             if (ioMessage != null) Spacer(Modifier.height(6.dp)) // 两条并存才需要间距
-                            TopBanner(message, maxLines = 2) { state.dismissPlaybackError() }
+                            TopBanner(
+                                message,
+                                maxLines = 2,
+                                onClick = { state.dismissPlaybackError() },
+                                // 这条通道只有错误语义（引擎失败/读取媒体库失败），恒 Error
+                                tone = BannerTone.Error,
+                            )
                         }
                     }
 
@@ -1312,6 +1365,17 @@ private const val RecedeScale = 0.96f
  * 顶部单条玻璃提示（IO 结果 / 播放错误 / 备份恢复报告共用）：样式单点定义，避免多条各写
  * 一份后漂移。
  *
+ * **状态语义（视觉审计 E2）**：改前成功/失败/错误共用同一套 Hi 玻璃 + 13sp 白字，
+ * 「备份已导出」和「恢复失败：文件无法解析」长得一模一样——错误信息混在成功提示里，
+ * 用户扫一眼根本不会停下来读。现在加 [tone] 分两档：
+ * - [Tone.Neutral]：确认类（已导出/已删除/恢复报告）。保持原观感。
+ * - [Tone.Error]：失败类。左缘加一条 3dp 的 destructive 色条。
+ *
+ * 为什么用「左缘色条」而不是整块染红/加红色边框：整块染红会把玻璃变成告警条（廉价感，
+ * 且深色模式红底上白字对比反而更差）；红色边框则与玻璃描边打架、四个角都在喊。
+ * 左缘一条 3dp 竖条是**最低成本的语义标记**——它不改变底色的通透，只在视觉扫描路径
+ * （左对齐阅读的起点）上给一个「这条不一样」的信号，成熟系统通知条普遍这么做。
+ *
  * 读屏（无障碍 P0-4）：这个横幅是**可点的**（点击关闭），但 GlassSurface 内部只走
  * combinedClickable，不带 role——读屏会把 [message] 当成一整段文字念完就过去，
  * 盲用户既不知道它可点、也不知道点了会怎样。补 role = Button 与 onClick 的标签
@@ -1321,8 +1385,16 @@ private const val RecedeScale = 0.96f
  * 内容（播放错误原因、备份恢复了几首）吞掉——而内容才是这条横幅的全部价值。
  * 用 onClick(label=...) 的方式追加动作名，才能既保留内容又表达可点性。
  */
+private enum class BannerTone { Neutral, Error }
+
 @Composable
-private fun TopBanner(message: String, maxLines: Int, onClick: () -> Unit) {
+private fun TopBanner(
+    message: String,
+    maxLines: Int,
+    onClick: () -> Unit,
+    tone: BannerTone = BannerTone.Neutral,
+) {
+    val glass = LocalGlassColors.current
     GlassSurface(
         modifier = Modifier
             .fillMaxWidth()
@@ -1339,11 +1411,29 @@ private fun TopBanner(message: String, maxLines: Int, onClick: () -> Unit) {
         shape = RoundedCornerShape(R.Card14.dp),
         onClick = onClick,
     ) {
+        // 左缘语义色条：只在 Error 档画。
+        //
+        // **必须用 matchParentSize() 而不是 fillMaxHeight()**：GlassSurface 是
+        // `Box(modifier, content)`，高度由子元素撑开（wrap content）。fillMaxHeight 会去
+        // 填充父约束的 maxHeight（可能是整屏高），把横幅撑成一大块；而 matchParentSize
+        // 的参与者在测量阶段被忽略、最后按父（=Text 撑出的）实际尺寸放置——这正是要的。
+        // 画完后由 GlassSurface 的 clip(shape) 裁掉左端的圆角，色条自然贴合胶囊轮廓。
+        if (tone == BannerTone.Error) {
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .drawBehind {
+                        drawRect(
+                            color = glass.destructive,
+                            size = androidx.compose.ui.geometry.Size(3.dp.toPx(), size.height),
+                        )
+                    },
+            )
+        }
         Text(
             message,
-            color = LocalGlassColors.current.textPrimary,
-            fontSize = 13.sp,
-            lineHeight = 18.sp, // GlassType.LHBody：横幅最多两行，行间归 body 档
+            color = glass.textPrimary,
+            style = GlassText.Body,
             maxLines = maxLines,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),

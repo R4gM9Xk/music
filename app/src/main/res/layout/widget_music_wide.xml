@@ -53,12 +53,8 @@
             android:singleLine="true"
             android:ellipsize="end"
             android:textColor="#FFFFFFFF"
-            android:textSize="14sp"
-            android:textStyle="bold"
-            android:shadowColor="#80000000"
-            android:shadowDx="0"
-            android:shadowDy="1"
-            android:shadowRadius="2" />
+            android:textSize="15sp"
+            android:textStyle="bold" />
 
         <!-- 横条版把这个 TextView 常驻 GONE，标题与艺术家拼成一行（见 bindWide）。
              仍然要声明：4x1 在窄宽时会被当成 square 布局复用同一套 id 查找，
@@ -90,7 +86,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:textColor="#80FFFFFF"
-            android:textSize="10sp"
+            android:textSize="11sp"
             android:visibility="gone" />
     </LinearLayout>
 

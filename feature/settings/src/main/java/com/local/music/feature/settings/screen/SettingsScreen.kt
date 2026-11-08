@@ -57,6 +57,7 @@ import com.local.music.core.ui.state.sleepTimerSubtitle
 import com.local.music.core.ui.state.virtualizerSubtitle
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassMotion
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.GlassIntensity
 import com.local.music.core.ui.theme.MotionIntensity
 import com.local.music.core.ui.theme.LocalGlassColors
@@ -173,14 +174,16 @@ fun SettingsScreen(
             // P1-②：快照读取失败时的显式横幅。放在最顶部——它是「本页所有改动都不会保存」
             // 这种状态的前提，藏在任一分组下面都会让人先改了再发现白改。
             // A3-07：横幅出现/消失走展开+渐变——旧实现 if 硬切，页首内容一帧被顶开/塌缩
+            // 增-P2-C：expand/shrink 原来用裸 tween(GlassMotion.Page, Curve) ——**没乘动效强度
+            // 乘数**（GlassMotion.scale），而同一次转场里的 fade 用的是 tweenPage()（按档缩放）。
+            // 后果：选「增强」档时 expand 360ms 固定、fade 504ms，两者不同步收束，展开到位前
+            // 文字已经全显/全隐，观感是「方框先动、内容抢跑」。同一转场必须同一个 token。
             androidx.compose.animation.AnimatedVisibility(
                 visible = corruptSnapshot,
-                enter = androidx.compose.animation.expandVertically(
-                    androidx.compose.animation.core.tween(GlassMotion.Page, easing = GlassMotion.Curve),
-                ) + androidx.compose.animation.fadeIn(GlassMotion.tweenPage()),
-                exit = androidx.compose.animation.shrinkVertically(
-                    androidx.compose.animation.core.tween(GlassMotion.Page, easing = GlassMotion.Curve),
-                ) + androidx.compose.animation.fadeOut(GlassMotion.tweenPage()),
+                enter = androidx.compose.animation.expandVertically(GlassMotion.tweenPage()) +
+                    androidx.compose.animation.fadeIn(GlassMotion.tweenPage()),
+                exit = androidx.compose.animation.shrinkVertically(GlassMotion.tweenPage()) +
+                    androidx.compose.animation.fadeOut(GlassMotion.tweenPage()),
             ) {
                 SectionHeader("设置未保存")
                 SettingsCard {
@@ -206,7 +209,9 @@ fun SettingsScreen(
             SettingsCard {
                 // 整行可点 + 内层开关双通道（GlassToggle 的 clickable 在内层会消费，不会双触发）
                 SettingRow(
-                    GlassIcons.Wave, "跟随封面取色",
+                    // A5 图标语义：取色这件事的**来源是封面**——唱片（Disc）一眼指向「封面」，
+                    // 而 Wave 已被整组音效占用，取色再用它等于两件不同的事共用一个符号
+                    GlassIcons.Disc, "跟随封面取色",
                     // P2-6：副标题必须与三态真相一致——自定义色存在时封面取色被短路，开关说了不算
                     if (state.customSeedArgb != null) "已被自定义主题色覆盖（点上方主题色可恢复）" else "极光背景取自当前专辑封面",
                     onClick = { state.applyFollowCover(!state.followCover) },
@@ -215,7 +220,10 @@ fun SettingsScreen(
                 RowDivider()
                 // F2 自定义主题色：三态（自定义 > 跟随封面 > 品牌靛紫），选中即生效
                 SettingRow(
-                    GlassIcons.Wave, "主题色",
+                    // A5 图标语义：主题色是**用户手动指定**的颜色（10 色预设 + 可自定义），
+                    // 用铅笔表达「自己动手改」，与上一行「跟随封面」的自动取色（Disc）形成
+                    // 自动 vs 手动的对照。原 Wave 与整组音效撞车，且与上一行同名同形
+                    GlassIcons.Edit, "主题色",
                     when {
                         state.customSeedArgb != null -> "自定义颜色（点击更换）"
                         // P3-9/P2-2：不虚标「可改为自定义」——只有预设色板，如实说
@@ -231,10 +239,12 @@ fun SettingsScreen(
                                     palette = previewSeed?.let { AuroraPalette.fromSeed(it) } ?: state.palette,
                                 )
                                 Spacer(Modifier.height(16.dp))
+                                // A1 字号 token：本节小标题与全 App 分组标题同档（12sp + 0.3 字距）——
+                                // 层级靠**字距**表达而不是靠一个游离的 12sp 裸值；颜色仍是 tertiary 保持弱层级
                                 Text(
                                     "预设色板",
+                                    style = GlassText.SectionLabel,
                                     color = LocalGlassColors.current.textTertiary,
-                                    fontSize = 12.sp,
                                     modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
                                 )
                                 ThemeColorSwatches(
@@ -266,13 +276,17 @@ fun SettingsScreen(
                 )
                 RowDivider()
                 SettingRow(
-                    GlassIcons.Book, "玻璃强度", "${state.glassLevel.label}（可改通透 / 浓郁）",
+                    // A5 图标语义：三条音效链之外，「玻璃强度」是**外观档位**设置，
+                    // 用齿轮表达「设置项」；原 Book 是文档语义，与下方崩溃日志/版本行混淆
+                    GlassIcons.Gear, "玻璃强度", "${state.glassLevel.label}（可改通透 / 浓郁）",
                     onClick = {
                         modal.show {
                             ModalSheet(modal, "玻璃强度") {
                                 GlassIntensity.entries.forEach { level ->
                                     SheetAction(
-                                        icon = GlassIcons.Book,
+                                        // 面板项沿用行图标的「档位设置」语义（Gear），
+                                        // 让用户从行到面板看到同一个符号，不必重新认一遍
+                                        icon = GlassIcons.Gear,
                                         label = level.label,
                                         subtitle = when (level) {
                                             GlassIntensity.Transparent -> "填充与描边减淡，更通透"
@@ -331,12 +345,18 @@ fun SettingsScreen(
                 // E2：自启动引导（仅国产激进省电 ROM 提供，subtitle 为 null 即不显示）
                 if (autoStartGuideSubtitle != null) {
                     SettingRow(
-                        GlassIcons.Wave, "自启动与后台运行", autoStartGuideSubtitle,
+                        // A5 图标语义：自启动/后台保活是**系统行为**开关（受 ROM 省电策略支配），
+                        // 与音效无关；齿轮表达「系统设置」。原 Wave 让它看起来像一个音效选项，
+                        // 而它就排在均衡器正上方——两项视觉上完全无法区分（本轮的核心问题）
+                        GlassIcons.Gear, "自启动与后台运行", autoStartGuideSubtitle,
                         onClick = onAutoStartGuide,
                     )
                     RowDivider()
                 }
                 SettingRow(
+                    // A5 图标语义：均衡器保留 Wave —— 它本来就是一条频响曲线，
+                    // 是 Wave 这个符号**唯一名副其实**的用法。同时它是下方三条音效链的
+                    // 组头，Wave 在这里代表「整组音效」这一族
                     GlassIcons.Wave, "均衡器", state.eqPreset.label,
                     onClick = {
                         modal.show {
@@ -362,6 +382,12 @@ fun SettingsScreen(
                 // 为什么这三项放在「均衡器」下面：它们是同一类东西（都挂播放器音频会话的
                 // audiofx），用户的心智模型是「音效」一组。也正因为它们会改变听感，
                 // 三项**默认全关**，与上面 EQ 默认「关闭」保持一致口径。
+                //
+                // A5 图标语义（本轮唯一的**有意复用**）：这三项与上面的均衡器共用 Wave。
+                // 复用在这里是对的而不是偷懒——它们确实是一族（同一 audiofx 会话、同一种
+                // 「改变听感」的效果），同一符号反而把「这是同一组音效」说清楚了；
+                // 真正要修的是**跨语义**复用（取色/自启动/桌面歌词/文件访问此前也都用 Wave），
+                // 那些已在本轮各自拆走。
                 SettingRow(
                     GlassIcons.Wave, "响度归一", loudnessNormSubtitle(state.audioFx),
                     onClick = { state.setLoudnessNorm(!state.audioFx.loudnessNorm) },
@@ -460,6 +486,9 @@ fun SettingsScreen(
                 )
                 RowDivider()
                 SettingRow(
+                    // A5 图标语义：定时关闭到点后是「睡着」——月亮直接对应夜间/入睡场景；
+                    // 与同组音效的 Wave、系统项的 Gear 区分开。下方档位面板沿用同一枚，
+                    // 让「行 → 面板」保持同一个符号（用户不必重新认一遍）
                     GlassIcons.Moon, "定时关闭", sleepSubtitle,
                     onClick = {
                         modal.show {
@@ -484,6 +513,8 @@ fun SettingsScreen(
                 )
                 RowDivider()
                 SettingRow(
+                    // A5 图标语义：歌词是「唱出来的字」，Mic 的发声语义贴它；
+                    // 与音效族的 Wave、系统档的 Gear 都拉开
                     GlassIcons.Mic, "歌词", "优先读取本地 .lrc 歌词文件",
                     onClick = { state.lyricEnabled = !state.lyricEnabled },
                     trailing = { GlassToggle(state.lyricEnabled, onToggle = { state.lyricEnabled = it }) },
@@ -493,7 +524,11 @@ fun SettingsScreen(
                 // 权限判定整个在 app 层的 [onDesktopLyricsEnabledChange] 里做：
                 // 未授权时它不真正开开关、而是跳系统授权页——本屏不需要知道 canDrawOverlays
                 SettingRow(
-                    GlassIcons.Wave, "桌面歌词",
+                    // A5 图标语义：桌面歌词 = 悬浮在**桌面（Home 屏）**上的一行字，
+                    // Home 的房子直接表达「出现在桌面上」；比建议的 Mic 更好——
+                    // Mic 已给「歌词」（本地 .lrc 是唱出来的字），两行同为歌词但一个是
+                    // 应用内一个是桌面悬浮，必须用不同符号区分开启范围
+                    GlassIcons.Home, "桌面歌词",
                     if (desktopLyricsEnabled) "播放中显示悬浮歌词，可拖动" else "未开启 · 需悬浮窗权限",
                     onClick = { onDesktopLyricsEnabledChange(!desktopLyricsEnabled) },
                     trailing = { GlassToggle(desktopLyricsEnabled, onToggle = onDesktopLyricsEnabledChange) },
@@ -584,7 +619,10 @@ fun SettingsScreen(
                 )
                 RowDivider()
                 SettingRow(
-                    GlassIcons.Book, "歌词文件访问",
+                    // A5 图标语义：这一行要的是**文件访问授权**（MANAGE_EXTERNAL_STORAGE，
+                    // 去下载目录读 .lrc），主体是「文件系统」而不是「歌词内容」，
+                    // 所以归入同组 Folder 的「目录/文件」家族；原 Book 与日志/版本行混淆
+                    GlassIcons.Folder, "歌词文件访问",
                     if (allFilesGranted) "已授权 · 点击重新扫描歌词" else "未授权 · 点击去授权（读取下载目录等歌词）",
                     onClick = onAllFilesAccess,
                 )
@@ -701,8 +739,7 @@ fun SettingsScreen(
                                         Text(
                                             current.changelog,
                                             color = LocalGlassColors.current.textSecondary,
-                                            fontSize = 13.sp,
-                                            lineHeight = 18.sp, // GlassType.LHBody：旧 20sp=1.54× 超出 1.27–1.4 规范区间
+                                            style = GlassText.Body,
                                             modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
                                         )
                                     }
@@ -715,7 +752,8 @@ fun SettingsScreen(
                                             } else {
                                                 "下载中 ${(current.progress * 100).toInt()}%，完成后自动打开安装程序"
                                             },
-                                            color = LocalGlassColors.current.textTertiary, fontSize = 11.sp, lineHeight = 14.sp, // GlassType.LHMicro
+                                            color = LocalGlassColors.current.textTertiary,
+                                            style = GlassText.Micro,
                                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
                                         )
                                     } else {

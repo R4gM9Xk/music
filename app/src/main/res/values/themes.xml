@@ -1,7 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+      启动窗背景（视觉审计 F3）。
+
+      改前是 @android:color/black：冷启动第一帧是纯黑，随后 Compose 首帧铺开极光
+      （deep2 ≈ #0E0A20 系），观感是一次「黑闪 → 突然有颜色」的跳变。
+      改后取品牌靛紫深色端（GlassPalettes.Purple.deep2 = #0E0A20）的近似值：
+      纯黑到深紫的差值在 16ms 内几乎不可辨，启动看起来是「从暗处浮现」而不是「黑屏后点亮」。
+
+      为什么不直接用 @color 引用 Compose 里的调色板：Compose 的 Color 常量在 Kotlin 侧，
+      资源 XML 无法引用；而本 App 支持「跟随封面取色」——启动瞬间还不知道会是什么颜色，
+      所以只能取**品牌默认色**（未取色前的兜底）作为最不突兀的起点。浅色模式用户会看到
+      深紫 → 近白的一次过渡，但浅色是持久化设置、读取发生在首帧之后，无法在 windowBackground
+      阶段解决；深色是默认态（ThemeMode.Dark 为初值），所以这里按深色优化。
+    -->
     <style name="Theme.ColorOSMusic" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowBackground">#FF0E0A20</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">false</item>

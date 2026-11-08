@@ -96,9 +96,43 @@ class DesktopLyricsController(private val appContext: Context) {
             if (view != null) {
                 val posSec = positionMsProvider() / 1000f
                 val text = currentLineText(posSec)
+                // **lastText 只在文字真的写进 View 之后才更新**（见下方 endAction）。
+                //
+                // 这是一个真实踩过的坑：最初把 `lastText = text` 放在动画启动**之前**，
+                // 结果 fast-forward 一行接着一行（快歌 / 用户拖进度条）时——
+                //   ① tick 启动淡出动画（alpha→0，90ms 后 endAction 里 setText）
+                //   ② 90ms 未到，下一次 tick 又把新 text 判为「变了」，调用 animate().cancel()
+                //   ③ cancel 会**丢弃尚未执行的 endAction** → setText 从未发生
+                //   ④ 而 lastText 早已等于这一句 → 后续 tick 全部判定「无变化」而跳过
+                // 最终表现：悬浮窗**永久停在上上句，而且 alpha 卡在 0（整窗看不见）**。
+                // 只有重启 App 或重新 show 才能恢复——是最难排查的那类「偶发但不自愈」。
+                //
+                // 正确做法是让 lastText 成为「**已经渲染**的那句」而不是「正在尝试渲染的那句」：
+                // 动画被打断时 lastText 仍是旧值，下一次 tick 自然重试，最坏情况只是
+                // 少一次淡入过渡，绝不会丢内容或卡透明度。
                 if (text != lastText) {
-                    lastText = text
-                    view.text = text
+                    val sameView = { lyricView === view }
+                    // ── 行切换过渡（视觉审计 F1 / 增-P3-4）──
+                    // 改前 setText 硬切：桌面上逐行歌词「啪」地换字，与 App 内播放页
+                    // 歌词的 500ms 柔和滚动完全两种语言。悬浮窗里做不到 Compose 的
+                    // AnimatedContent，但「先淡出 → 换字 → 淡入」的成本几乎为零。
+                    //
+                    // 为什么不对称（90ms 出 / 120ms 入）：淡出要**快**，否则旧行还在屏幕上
+                    // 赖着不走、与新行的语义冲突；淡入可以稍缓，用户刚看清新行时不会觉得跳。
+                    //
+                    // 为什么用 ViewPropertyAnimator 而不是 ValueAnimator：前者自带
+                    // 硬件层优化与生命周期取消，且这里只要 alpha 一条曲线。
+                    view.animate().cancel() // 不叠加两条动画：后者的 endAction 会与前者抢 setText
+                    view.animate().alpha(0f).setDuration(90).withEndAction {
+                        // 快速切歌/关窗时 lyricView 已被替换或置空：此时 setText 会打到
+                        // 已移除的视图上（无害但无意义），且不该再更新 lastText——保持旧值
+                        // 让下一次 tick 在新视图上重试
+                        if (sameView()) {
+                            view.text = text
+                            lastText = text // ← 唯一更新点：文字真的上屏了才认账
+                            view.animate().alpha(1f).setDuration(120).start()
+                        }
+                    }.start()
                 }
                 // 路径被外部改变（引擎重建等）：重读一次，保证歌词跟得上曲目
                 val path = currentTrackPathProvider()
@@ -124,8 +158,31 @@ class DesktopLyricsController(private val appContext: Context) {
                 text = "♪ 暂无歌词"
                 textSize = 16f
                 setTextColor(0xFFFFFFFF.toInt())
-                setBackgroundColor(0x66000000) // 半透明黑底：任意壁纸可读、可拖开
-                setPadding(24, 12, 24, 12)
+                // ── 视觉一致性（视觉审计 F1）──
+                // 改前是裸 TextView：直角 + 0x66000000 纯黑底 + px 单位的 padding。
+                // 它悬浮在**桌面**上，用户每看一眼都在把它和 App 内的玻璃做对照，
+                // 直角黑块与「液态玻璃」的语言完全断裂。
+                //
+                // 现在：圆角胶囊（14dp，对齐 R.Card14 的视觉重量；悬浮小条不宜用 28dp 大圆角）
+                // + 与 chromeScrim 同族的深底（#1A1A24，App 内迷你条/导航栏用的就是它）
+                // + 细描边制造「玻璃边缘」的暗示（桌面壁纸不可控，必须给边缘定义，
+                //   否则浅色壁纸下这个深块会变成一块说不清来路的墨迹）。
+                //
+                // 注意：悬浮窗**不能用 Compose**——它跑在服务进程里、没有 ComposeView 宿主，
+                // 且每次显示都重建 View 树，用 ComposeView 需要额外搭 Recomposer 与生命周期，
+                // 成本远超一个 GradientDrawable。这里是「用平台 API 模仿应用语言」，
+                // 不追求 realtime blur（WindowManager 悬浮窗做背景模糊需要 RenderEffect +
+                // 逐帧采样壁纸，权限与功耗都不可接受）。
+                val density = appContext.resources.displayMetrics.density
+                fun dp(v: Int) = (v * density).toInt()
+                val bg = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                    cornerRadius = dp(14).toFloat()
+                    setColor(0xE61A1A24.toInt()) // #1A1A24 @ 90%：比 App 内 chromeScrim 略实，桌面壁纸不可控
+                    setStroke(dp(1), 0x33FFFFFF) // 白 20% 细描边：给深块一个「玻璃边缘」
+                }
+                background = bg
+                setPadding(dp(18), dp(10), dp(18), dp(10))
                 // 拖动 + 位置持久化：松手/拖动中把 x/y 写回应用私有目录的小 JSON
                 //（DesktopLyricsPrefs），下次 show 恢复到用户拖后的位置（见 restorePosition）
                 setOnTouchListener(

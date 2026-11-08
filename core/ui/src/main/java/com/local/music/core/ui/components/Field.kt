@@ -33,6 +33,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.theme.GlassIcons
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.auroraAccentColor
@@ -82,7 +83,7 @@ fun GlassTextField(
                     value = value,
                     onValueChange = onValueChange,
                     singleLine = true,
-                    textStyle = TextStyle(color = LocalGlassColors.current.textPrimary, fontSize = 15.sp),
+                    textStyle = GlassText.Row.copy(color = LocalGlassColors.current.textPrimary),
                     // 光标强调色用 auroraAccentColor()（浅色回退 seed）：seed3 过浅在浅色下近不可见
                     cursorBrush = SolidColor(auroraAccentColor()),
                     keyboardOptions = KeyboardOptions(imeAction = imeAction), // P3-76：不再硬编码 Search
@@ -105,7 +106,7 @@ fun GlassTextField(
                                 Text(
                                     hint,
                                     color = LocalGlassColors.current.textSecondary,
-                                    fontSize = 15.sp,
+                                    style = GlassText.Row,
                                     maxLines = 1,
                                     modifier = Modifier.graphicsLayer { alpha = hintAlpha },
                                 )

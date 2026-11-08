@@ -49,6 +49,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -57,13 +58,12 @@ import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import com.local.music.core.ui.theme.GlassMotion
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.LocalThemeFraction
@@ -371,7 +371,9 @@ fun GlassSheet(
                         // 不另造一份文案（避免界面与读屏两个来源）。
                         .semantics { paneTitle = title },
                     level = GlassLevel.Md,
-                    shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                    // C4：面板顶部圆角改用 R.Player28 常量（原裸写 28.dp）。
+                    // 底部两角为 0：面板贴在屏幕底边，圆角在那里没有可见意义。
+                    shape = RoundedCornerShape(topStart = R.Player28.dp, topEnd = R.Player28.dp),
                     blur = GlassLevel.Md,
                 ) {
                     // 模态面板是最高层级：在玻璃压底之上再加一层近不透明内衬（深浅主题各配，
@@ -398,18 +400,48 @@ fun GlassSheet(
                                 .clip(RoundedCornerShape(2.dp))
                                 .background(LocalGlassColors.current.textTertiary.copy(alpha = 0.55f)),
                         )
+                        // B1 标题层级倒挂修复：原为 12sp + textSecondary，比面板内的 15sp
+                        // 动作行**还弱**——用户第一眼读到的是菜单项而不是「这个面板是什么」。
+                        // 改 Heading（16 SemiBold）+ textPrimary：面板标题 > 动作行 > 段头，
+                        // 三档单调递减，层级才成立。段头（SectionLabelMicro）保持 textTertiary
+                        // 不动——它是第三档，模糊掉它反而会让面板重新变吵。
                         Text(
                             title,
-                            color = LocalGlassColors.current.textSecondary,
-                            fontSize = 12.sp,
+                            style = GlassText.Heading,
+                            color = LocalGlassColors.current.textPrimary,
                             modifier = Modifier
                                 .align(Alignment.CenterHorizontally)
                                 .padding(top = 10.dp, bottom = 6.dp),
                         )
+                        // E5 面板高度：固定 420dp → 屏幕高度的 65%。
+                        //
+                        // 为什么不再用固定值：420dp 在小屏（≈640dp 高）上占 66%、在
+                        // 一加13 这类 900+dp 大屏上只占 46%——同一个面板在大屏上「显得局促」
+                        // 而小屏上「几乎铺满」，面板的呼吸感随设备漂移。按屏高取比例后，
+                        // 「面板占屏幕多少」这个观感在设计上是常量。
+                        //
+                        // **下限 280dp 是必须的**：横屏时 screenHeightDp 只剩 360–420dp，
+                        // 纯 65% 会算出 234–273dp，长队列（几百首）就只能在一条窄缝里滚动。
+                        // 280dp 保证横屏下至少露出约 4 行，队列面板仍然可用。
+                        //
+                        // **不需要再手写上限**：外层 Column 在测量非 weight 子项时会递减
+                        // 剩余空间（把手 4 + 标题 38 已占用，另有 navigationBarsPadding 与
+                        // 内边距先行扣减），把「剩余可用高度」作为 mainAxisMax 传给本列。
+                        // 于是横屏极小屏（360dp）上 280dp 会被父约束自动压到约 244dp，
+                        // 面板不会被顶穿、也不会被 GlassSurface 的 clip 裁掉。
+                        // 换句话说：**下限表达「别太矮」，上限由布局本身负责**——
+                        // 手写 `coerceAtMost(screenHeight - 骨架)` 与父约束效果等价，
+                        // 只是多一处要跟着改的魔数（已按 920/640/420/360dp 逐项核算）。
+                        //
+                        // 顺序要求：heightIn 必须作用在滚动**视口**上（排在 verticalScroll
+                        // 之前）。反过来的话它约束的是滚动内容而不是视口，max 就不再是
+                        // 「面板最多多高」而是「内容最多多高」，语义和实际效果都变了。
+                        val screenHeight = LocalConfiguration.current.screenHeightDp
+                        val contentMaxHeight = (screenHeight * 0.65f).dp.coerceAtLeast(280.dp)
                         Column(
                             Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 420.dp)
+                                .heightIn(max = contentMaxHeight)
                                 .verticalScroll(scrollState),
                             content = content,
                         )
@@ -421,7 +453,8 @@ fun GlassSheet(
 }
 
 /**
- * 面板动作行：32dp 玻璃图标块 + 主副标题；emphasized = 选中态（强调色）。
+ * 面板动作行：32dp 玻璃图标块 + 主副标题；emphasized = 选中态（强调色）；
+ * destructive = 破坏性动作（警示色，标在不可撤销的删除/清空/放弃类动作上）。
  *
  * **读屏语义（无障碍 P0-4）**：这是全 App 所有菜单项的唯一渲染点——
  * SongActionsSheet（下一首播放/收藏/加入歌单/歌曲信息…）、CollectionActionsSheet
@@ -452,14 +485,25 @@ fun SheetAction(
     modifier: Modifier = Modifier,
     subtitle: String? = null,
     emphasized: Boolean = false,
+    destructive: Boolean = false,
 ) {
     val glass = LocalGlassColors.current
     val accent = auroraAccentColor()
+    // A4 破坏性动作色：destructive 的优先级**高于** emphasized。
+    // 两者语义互斥（一个是「推荐/开启」，一个是「不可撤销」），同时为 true 是调用方
+    // 表达冲突；此处选择让**风险信号**胜出——误把删除动作渲染成普通强调色的代价，
+    // 远大于误把强调动作渲染成警示色。加这个参数是为了让 ActionsSheet 的
+    // 「删除歌单 / 确认删除 / 从歌单移除」有统一入口，不必各自硬编码颜色。
+    val rowColor = when {
+        destructive -> glass.destructive
+        emphasized -> accent
+        else -> glass.textPrimary
+    }
     val interactionSource = remember { MutableInteractionSource() }
     Row(
         modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(R.Card14.dp))
             .pressScale(interactionSource, pressed = 0.98f)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
             // 语义挂在 clickable 同一个节点上（与 Chrome.MiniBarButton / PlayerScreen.ConsoleIcon
@@ -480,35 +524,40 @@ fun SheetAction(
             // 语义由同一行的 label/subtitle 承担（merge 后自动朗读），给了就是重复播报
             Icon(
                 icon, null, Modifier.size(18.dp),
-                tint = if (emphasized) accent else LocalGlassColors.current.textPrimary,
+                tint = rowColor,
             )
         }
         Column(Modifier.weight(1f)) {
+            // A1：15sp Medium 裸写 → Row（15 Medium 21），与列表行同档。
+            // 动作项不该比列表行更重（视觉审计 A1 的意图），层级靠行高与图标块撑。
             Text(
                 label,
-                color = if (emphasized) accent else LocalGlassColors.current.textPrimary,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
+                color = rowColor,
+                style = GlassText.Row,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
             if (subtitle != null) {
                 Spacer(Modifier.height(2.dp))
-                // subtitle 含路径/歌名拼接，窄屏会换行：补 LHMicro 行高
-                Text(subtitle, color = LocalGlassColors.current.textTertiary, fontSize = 11.sp, lineHeight = 14.sp)
+                // subtitle 含路径/歌名拼接，窄屏会换行。Micro 自带 LHMicro（14sp）行高，
+                // 原实现手写 lineHeight = 14.sp 正是 LHMicro 的值，改 token 后不必再写。
+                Text(subtitle, color = LocalGlassColors.current.textTertiary, style = GlassText.Micro)
             }
         }
     }
 }
 
-/** 段头小标签（队列面板内：已播放 / 正在播放），与行内文案左对齐 */
+/** 段头小标签（队列面板内：已播放 / 正在播放），与行内文案左对齐
+ *
+ *  A1：11sp + 0.3 字距的裸写 → `GlassText.SectionLabelMicro`，两者是完全相同的打包
+ *  （11 Normal / 14 行高 / 0.3 字距）。用 token 的意义在于「段头」这个语义从此有了名字：
+ *  下次有人想给面板加段头时，不必再去别处抄这三个数值。 */
 @Composable
 private fun SectionLabel(text: String) {
     Text(
         text,
         color = LocalGlassColors.current.textTertiary,
-        fontSize = 11.sp,
-        letterSpacing = 0.3.sp,
+        style = GlassText.SectionLabelMicro,
         modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 10.dp, bottom = 4.dp),
     )
 }
@@ -533,7 +582,6 @@ fun QueueSheet(
 ) {
     val scrollState = rememberScrollState()
     val density = LocalDensity.current
-    val accent = auroraAccentColor()
     val glass = LocalGlassColors.current
     // 定位数学全程 Float（A2-04）：rowPx/labelPx 先 toInt 再乘索引会让截断误差随行数
     // 线性放大（66dp×2.75 密度每行丢 0.5px，500 行 ≈250px≈1.4 行）——乘完再取整
@@ -568,7 +616,7 @@ fun QueueSheet(
             // 结果是一个孤立的「正在播放」标签 + 大片空白（曲库未装载/权限被拒时点队列即可见）。
             Text(
                 "队列是空的 · 去曲库挑一首开始播放",
-                color = glass.textTertiary, fontSize = 13.sp, lineHeight = 18.sp,
+                color = glass.textTertiary, style = GlassText.Body,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth().padding(vertical = 32.dp),
             )
@@ -596,14 +644,22 @@ fun QueueSheet(
         ) {
             Text(
                 "接下来 · $upcomingCount 首",
-                color = glass.textTertiary, fontSize = 11.sp, letterSpacing = 0.3.sp,
+                color = glass.textTertiary, style = GlassText.SectionLabelMicro,
             )
             Spacer(Modifier.weight(1f))
             if (upcomingCount > 0) {
                 val clearInteraction = remember { MutableInteractionSource() }
+                // A4 破坏性色：这里原来用 accent（auroraAccentColor）——
+                // 「清空接下来」会**不可撤销**地丢掉整个待播段，却与「全部播放」这类
+                // 常规动作用了同一个强调色，等于没有任何风险信号。
+                // 改读 glass.destructive（低饱和暖红，见 GlassColors.destructive 的推导）。
+                //
+                // 本轮范围说明：只改「清空接下来」这一处。删除歌单的确认行在
+                // ActionsSheet.kt（别人写域），那些调用点走 SheetAction 新增的
+                // `destructive = true` 形参；本文件只负责把参数实现出来。
                 Text(
                     "清空",
-                    color = accent, fontSize = 12.sp, fontWeight = FontWeight.Medium,
+                    color = glass.destructive, style = GlassText.CaptionMedium,
                     modifier = Modifier
                         .pressScale(clearInteraction, pressed = 0.92f)
                         .clickable(interactionSource = clearInteraction, indication = null, onClick = onClearUpNext)

@@ -70,6 +70,53 @@ class PlayerFlight(private val scope: CoroutineScope) {
     /** 进入飞行起点的导航胶囊选中项（覆盖层渐隐替身用） */
     var entryNavSelected by mutableStateOf(0)
 
+    /**
+     * 进入飞行时**底部 Chrome 是否由覆盖层代画导航胶囊**（衔接修复③）。
+     *
+     * 来自 tab 屏（曲库/歌单/设置）时，GlassApp 在 phase=Entering 期间把 Chrome 整块卸载，
+     * 屏内没有真胶囊 → 覆盖层必须画一份替身，否则胶囊凭空消失。
+     * 但来自详情/搜索时，那两屏**自带 GlassChrome**（屏内真胶囊），且它已被
+     * baseContentAlpha 乘掉一次 —— 覆盖层若再画一份，两枚半透明胶囊同位置叠加 =
+     * 胶囊偏亮、消退节奏不对（旧审计 P3-23）。此flag 让覆盖层只在**无人代画**时补位。
+     */
+    var entryNavOwnedByOverlay by mutableStateOf(true)
+        private set
+
+    /**
+     * 起飞瞬间的按压回弹接续（1 = 正常，<1 = 按压态）——衔接修复②。
+     *
+     * 迷你条是 GlassSurface(onClick)，自带 pressScale(.97)。点按的 up 事件同时触发
+     * 「beginEntry（Chrome 当帧卸载）」与「pressScale 回弹（.97→1，180ms）」：
+     * 真身连同回弹动画一起被卸载截断，替身按 scale=1 绘制 —— 用户看到迷你条从按压态
+     * **瞬跳**到全尺寸才起飞。这里让替身承接这段回弹：起飞瞬间从 .97 弹回 1，
+     * 与真实手感一致（Apple Music 同款「按下去的方向接着长」）。
+     *
+     * 只作用于进入方向；退出起点是点「收起」按钮，迷你条真身没有按压缩放。
+     */
+    val pressRecover = Animatable(1f)
+
+    /**
+     * [pressRecover] 是否已布防（snapTo(.97) 已落地）。
+     *
+     * 存在的唯一原因：`snapTo` 是 suspend，要到协程**第一次执行**才改值；而 beginEntry
+     * 是同步返回、同一帧就出画面。若这一帧直接读 [pressRecover]，读到的还是初始值 1f →
+     * 替身先闪一帧全尺寸、下一帧才缩回 .97 再弹起（比原来的「瞬跳」更难看）。
+     * 未布防期间 [pressScale] 直接返回按压值，与真身按下那一刻严格一致。
+     */
+    private var pressArmed by mutableStateOf(false)
+
+    /**
+     * 替身层应按的缩放（绘制期读，每帧取）：
+     * - 非进入方向 → 1（退出起点没有按压态；也天然免疫中止残留值）
+     * - 进入期未布防 → 按压值（首帧就位，不闪）
+     * - 进入期已布防 → 跟回弹动画
+     */
+    fun pressScale(): Float = when {
+        phase != Phase.Entering -> 1f
+        !pressArmed -> MINI_PRESS_SCALE
+        else -> pressRecover.value
+    }
+
     /** 进入飞行时的来源屏（退出飞行回到这里，而不是永远回曲库） */
     var entrySource by mutableStateOf<GlassScreen?>(null)
         private set
@@ -221,15 +268,29 @@ class PlayerFlight(private val scope: CoroutineScope) {
         songSnapshot = song
         entryNavSelected = navSelected
         entrySource = source
+        // 导航胶囊替身归属（衔接修复③）：只有 tab 来源才需要覆盖层补位。
+        // 详情/搜索屏自带 GlassChrome，其真胶囊自己在 baseContentAlpha 下淡出，
+        // 覆盖层再画一份就是双份叠加偏亮（P3-23）。来源未知（null）时保守代画——
+        // 宁可多画一枚（与真身同位置、同位置渐隐，肉眼不可辨）也不能让胶囊凭空消失。
+        entryNavOwnedByOverlay = source == null || source !in NON_TAB_SOURCES_WITH_CHROME
         entryShowCover = true
         phase = Phase.Entering
         started = false
-        // **等待期 t 必须归零**：beginExit 的忙时中止分支只翻 phase 不复位 t，残留 t（如 0.4）
-        // 会让等待期的替身样式按半程 lerp 渲染（圆角/字号/播放钮圆底/导航胶囊全部半形态），
-        // 起飞瞬间 snapTo(0) 再全部跳变。这里用代际守卫的协程复位，不阻塞当前同步块。
+        // 按压回弹接续（衔接修复②）：迷你条刚被按下 .97，Chrome 本帧即卸载。
+        // 替身从这里起步、180ms 弹回 1，飞行本体同步起飞 —— 不再有「瞬跳回全尺寸」。
+        // **snap 与 animate 必须在同一个协程里顺序执行**：拆成两个 launch 时调度顺序
+        // 不保证（可能先 animateTo(1) 再 snapTo(.97) → 回弹被吞掉、替身直接闪到 1）。
+        // 同一协程里先把 t 归零（原有语义，见下），再做回弹接续。
         scope.launch {
             if (gen != generation) return@launch
+            // **等待期 t 必须归零**：beginExit 的忙时中止分支只翻 phase 不复位 t，残留 t（如 0.4）
+            // 会让等待期的替身样式按半程 lerp 渲染（圆角/字号/播放钮圆底/导航胶囊全部半形态），
+            // 起飞瞬间 snapTo(0) 再全部跳变。这里用代际守卫的协程复位，不阻塞当前同步块。
             t.snapTo(0f)
+            pressRecover.snapTo(MINI_PRESS_SCALE)
+            pressArmed = true
+            if (gen != generation) return@launch
+            pressRecover.animateTo(1f, GlassMotion.tweenPress())
         }
         // 等待期就先挂 mini-only 快照：替身按 t=0 几何原地绘制迷你条（Chrome 此刻已卸载，
         // 不挂的话替身要等 player rects 到齐才出现，起点有 1~N 帧空窗）
@@ -258,6 +319,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
                 songSnapshot = null
                 snapshot = null
                 started = false
+                pressArmed = false
                 return@launch
             }
             // 起飞前重快照：entryShowCover 清除会触发 modeT 500ms 动画（封面 rect 移动中），
@@ -271,6 +333,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
                 songSnapshot = null
                 snapshot = null
                 started = false
+                pressArmed = false
                 return@launch
             }
             snapshot = mini + playerFinal
@@ -312,6 +375,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
             started = false
             exitSnapPending = false
             entrySource = null
+            pressArmed = false
             navigate(target)
             return
         }
@@ -365,6 +429,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
             snapshot = null
             started = false
             entrySource = null
+            pressArmed = false
             // 收尾再清瞬态标记：此刻播放页已离开组合，翻转不再影响任何飞行几何。
             // 保留清理是必要的——否则标记泄漏到下一次「直入播放页」（不经飞行）会先落
             // 封面态再滑走，且同一首歌时 PlayerScreen 的守卫不成立 → 歌词页永久进不去。
@@ -389,6 +454,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
         started = false
         exitSnapPending = false
         entrySource = null
+        pressArmed = false
     }
 
     /**
@@ -414,6 +480,7 @@ class PlayerFlight(private val scope: CoroutineScope) {
             started = false
             exitSnapPending = false
             entrySource = null
+            pressArmed = false
             // t 复位需 suspend：放到协程里，不阻塞尺寸变化回调。
             // **代际守卫**：若复位队列期间用户立刻发起新的飞行（beginExit 要 t=1），
             // 迟到的 snapTo(0) 会把 t 冲掉、让退出动画从 0 开始。代际不符即放弃复位。
@@ -425,7 +492,16 @@ class PlayerFlight(private val scope: CoroutineScope) {
         rects.clear()
     }
 
-    /** 取消在跑的飞行动画协程（entry / exit 各一）。取消后调用方负责清状态。 */
+    /**
+     * 取消在跑的飞行动画协程（entry / exit 各一）。取消后调用方负责清状态。
+     *
+     * [pressRecover] 不在这里复位，也**不需要**复位：
+     * - 它只在 phase == Entering 时被覆盖层读取，中止后 phase 立刻离开 Entering →
+     *   残留值（如 0.985）不会作用于任何一帧；
+     * - 每次 beginEntry 都先 `snapTo(MINI_PRESS_SCALE)` 再 animateTo(1)，旧值必被覆盖；
+     * - 在同一 Animatable 上补一个 snapTo 反而会和 beginEntry 的 snapTo 抢执行顺序，
+     *   凭空引入竞态。
+     */
     private fun cancelJobs() {
         entryJob?.cancel()
         entryJob = null
@@ -479,6 +555,18 @@ class PlayerFlight(private val scope: CoroutineScope) {
 }
 
 val LocalPlayerFlight = compositionLocalOf<PlayerFlight?> { null }
+
+/**
+ * 迷你条按压态缩放（与 GlassSurface 的 pressScale(pressed = 0.97f) **必须同值**）：
+ * 起飞瞬间替身由这里起步回弹到 1，两端对齐才不会跳变。改一处必须改另一处。
+ */
+private const val MINI_PRESS_SCALE = 0.97f
+
+/**
+ * 自带 GlassChrome 的非 tab 屏：进入飞行时屏内真导航胶囊自己在淡出，
+ * 覆盖层**不得**再画一枚（双份叠加偏亮，见 PlayerFlight.entryNavOwnedByOverlay）。
+ */
+private val NON_TAB_SOURCES_WITH_CHROME = setOf(GlassScreen.Detail, GlassScreen.Search)
 
 /**
  * 元素挂载点：把自身 root 坐标持续回填进 [PlayerFlight.rects]。

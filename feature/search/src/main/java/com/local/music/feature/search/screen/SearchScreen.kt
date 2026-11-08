@@ -29,14 +29,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.ui.graphics.Color
 import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.GlassChrome
 import com.local.music.core.ui.components.GlassLevel
@@ -54,7 +51,9 @@ import com.local.music.core.ui.components.pressScale
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.LibraryGroup
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.auroraAccentColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
@@ -115,7 +114,10 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                 )
                 val cancelInteraction = remember { MutableInteractionSource() }
                 Text(
-                    "取消", color = auroraAccentColor(), fontSize = 13.sp,
+                    // A1：13sp 裸字号 → GlassText.BodyMedium（13 Medium 18）。
+                    // 用 Medium 而非 Body：这是顶栏唯一的强调动作（退出搜索），
+                    // 与下方「全部 N 张专辑」同档，视觉上是同一类"可点的强调文字"
+                    "取消", color = auroraAccentColor(), style = GlassText.BodyMedium,
                     modifier = Modifier
                         .pressScale(cancelInteraction, pressed = 0.92f)
                         .clickable(interactionSource = cancelInteraction, indication = null) {
@@ -144,7 +146,8 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         item(key = "history-empty") {
                             Text(
                                 "暂无搜索历史",
-                                color = LocalGlassColors.current.textTertiary, fontSize = 13.sp,
+                                // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
+                                color = LocalGlassColors.current.textTertiary, style = GlassText.Body,
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
                             )
@@ -172,7 +175,8 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         item(key = "search-empty") {
                             Text(
                                 "没有找到「${query.trim()}」相关内容",
-                                color = LocalGlassColors.current.textTertiary, fontSize = 13.sp,
+                                // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
+                                color = LocalGlassColors.current.textTertiary, style = GlassText.Body,
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier.fillMaxWidth().padding(top = 56.dp),
                             )
@@ -232,7 +236,9 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                                 val expandInteraction = remember { MutableInteractionSource() }
                                 Text(
                                     if (showAllAlbums) "收起" else "全部 ${albums.size} 张专辑",
-                                    color = auroraAccentColor(), fontSize = 13.sp, fontWeight = FontWeight.Medium,
+                                    // A1：13sp Medium 三连 → GlassText.BodyMedium（13 Medium 18）。
+                                    // 与「取消」同档：两者都是可点的强调文字，视觉应当等重
+                                    color = auroraAccentColor(), style = GlassText.BodyMedium,
                                     modifier = Modifier
                                         .padding(start = 20.dp, end = 20.dp, bottom = 14.dp)
                                         .pressScale(expandInteraction, pressed = 0.92f)
@@ -335,13 +341,19 @@ private fun AlbumRow(pair: List<LibraryGroup>, state: AppState) {
 private fun GlassChip(text: String, onClick: () -> Unit) {
     GlassSurface(
         level = GlassLevel.Lo,
-        shape = RoundedCornerShape(50),
+        // C4：胶囊圆角走 R.Full（50），不再裸写 50——刻度里"胶囊"只有这一档
+        shape = RoundedCornerShape(R.Full),
         onClick = onClick,
         modifier = Modifier.semantics { this.role = Role.Button },
     ) {
         Text(
-            text, color = LocalGlassColors.current.textSecondary,
-            fontSize = 12.sp,
+            text,
+            // A4 跳过（有意）：芯片是 lo 玻璃底 + textSecondary，**不是** seed 实底，
+            // 因此不适用 onSeedColor()。浅色模式下 textSecondary 已是近黑，对比由 token 保证。
+            color = LocalGlassColors.current.textSecondary,
+            // A1：12sp 裸字号 → GlassText.Caption（12 Normal 16）。芯片与列表副标题同字号，
+            // 但视觉上更小：它靠胶囊形与低对比度退到背景，不靠字号
+            style = GlassText.Caption,
             modifier = Modifier.padding(horizontal = 13.dp, vertical = 7.dp),
         )
     }

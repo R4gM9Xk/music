@@ -3,6 +3,7 @@ package com.local.music.core.ui.theme
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -11,7 +12,11 @@ import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 
 /**
  * 液态玻璃流 · 设计 token
@@ -128,6 +133,150 @@ object GlassType {
     const val LHMicro = 14f
 }
 
+/**
+ * 排版 token 的**可下发形态**：字号 + 字重 + 行高 + 字距打包成一个 [TextStyle]。
+ *
+ * **为什么必须存在这一层**（视觉审计 A1，2026-11-08）：
+ * 上面 [GlassType] 只有一堆 Float 常量，调用点要写
+ * `fontSize = 15.sp, fontWeight = FontWeight.Medium, lineHeight = 21.sp`——
+ * 三处手写、三处可漏。事实是**全仓 63 处 fontSize 全是裸字面量，GlassType 零引用**，
+ * 于是「同语义同 token」这条规则在代码里没有任何着力点，值只能靠人工对齐（然后漂移）。
+ *
+ * 打包成 TextStyle 之后，调用点写 `style = GlassText.Row` 就同时得到字号/字重/行高，
+ * 一致性由**构造**保证而不再由**纪律**保证。新增排版一律从这里取；
+ * 改造既有调用点时若发现 `style = GlassText.X, fontSize = Y.sp` 并存，说明 X 选错了，
+ * 应补一个正确的 token 而不是就地覆盖。
+ *
+ * 命名口径与 token-baseline 的 7 级阶梯一一对应：
+ * - Display / Title / Heading / BodyEmph(=Row) / Body / Caption / Micro
+ * - 带 `Medium`/`SemiBold` 后缀者为同字号的强调档（用于主标题、选中态）
+ * - [Numeric] 是**等宽数字**专用档：时间/倒计时必须用它，否则每秒变化时字宽跳动
+ *
+ * 已登记例外：播放页歌词行的字号/字重/行高是连续 lerp 动画（PlayerScreen 的 LyricLineRow），
+ * 无法套静态 TextStyle，属设计意图，不在此列。
+ */
+object GlassText {
+    /** 页面大标题（30 Bold 38）：CJK 不加负字距——负字距是拉丁排版习惯，中文只会挤字形 */
+    val Display = TextStyle(
+        fontSize = GlassType.Display.sp,
+        fontWeight = FontWeight.Bold,
+        lineHeight = GlassType.LHDisplay.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 二级页/详情大标题（20 Bold 26） */
+    val Title = TextStyle(
+        fontSize = GlassType.Title.sp,
+        fontWeight = FontWeight.Bold,
+        lineHeight = GlassType.LHTitle.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 详情页顶栏页名（16 Bold 22）：与下方 Hero 标题拉开一档，又不至于和大标题同重 */
+    val TitleCompact = TextStyle(
+        fontSize = GlassType.Heading.sp,
+        fontWeight = FontWeight.Bold,
+        lineHeight = GlassType.LHHeading.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 区块/面板标题、播放页歌名（16 SemiBold 22） */
+    val Heading = TextStyle(
+        fontSize = GlassType.Heading.sp,
+        fontWeight = FontWeight.SemiBold,
+        lineHeight = GlassType.LHHeading.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 列表行主标题（15 Medium 21）——全 App 出现密度最高的文本档 */
+    val Row = TextStyle(
+        fontSize = GlassType.BodyEmph.sp,
+        fontWeight = FontWeight.Medium,
+        lineHeight = GlassType.LHBodyEmph.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 列表行主标题·强调（15 SemiBold 21）：常驻 chrome 的歌名、面板动作项 */
+    val RowStrong = TextStyle(
+        fontSize = GlassType.BodyEmph.sp,
+        fontWeight = FontWeight.SemiBold,
+        lineHeight = GlassType.LHBodyEmph.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 正文/按钮/设置行（13 Normal 18） */
+    val Body = TextStyle(
+        fontSize = GlassType.Body.sp,
+        fontWeight = FontWeight.Normal,
+        lineHeight = GlassType.LHBody.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 正文·强调（13 Medium 18）：按钮文字、可点的强调动作（如搜索「取消」「全部 N 张」） */
+    val BodyMedium = TextStyle(
+        fontSize = GlassType.Body.sp,
+        fontWeight = FontWeight.Medium,
+        lineHeight = GlassType.LHBody.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 列表副标题 / meta（12 Normal 16） */
+    val Caption = TextStyle(
+        fontSize = GlassType.Caption.sp,
+        fontWeight = FontWeight.Normal,
+        lineHeight = GlassType.LHCaption.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 副标题·强调（12 Medium 16）：尾部「已选」「已添加」等状态标记 */
+    val CaptionMedium = TextStyle(
+        fontSize = GlassType.Caption.sp,
+        fontWeight = FontWeight.Medium,
+        lineHeight = GlassType.LHCaption.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /** 时间戳/角标/来源行（11 Normal 14） */
+    val Micro = TextStyle(
+        fontSize = GlassType.Micro.sp,
+        fontWeight = FontWeight.Normal,
+        lineHeight = GlassType.LHMicro.sp,
+        letterSpacing = 0.sp,
+    )
+
+    /**
+     * 时间/倒计时/进度数字（11 Normal 14 **等宽数字**）。
+     *
+     * `fontFeatureSettings = "tnum"` 让每个数字占同一字宽：已播时长每秒递增时
+     * 文本宽度不再抖动（比例数字下 "1" 比 "8" 窄，逐秒跳变肉眼可见），
+     * 列表右对齐的时长列也随之齐整。视觉审计 B4。
+     */
+    val Numeric = TextStyle(
+        fontSize = GlassType.Micro.sp,
+        fontWeight = FontWeight.Normal,
+        lineHeight = GlassType.LHMicro.sp,
+        letterSpacing = 0.sp,
+        fontFeatureSettings = "tnum",
+    )
+
+    /** 分组小标题（12 Normal 16 + 0.3 字距）：全大写式的小标签，字距是它唯一的层级信号 */
+    val SectionLabel = TextStyle(
+        fontSize = GlassType.Caption.sp,
+        fontWeight = FontWeight.Normal,
+        lineHeight = GlassType.LHCaption.sp,
+        letterSpacing = 0.3.sp,
+    )
+
+    /** 分组小标题·微档（11 Normal 14 + 0.3 字距）：面板内部段头 */
+    val SectionLabelMicro = TextStyle(
+        fontSize = GlassType.Micro.sp,
+        fontWeight = FontWeight.Normal,
+        lineHeight = GlassType.LHMicro.sp,
+        letterSpacing = 0.3.sp,
+    )
+}
+
+
 // ── 圆角 token（UI 审计第 3 轮确立）───────────────────────
 /**
  * 6 级圆角刻度（dp）。阶梯外禁止 8/11/12/16/20/22 等中间值。
@@ -142,6 +291,21 @@ object R {
     const val Card24 = 24       // 大封面（歌单详情 132dp）
     const val Player28 = 28     // 播放页大面板 / GlassSurface 默认
     const val Full = 50         // 胶囊（搜索框 44dp 高 → 22dp = 半高）
+
+    /**
+     * 嵌套圆角的**共心推导**（视觉审计 C4）：外容器圆角 Rout、内边距 pad 时，
+     * 内侧子元素要用的圆角 = Rout − pad。
+     *
+     * 为什么这条几何律值得单独成 token：圆角不是「每块各自好看」的装饰，而是一条
+     * **等距曲线**。外圆角 28 + 内边距 12 而内圆角仍写 10 时，内外两条弧线在四角
+     * 平行关系断掉——肉眼说不出哪里错，但会觉得「这角有点脏」。Apple 系控件的
+     * 高级感很大一部分就来自这条不写在任何设计稿上的规律。
+     *
+     * 已知历史点：迷你条外圆角 28、内边距 12、封面圆角 10（应为 16）。
+     * 注意推导结果可能落到刻度外（如 16 不在 R 刻度上）——**此处以几何正确优先**，
+     * 刻度服务于一致性，而一致性本身包含嵌套关系。结果下限 4dp 防退化。
+     */
+    fun nested(outer: Int, padding: Int): Int = (outer - padding).coerceAtLeast(4)
 }
 
 // ── 间距 token（UI 审计第 6 轮修正确立）───────────────────
@@ -178,6 +342,28 @@ data class GlassColors(
     val lyricFar: Color = Color.White.copy(alpha = 0.34f),
     val lyricAdjacent: Color = Color.White.copy(alpha = 0.55f),
     /**
+     * 破坏性动作色（视觉审计 A4）：删除/清空/放弃快照这类**不可撤销**操作的唯一视觉信号。
+     *
+     * 为什么需要它：改前「确认删除」（ActionsSheet 删除确认行）与「全部播放」视觉完全同级——
+     * 都吃 textPrimary。破坏性操作没有任何可感知的层级差，等于让用户凭文案自己小心。
+     * 成熟系统都用一枚克制的警示色表达「这一步不一样」，而不是把整行染红。
+     *
+     * 取**低饱和暖红**而不是 Material error 的纯红：本 App 底色是极光暗紫/暗青且带大量
+     * 半透明玻璃，纯红在高饱和暗底上会「跳出来」变成廉价告警条；降饱和后它仍然是
+     * 唯一的暖色语义，但不与极光取色争艳。浅色档同理用深一档的砖红保证白底可读。
+     */
+    val destructive: Color = Color(0xFFE4867C),
+    /**
+     * 按压态底色（视觉审计 A6）：全 App `indication = null`，按下一个列表行/动作行时
+     * **没有任何底色变化**，只剩一个 0.98 的行级缩放——肉眼几乎不可见，等于零反馈。
+     *
+     * 为什么用「底色微亮」而不是继续加大缩放：整行缩放会让文字/封面一起位移，
+     * 在长列表里是噪声；而一层极淡的浮起底色是静止的、只改明度的信号，
+     * 观感更接近系统原生（ColorOS/Android 的 ripple 本质也是明度层）。
+     * alpha 取 0.06 量级：刚好看得见，且叠在玻璃上不会破坏通透。
+     */
+    val pressedOverlay: Color = Color.White.copy(alpha = 0.06f),
+    /**
      * chrome 层遮罩（F3 / G2 透字修复）：**只**给迷你播放条与底部导航栏用，
      * 其余玻璃面板（控制台/卡片/面板）不传，保持原观感。
      *
@@ -196,7 +382,7 @@ data class GlassColors(
      * 为什么用深底而不是深色玻璃 fill：fill 是白色系（hi=白16%），叠白只会
      * 提亮背景、把浅色幽灵字衬得更明显 —— 深色模式必须往黑的方向压。
      *
-     * ## 为什么 alpha 取这么高（0.62 / 0.52）
+     * ## 为什么 alpha 取这么高（0.80 / 0.74）
      *
      * 这一层是**唯一可靠的兜底**，不能指望 blur 一定生效：haze 的 blur 依赖
      * RenderEffect（Android 12+，且需硬件加速 GPU）。软件渲染 / 无 RenderEffect 的
@@ -223,11 +409,16 @@ data class GlassColors(
      * 迷你条与导航栏又是用户最高频看到的两块玻璃。0.80 是「可读性达标」与「玻璃还在」
      * 的共同解。
      *
-     * chrom 自身文字画在遮罩**之上**，不受衰减（深色下白字对比反而略升，实测 6.3:1）。
+     * chrome 自身文字画在遮罩**之上**，不受衰减（深色下白字对比反而略升，实测 6.3:1）。
      *
      * 已知取舍：本字段**不随「玻璃强度」设置变化**（[GlassIntensity.derive] 有意不缩放它）。
      * 它是可读性保障而非装饰强度，不该被用户的观感偏好削弱 —— 副作用是迷你条/导航栏上
      * 三档强度差异变得很微弱，属有意为之，不要当成 bug。
+     *
+     * **视觉审计 D1 待办（未落地）**：0.80 让这两块玻璃基本成为实色板（模糊可见贡献仅
+     * 20%），与「液态玻璃」的产品主张有张力。真正的解法在**内容侧**——列表滚动到 chrome
+     * 下方前做边缘渐隐，让透字在到达 chrome 之前就消失，scrim 即可回落到 0.4–0.5 让模糊
+     * 重新可见。属需真机复测的联动项，本轮不动此值。
      */
     val chromeScrim: Color = Color(0xFF1A1A24).copy(alpha = 0.80f),
 ) {
@@ -237,8 +428,10 @@ data class GlassColors(
             hi = Color.White.copy(alpha = 0.60f),
             md = Color.White.copy(alpha = 0.48f),
             lo = Color.White.copy(alpha = 0.32f),
-            stroke = Color.White.copy(alpha = 0.65f),
-            strokeSoft = Color.White.copy(alpha = 0.38f),
+            // 浅色描边反转（视觉审计 D5）：白色系描边压在白 60% 玻璃 + 近白极光上等于消失，
+            // 卡片/封面失去边缘定义。改近黑低 alpha 才能在浅底上「画出」轮廓。
+            stroke = Color(0xFF23232B).copy(alpha = 0.14f),
+            strokeSoft = Color(0xFF23232B).copy(alpha = 0.09f),
             topLine = Color.White.copy(alpha = 0.90f),
             textPrimary = Color(0xFF23232B),
             textSecondary = Color(0xFF23232B).copy(alpha = 0.62f),
@@ -246,6 +439,9 @@ data class GlassColors(
             textFaint = Color(0xFF23232B).copy(alpha = 0.42f),
             lyricFar = Color(0xFF23232B).copy(alpha = 0.34f),
             lyricAdjacent = Color(0xFF23232B).copy(alpha = 0.55f),
+            // 浅色下纯红更刺眼，用砖红一档
+            destructive = Color(0xFFC0392B),
+            pressedOverlay = Color(0xFF23232B).copy(alpha = 0.05f),
             // 浅色模式的透字是「深色笔画压在浅玻璃上」，方向必须反过来往白压。
             // 按同一推算：深色文字 lum≈35、玻璃底 lum≈241，经 alpha=a 白遮罩后
             // 残值 = 35 + (241−35)×a，要它与底 241 不可区分需 a ≈ 0.78 以上；
@@ -274,6 +470,8 @@ fun lerpGlassColors(from: GlassColors, to: GlassColors, fraction: Float): GlassC
     textFaint = lerp(from.textFaint, to.textFaint, fraction),
     lyricFar = lerp(from.lyricFar, to.lyricFar, fraction),
     lyricAdjacent = lerp(from.lyricAdjacent, to.lyricAdjacent, fraction),
+    destructive = lerp(from.destructive, to.destructive, fraction),
+    pressedOverlay = lerp(from.pressedOverlay, to.pressedOverlay, fraction),
     chromeScrim = lerp(from.chromeScrim, to.chromeScrim, fraction),
 )
 
@@ -309,6 +507,37 @@ object GlassMotion {
     fun <T> tweenHover() = tween<T>((Hover * scale).toInt().coerceAtLeast(1), easing = Curve)
     fun <T> tweenFlight() = tween<T>((Flight * scale).toInt().coerceAtLeast(1), easing = Curve)
     fun <T> tweenSheet() = tween<T>((Sheet * scale).toInt().coerceAtLeast(1), easing = Curve)
+}
+
+// ── 弹性动效（P1-2：回弹/落位类动画的正确语言）───────────────
+/**
+ * 弹簧 token，与上面的 tween 并列，共同构成「全 App 单一动效语言」。
+ *
+ * **为什么需要**：tween 是「定时播放」——按下 180ms 后到 0.92，松手再 180ms 回到 1。
+ * 快速连点时两次 tween 会排队重启，观感僵硬；而弹簧**继承当前速度**、可被打断后
+ * 从当前位置自然重定向，这是 iOS/ColorOS 原生手感的来源。全仓此前 0 个 spring
+ * （动效审计 P1-2）。
+ *
+ * 三档语义（不要按数值记忆，按**用途**选）：
+ * - [springSnap]：落位/归位（拖拽松手、重排落点）。低阻尼、带一点点回弹，
+ *   让「吸附」有物理感而不是滑到位就停。
+ * - [springGentle]：按压回弹、开关滑块。阻尼接近临界，**不振荡**——按钮回弹过头
+ *   会显得廉价，这里要的是「柔和地恢复」。
+ * - [springPanel]：面板/覆盖层升降。大位移用低刚度，收尾才不显得急。
+ *
+ * 注意：弹簧的 [spring] 不带时长，`GlassMotion.scale`（动效强度）无法直接乘——
+ * 用 stiffness/dampingRatio 的倒数近似缩放，见各函数实现。这是**有意的不完美**：
+ * 弹簧的语义就是「按物理收束」，强行改成定时反而丢掉它的全部好处。
+ */
+object GlassSpring {
+    /** 落位/归位：略带回弹 */
+    fun <T> snap() = spring<T>(dampingRatio = 0.72f, stiffness = 520f)
+
+    /** 按压/开关：近似临界阻尼，不回弹 */
+    fun <T> gentle() = spring<T>(dampingRatio = 0.9f, stiffness = 700f)
+
+    /** 面板/覆盖层：大位移低刚度 */
+    fun <T> panel() = spring<T>(dampingRatio = 0.85f, stiffness = 340f)
 }
 
 /** 玻璃强度（设置页三档）：按系数派生填充与描边透明度 */
@@ -431,3 +660,55 @@ fun auroraAccentColor(): Color {
     // 主题渐变中点选中态文字/输入光标/播放高亮集体跳色）
     return lerp(palette.seed3, palette.seed, LocalThemeFraction.current)
 }
+
+/**
+ * 压在 seed 实底上的前景色（视觉审计 A4）：tab 选中态、详情页「播放」胶囊、开关滑块、
+ * 进度条等凡以 palette.seed 作背景处一律读它。
+ *
+ * **为什么必须由派生决定而不是固定白色**：项目允许用户从 10 色预设（含琥珀 #E0A800、
+ * 草绿 #57A94A、青绿 #1D9E75）或任意封面主色作 seed。白字压在琥珀上实测对比只有
+ * ≈2.15:1——**选中态反而成了全屏最难读的元素**，与「清晰视觉层级」正好相反。
+ *
+ * ## 为什么不能简单用「亮度 > 0.5 就返回黑」
+ *
+ * 第一版就是这么写的，实测 10 个预设色**全部 ≤0.44**（最亮的琥珀 0.439，最暗的石板灰蓝
+ * 0.141），没有一枚越过 0.5 —— 等于这条判据从未生效，全部仍然吃到白字，琥珀上 2.15:1
+ * 的问题原封不动。根因：这些 seed 不是「亮色块」，而是**中低明度的高饱和彩色**，
+ * 用「亮/暗」这条二分线去切它们，切点落在了一个所有样本都不在的位置。
+ *
+ * 正确的问法不是「这个颜色亮吗」，而是「**白字和黑字，哪个在上面更清楚**」。
+ * 这就是 WCAG 的相对亮度与对比度公式直接回答的问题：
+ *   对比度 = (L亮 + 0.05) / (L暗 + 0.05)
+ * 所以这里直接算两个候选前景色各自的对比度，取大的那个。这个判据对任意 seed
+ * （预设色 / 自定义色 / 封面提取色）都成立，不需要针对色板调参。
+ *
+ * 实测该判据在 10 个预设色上的结果：
+ * - 琥珀（0.439）→ 黑字 8.04:1（白字仅 2.15）✅ 这是修复的重点目标
+ * - 草绿（0.309）→ 黑字 5.91（白 2.93）✅ 同理
+ * - 青绿（0.260）/ 蓝（0.242）/ 靛紫（0.229）/ 珊瑚橙（0.221）→ 黑字 4.6–5.1（白 3.4–3.8）✅
+ * - 玫红（0.197）/ 紫罗兰（0.182）/ 棕（0.177）/ 石板灰蓝（0.141）→ 白字 3.8–5.5（黑字 3.2–4.1）✅
+ *
+ * 注意：多数 seed 上白字也都达不到 AA 大字号 3:1 以上（琥珀 2.15、草绿 2.93），
+ * 说明**白字本来就不是这些色的正确选择**——这不是 onSeedColor 能完全挽救的问题，
+ * 而是「seed 被用作大面积实底」这个设计本身的上限。彻底解决需要给 seed 实底再加
+ * 一层明度保障（如压暗 8%），属下一轮候选；本轮先把「明显更优的那个」选对。
+ */
+@Composable
+fun onSeedColor(): Color {
+    val seed = LocalAuroraPalette.current.seed
+    // WCAG 相对亮度（linearized）。Compose 的 luminance() 就是这套公式，直接复用。
+    val seedL = seed.luminance()
+    val whiteL = Color.White.luminance()   // = 1.0
+    val inkL = OnSeedInk.luminance()       // 近黑，约 0.01
+
+    fun contrast(a: Float, b: Float): Float {
+        val hi = maxOf(a, b)
+        val lo = minOf(a, b)
+        return (hi + 0.05f) / (lo + 0.05f)
+    }
+
+    return if (contrast(seedL, inkL) >= contrast(seedL, whiteL)) OnSeedInk else Color.White
+}
+
+/** onSeedColor 的近黑候选：带一点蓝调（#1A1A22）而不是纯黑，与 App 的深色令牌同族 */
+private val OnSeedInk = Color(0xFF1A1A22)

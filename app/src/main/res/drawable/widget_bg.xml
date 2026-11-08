@@ -10,7 +10,17 @@
 -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android"
     android:shape="rectangle">
-    <!-- 深色玻璃底：与应用的液态玻璃流一致，但不做真模糊（小部件里做不了实时模糊） -->
-    <solid android:color="#F21C1C22" />
+    <!--
+      深色玻璃底：与应用的液态玻璃流一致，但不做真模糊（小部件里做不了实时模糊）。
+
+      视觉审计 F2：底色由 #F21C1C22 改 #F21A1A24 —— 与 App 内 chromeScrim 的
+      `Color(0xFF1A1A24)` 同值。改前两者差在色相上（1C1C22 偏灰、1A1A24 偏靛），
+      并排看是两块「不太一样的深色」。小部件是桌面上的常驻元素，与 App 内迷你条
+      （同样 #1A1A24 系）应当像同一个系统出来的，所以直接对齐色值。
+
+      alpha 仍取 F2（95%）不是 App 内的 80%：桌面上没有极光背景做垫底，
+      桌面壁纸可能是任何东西，需要更实的底保证文字可读。
+    -->
+    <solid android:color="#F21A1A24" />
     <corners android:radius="24dp" />
 </shape>

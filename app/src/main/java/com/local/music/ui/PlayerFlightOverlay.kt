@@ -27,6 +27,7 @@ import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -51,6 +52,7 @@ import com.local.music.core.ui.theme.GlassColors
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.R
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeStyle
 import dev.chrisbanes.haze.HazeTint
@@ -139,10 +141,31 @@ fun PlayerFlightOverlay(
                     }
                     else -> 1f
                 }
+                // 按压回弹接续（衔接修复②）：迷你条的 pressScale(.97) 回弹被 Chrome 卸载
+                // 截断，替身在这里把它演完——否则点按瞬间迷你条从按压态「瞬跳」回全尺寸。
+                // 取值统一走 flight.pressScale()：非进入方向恒 1、进入期未布防的**首帧**
+                // 直接给按压值（snapTo 是 suspend，首帧读不到 .97，否则会先闪一帧全尺寸）。
+                // 缩放轴心取迷你条真身中心（不是整层中心）：替身层是根层全屏 Box，
+                // 按层中心缩放会让底部迷你条整体横移/上移，反而制造新的错位。
+                // **必须无条件赋值**：graphicsLayer lambda 只对其中写到的属性生效，
+                // 条件跳过会让上一次写进去的 scale 永久留在图层上（回弹结束仍缩着 3%）。
+                val s = flight.pressScale()
+                val mini = snap[FlightKeys.MiniGlass]
+                if (mini != null && size.width > 0f && size.height > 0f) {
+                    transformOrigin = TransformOrigin(
+                        mini.center.x / size.width,
+                        mini.center.y / size.height,
+                    )
+                }
+                scaleX = s
+                scaleY = s
             },
     ) {
         // ── 导航胶囊渐隐替身（仅进入飞行）：Chrome 已退出布局，原地随 t 消隐 ──
-        if (flight.phase == PlayerFlight.Phase.Entering) {
+        // 仅当 Chrome 真身确实被卸载（tab 来源）时才代画：详情/搜索屏自带 GlassChrome，
+        // 其真胶囊自己在 baseContentAlpha 下淡出，再画一份就是两枚半透明胶囊同位置叠加
+        // （偏亮 + 消退节奏不对，旧审计 P3-23）——衔接修复③。
+        if (flight.phase == PlayerFlight.Phase.Entering && flight.entryNavOwnedByOverlay) {
             snap[FlightKeys.MiniNav]?.let { navRect ->
                 GlassNavBar(
                     selected = flight.entryNavSelected,
@@ -175,7 +198,7 @@ fun PlayerFlightOverlay(
                     .flightSize(rect, tAt)
                     .graphicsLayer {
                         // 与迷你条玻璃同形裁切：R28 圆角在底边削掉线端的形状与真身一致
-                        shape = RoundedCornerShape(28.dp)
+                        shape = FlightPanelShape
                         clip = true
                         alpha = (1f - tAt()).coerceIn(0f, 1f)
                     }
@@ -217,7 +240,7 @@ fun PlayerFlightOverlay(
                         // from 端必须是 R.Thumb10：迷你条真身封面就是 R10（旧 11dp 起点导致
                         // 点按/落地瞬间封面圆角差 1dp，四角弧线肉眼可辨）
                         val t = tAt()
-                        shape = RoundedCornerShape(lerp(10.dp, 28.dp, t))
+                        shape = RoundedCornerShape(lerp(R.Thumb10.dp, R.Player28.dp, t))
                         clip = true
                         shadowElevation = lerp(0.dp, 18.dp, t).toPx()
                     }
@@ -229,10 +252,10 @@ fun PlayerFlightOverlay(
                         val sw = 1.dp.toPx()
                         drawContent()
                         drawRoundRect(
-                            color = lerp(Color.White.copy(alpha = 0.12f), glass.stroke, t),
+                            color = lerp(glass.strokeSoft, glass.stroke, t),
                             topLeft = Offset(sw / 2f, sw / 2f),
                             size = Size(size.width - sw, size.height - sw),
-                            cornerRadius = CornerRadius(lerp(10.dp, 28.dp, t).toPx() - sw / 2f),
+                            cornerRadius = CornerRadius(lerp(R.Thumb10.dp, R.Player28.dp, t).toPx() - sw / 2f),
                             style = Stroke(sw),
                         )
                     },
@@ -403,7 +426,7 @@ private fun FlightGlassPanel(
                     color = glass.strokeSoft,
                     topLeft = Offset(sw / 2f, sw / 2f),
                     size = Size(size.width - sw, size.height - sw),
-                    cornerRadius = CornerRadius(28.dp.toPx() - sw / 2f),
+                    cornerRadius = CornerRadius(R.Player28.dp.toPx() - sw / 2f),
                     style = Stroke(sw),
                 )
                 // GlassSurface 顶部亮线（glassTopLine 为模块私有，此处同款复刻）——
@@ -423,7 +446,7 @@ private fun FlightGlassPanel(
 }
 
 /** 替身玻璃面板形状：两端真身（迷你条 / 控制台）都是 R.Player28，恒定不复用 lerp */
-private val FlightPanelShape = RoundedCornerShape(28.dp)
+private val FlightPanelShape = RoundedCornerShape(R.Player28.dp)
 
 /**
  * 飞行替身的单行文字（歌名/作者共用）：字号 lerp 是 Text 的组合期参数（真布局渲染，

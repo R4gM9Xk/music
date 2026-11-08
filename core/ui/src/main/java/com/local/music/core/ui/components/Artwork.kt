@@ -1,9 +1,6 @@
 package com.local.music.core.ui.components
 
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -13,7 +10,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -31,9 +30,11 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.local.music.core.ui.theme.AuroraPalette
+import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.GlassPalettes
 import com.local.music.core.ui.theme.LibraryOrigin
 import com.local.music.core.ui.theme.LocalAuroraPalette
+import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.LocalLibraryOrigin
 import com.local.music.core.ui.theme.R
 import androidx.compose.ui.graphics.lerp
@@ -110,7 +111,10 @@ enum class ArtStyle(
 }
 
 /**
- * 封面：优先画真封面，否则画渐变占位 + 装饰层；bordered = 1px 白 12% 描边。
+ * 封面：优先画真封面，否则画渐变占位 + 装饰层；bordered = 1px 描边。
+ *
+ * 描边色（D5）：原为硬编码「白 12%」，现读 `LocalGlassColors.strokeSoft`——理由见下方调用点。
+ * 历史记录：白 12% 是深色模式下调出来的值，浅色模式从未复核，这正是硬编码色能潜伏的方式。
  *
  * 位图来源两种（按优先级）：
  * - [bitmap]：调用方手里已解好的位图（飞行覆盖层等需要「起飞瞬间几何冻结」的场景）
@@ -177,7 +181,12 @@ fun ArtThumb(
             Box(
                 Modifier
                     .matchParentSize()
-                    .border(1.dp, Color.White.copy(alpha = 0.12f), shape),
+                    // D5：描边改读 strokeSoft（深色 = 白 14%，浅色自动反转成近黑）。
+                    // 原为硬编码 Color.White.copy(alpha = 0.12f)：浅色模式下封面多是浅底
+                    // （白色房间那张尤甚），白描边压在白玻璃上等于没画——缩略图的边缘
+                    // 直接糊进卡片底，看起来像图没对齐。改用 token 后深浅两态都能「画出」轮廓，
+                    // 且描边强度跟随「玻璃强度」设置一起缩放，不再是一个游离的魔数。
+                    .border(1.dp, LocalGlassColors.current.strokeSoft, shape),
             )
         }
     }
@@ -205,24 +214,45 @@ fun WaveIndicator(
             // transformOrigin(0.5f, 1f) 把原点钉在底边，缩放时顶边上下起伏，正是原来
             // 「底对齐 + height 变化」的观感。唯一差异是 1dp 圆角随缩放纵向变扁，
             // 在 4~13dp 高度区间不可辨，可接受。
-            val h by if (playing) {
-                val t = rememberInfiniteTransition(label = "wave$i")
-                t.animateFloat(
-                    initialValue = WaveBarMinPx, targetValue = WaveBarMaxPx,
-                    animationSpec = infiniteRepeatable(
-                        tween(550, delayMillis = WaveDelays[i % WaveDelays.size]), RepeatMode.Reverse,
-                    ),
-                    label = "h$i",
-                )
-            } else {
-                androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(WaveBarMinPx) }
+            // 增-P2-A：重写为「单一 Animatable + 绘制期读」，一并解决三个问题：
+            //
+            // ① **曲线漏网**：旧 tween(550, delay) 未传 easing，落 Compose 默认
+            //    FastOutSlowInEasing——全仓唯一违反「统一曲线」纪律的点
+            //    （GlassMotion.Curve 的 KDoc 明写「全 app 唯一缓动曲线」）。现补 Curve。
+            //
+            // ② **暂停硬跳**：旧实现 playing=false 时直接取常量 mutableStateOf(min)，
+            //    四条竖条从各自任意高度**瞬跳**到最低，像被掐断。现在同一实例收束
+            //    （tweenHover），暂停时自然「落下去」。
+            //    为什么不能用 animateFloatAsState 追无限动画的值：那会让它每帧追一个
+            //    每帧都变的目标，起伏被平滑成滞后，等于把波形抹平。必须由协程直接驱动。
+            //
+            // ③ **组合期读动画值**：旧写法 `val h by ...` 在组合期解构 State，与文件内
+            //    注释宣称的「零重组」相悖——无限动画下等于 60fps 重组本行子树。
+            //    现在把 Animatable 实例交给绘制期 lambda 读（见下方 graphicsLayer）。
+            val amp = remember { Animatable(WaveBarMinPx) }
+            LaunchedEffect(playing) {
+                if (playing) {
+                    // 首轮带错峰 delay（等价原 CSS animation-delay），之后匀速往返
+                    amp.animateTo(
+                        WaveBarMaxPx,
+                        tween(550, delayMillis = WaveDelays[i % WaveDelays.size], easing = GlassMotion.Curve),
+                    )
+                    while (true) {
+                        amp.animateTo(WaveBarMinPx, tween(550, easing = GlassMotion.Curve))
+                        amp.animateTo(WaveBarMaxPx, tween(550, easing = GlassMotion.Curve))
+                    }
+                } else {
+                    // 暂停：从当前高度平滑落到最低，绝不硬跳
+                    amp.animateTo(WaveBarMinPx, GlassMotion.tweenHover())
+                }
             }
             Box(
                 Modifier
                     .width(2.dp)
                     .height(WaveBarMaxDp)
                     .graphicsLayer {
-                        scaleY = h / WaveBarMaxPx
+                        // 绘制期读：amp.value 变化只失效绘制，不触发重组（既有红线）
+                        scaleY = amp.value / WaveBarMaxPx
                         transformOrigin = TransformOrigin(0.5f, 1f)
                     }
                     .clip(androidx.compose.foundation.shape.RoundedCornerShape(1.dp))

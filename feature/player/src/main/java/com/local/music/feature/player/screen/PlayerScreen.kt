@@ -32,6 +32,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -103,6 +104,7 @@ import com.local.music.core.ui.state.sleepTimerLabel
 import com.local.music.core.ui.state.sleepTimerSubtitle
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassMotion
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.LocalGlassColors
@@ -253,9 +255,13 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             Icon(GlassIcons.Down, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
                         }
                         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
-                            Text("正在播放", color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                            // A1 token 化：顶栏是**次要信息**，字重必须弱于下方歌名（Heading/SemiBold 16）。
+                            // 旧值是 13sp + SemiBold——字号比歌名小但字重同级，在玻璃上两者争视觉焦点；
+                            // BodyMedium（13 Medium）同时守住字号与字重的从属关系。
+                            Text("正在播放", color = LocalGlassColors.current.textPrimary, style = GlassText.BodyMedium,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("来自「${state.queueSource ?: "本地音乐"}」", color = LocalGlassColors.current.textSecondary, fontSize = 11.sp)
+                            // 「来自…」是来源注脚：Micro（11/14）与播放页时间戳同档，不参与信息层级竞争
+                            Text("来自「${state.queueSource ?: "本地音乐"}」", color = LocalGlassColors.current.textSecondary, style = GlassText.Micro)
                         }
                         GlassIconButton(
                             onClick = {
@@ -321,7 +327,11 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             lerp(bigRect.right, smallRect.right, modeT),
                             lerp(bigRect.bottom, smallRect.bottom, modeT),
                         )
-                        val coverShape = RoundedCornerShape(lerp(28.dp, 18.dp, modeT))
+                        // C4：圆角两端改读 R 刻度（R.Player28 大封面端 / R.Card18 歌词小窗端）。
+                        // 数值与旧裸值 28/18 完全相同——token 化的意义不在改观感，而是让
+                        // 「播放页封面两端圆角 = 两个既有刻度」这件事写进代码；日后调刻度时
+                        // 只需改 R，封面不会成为全仓唯一还在用裸 28/18 的角落。
+                        val coverShape = RoundedCornerShape(lerp(R.Player28.dp, R.Card18.dp, modeT))
 
                         // 歌词 rail：常驻组合（P3-15——旧写法 modeT>0 的组合期读取让模式切换
                         // 500ms 内整个舞台每帧重组）；淡入淡出交给下方 graphicsLayer 绘制期读。
@@ -376,7 +386,10 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         if (pureMusic) {
                             Text(
                                 "纯音乐，请欣赏",
-                                color = LocalGlassColors.current.textSecondary, fontSize = 13.sp,
+                                // A1：Body（13/18）与旧裸值 13sp 同档，但行高由 token 给定——
+                                // 舞台空态文案是单句、可折行（窄屏/横屏），裸 13sp 走的是
+                                // Material 默认行高，与本仓 1.38 的中文行高规范不一致
+                                color = LocalGlassColors.current.textSecondary, style = GlassText.Body,
                                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -407,6 +420,18 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             // 同一系数会平方衰减（中点 0.25），交叉淡化亮度凹陷加深——退出期恒 1 交给根层
             val sharedInnerAlpha = { (flight?.playerSharedInnerAlpha() ?: 1f) * sheetAlpha }
             val softAlpha = { (flight?.softAlpha() ?: 1f) * sheetAlpha }
+            // 2.2-D：拖动进度条时的预览比例（null = 未拖动，显示真实进度）。
+            //
+            // 为什么用「持有 State 对象 + 传 provider lambda」而不是直接读 Float：
+            // 拖动中这个值每帧变，若在 consoleBlock 作用域读它，整个控制台（模式行 /
+            // 播放键 / 队列入口）每帧重组——正是本仓明令禁止的模式（见 ElapsedTimeText
+            // 的注释：进度必须收缩到最小重组域）。这里只把**引用**透传下去，
+            // 真正的读取发生在 ElapsedTimeText 内部，重组范围 = 一张文本。
+            //
+            // 这个接线本来就该有：ProgressTrack 早已支持 onPreview（Chrome.kt 的 P3-64
+            // 专为此加），文档写明「供『已播时长』跟随手指变化」，但全仓没有任何调用点
+            // 传过它 —— 于是拖动时轨道跟手、时间数字一动不动，松手才跳。
+            val previewFraction = remember { mutableStateOf<Float?>(null) }
             val consoleBlock: @Composable () -> Unit = {
             GlassSurface(
                 modifier = Modifier
@@ -432,14 +457,24 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     ),
                 ) {
                     // 歌曲信息 + 收藏 + 队列
+                    //
+                    // **为什么本轮不让歌名「出卡」**（视觉审计 C2 / B2 的原始建议）：
+                    // 歌名与副标题挂着 FlightKeys.PlayerTitle / PlayerArtist，播放键/下一首同理
+                    // （PlayerPlay / PlayerNext）。PlayerFlightOverlay 的起止 rect 是**按这些节点的
+                    // 实测位置**推出的——把它们从玻璃卡里搬出去（哪怕只挪 20dp 垂直），
+                    // 飞行两端几何就要重算，覆盖层替身会与真身在飞行途中错位。
+                    // 那是飞行系统的重写，属独立轮次；本轮只做**不动布局**的层级修正（字号 token）。
+                    // 同理不做「封面放大」：封面 rect 由 stageW/stageH 推导，放大需重排整页高度分配。
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
-                            Text(song.title, color = LocalGlassColors.current.textPrimary, fontSize = 16.sp,
-                                fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            // A1：Heading（16 SemiBold 22）——字号/字重与旧裸值一致，补齐 22 行高
+                            Text(song.title, color = LocalGlassColors.current.textPrimary, style = GlassText.Heading,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier
                                     .trackFlight(FlightKeys.PlayerTitle)
                                     .graphicsLayer { alpha = sharedInnerAlpha() })
-                            Text(song.subtitle, color = LocalGlassColors.current.textSecondary, fontSize = 12.sp,
+                            // A1：Caption（12/16）——与列表副标题同档，去掉裸 12sp 的默认行高
+                            Text(song.subtitle, color = LocalGlassColors.current.textSecondary, style = GlassText.Caption,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier
                                     .trackFlight(FlightKeys.PlayerArtist)
@@ -492,6 +527,9 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         ProgressTrack(
                             progressProvider = { state.progressFraction },
                             onSeek = state::seekToFraction,
+                            // 2.2-D：拖动预览回传（null = 松手/取消）。只写进预览 State，
+                            // 不在这里读 value，避免把逐帧读取带进控制台组合作用域
+                            onPreview = { previewFraction.value = it },
                         )
                     }
                     Row(
@@ -503,7 +541,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     ) {
                         // 时间文本无法走绘制期读（Text 必须组合期排版）：抽成极小组件，
                         // 让 10Hz 的重组范围只限于这一张文本，而不是整条控制台
-                        ElapsedTimeText(state)
+                        ElapsedTimeText(state, previewFraction)
                         TotalTimeText(state)
                     }
 
@@ -585,15 +623,46 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
 
             // 底部提示行（按当前视觉模式而非持久化偏好）；无歌词时不再教「滑动切换」（P3-65）——
             // 纯音乐没有歌词端可切，提示与舞台空态文案保持同一句话
-            val hint = when {
-                lyrics == null -> "纯音乐，请欣赏"
+            //   ↑ 这条 P3-65 的「保持同一句话」已被下面的 E4 废止：同一句话重复两遍本身就是
+            //     问题（双显）。现在「无歌词」只有舞台那一份，提示行留空但保留行高。
+            //
+            // E4（视觉审计）：同一句「纯音乐，请欣赏」原先**双显**——舞台封面下方已经有一句，
+            // 底部提示行再复述一遍，一屏两次完全相同的话，读起来像卡住的占位文案。
+            // 改后：无歌词时提示行**不出字**，这句话的唯一归属是舞台上那句（它跟随封面端淡入淡出）。
+            // 槽位仍按原高度保留（见下方 Text 的 `hint ?: "\u00A0"`），否则控制台会随之下移一整行。
+            //
+            // 顺带修掉一处失真：空队列的占位曲（mediaUri == null）现在也走这里不出字。
+            // 它的舞台上压根没有这句（stageBlock 的 pureMusic 要求 mediaUri != null），
+            // 旧实现却在提示行对它宣称「纯音乐，请欣赏」——占位曲不是纯音乐，是**没有歌**。
+            val hint: String? = when {
+                lyrics == null -> null
                 showLyrics -> "点击歌词行可跳转 · 左右滑动切换封面 / 歌词"
                 else -> "左右滑动切换封面 / 歌词"
             }
             val hintBlock: @Composable () -> Unit = {
+            // 空态仍然渲染**同一个 Text**，只把文案换成一个不可见字符（而不是直接不渲染）：
+            //
+            // 不渲染的话提示行会矮一整行，两种方向下都会移动控制台——只是量不同：
+            // - 竖屏：`Column { Box(weight 1f){顶栏+舞台} / 控制台 / 提示行 }`。控制台与提示行是
+            //   固定高度子项，Box 吃剩余。提示行矮 26dp → **控制台整体下移 26dp**，同时舞台变高 26dp；
+            //   而封面边长是 `min(280dp, stageW, stageH*0.92)`、中心是 stageH/2 —— 封面跟着变大下移。
+            //   于是从「有歌词」切到「纯音乐」，封面与控制台两处同时跳，切歌时这一帧很显眼。
+            // - 横屏：右侧 `Column(width=380, fillMaxHeight, Arrangement.Center)` 里是
+            //   「控制台+提示行」这一组、整组垂直居中。少一行则整组重新居中 → **控制台下移半行**。
+            // 提示行是恒定的装饰性留白，不该随内容有无去改页面几何。所以保持同一个 Text 节点、
+            // 同一个 style，只把内容换成**不换行空格**（U+00A0）：行盒高度与出字时逐像素相同
+            // （连系统字号放大时的 sp 缩放也一致），且视觉上不可见。
+            // 为什么不用普通空格 / 空串：普通空格属于可折叠空白，排版器在行尾会把它当零宽处理，
+            // 空串更可能直接量成 0 高——占位就失效了。U+00A0 有实体字宽，必然出一行。
+            // 为什么不用 Spacer(height = …)：行盒高度受字体 metrics / includeFontPadding 影响，
+            // 手写 dp 只能逼近，反而引入 1–2dp 的常驻错位。
+            // 已知残留：极窄屏上长提示可能折成两行（比占位高一行）。这只影响「有歌词」那一侧，
+            // 且折行时本来就不可能与占位等高——属可接受误差，不要为它改成高度测量。
             Text(
-                hint,
-                color = LocalGlassColors.current.textTertiary, fontSize = 11.sp,
+                hint ?: "\u00A0",
+                // A1：Micro（11/14）——与旧裸 11sp 同字号，补上 14 行高（裸 11sp 走默认行高，
+                // 与上方控制台的行高节奏脱节）
+                color = LocalGlassColors.current.textTertiary, style = GlassText.Micro,
                 modifier = Modifier
                     .fillMaxWidth()
                     // P2-⑤：横屏下提示行紧贴控制台，避免它在 720dp 高度里白占一行
@@ -787,6 +856,20 @@ private fun LyricLineRow(
     modifier: Modifier = Modifier,
 ) {
     val palette = LocalAuroraPalette.current
+    // A2 歌词色 token 接线：邻行/远行的衰减值**不再在这里写死**，改读 GlassColors 的
+    // lyricAdjacent / lyricFar 的实际 alpha。这两个 token 早就定义了，但全仓零引用——
+    // 于是「歌词非当前行多亮」这条规则在代码里没有着落点，只能在播放页手写 0.55/0.34。
+    // 接线后：浅色模式的 lyricAdjacent/lyricFar 是近黑系（见 GlassColors.light()），
+    // 若日后把浅色档调到 0.48/0.28 这类更适合白底的值，歌词衰减会自动跟随，不需要回来改这里。
+    //
+    // 当前行（distance==0）仍恒为 1f：它是**完全前置**的行，不是「比邻行更亮一档」，
+    // 用 token 表达反而会在浅色档被调低时让当前行也变灰。
+    //
+    // 性能：这里在**组合期**读 LocalGlassColors（animateFloatAsState 的 target 必须是组合期值）。
+    // 不新增重组成本——本函数下方 `color = LocalGlassColors.current.textPrimary` 本来就组合期读它，
+    // 玻璃色变化时这些行已经会重组；而真正高频的动画值（railOffset 位置衰减）仍在
+    // positionalAlphaProvider 的绘制期读，没有被这条改动带进组合期。
+    val glass = LocalGlassColors.current
     val p by animateFloatAsState(
         targetValue = if (distance == 0) 1f else 0f,
         animationSpec = GlassMotion.tweenLyric(),
@@ -794,8 +877,8 @@ private fun LyricLineRow(
     )
     val targetAlpha = when (distance) {
         0 -> 1f
-        1 -> 0.55f
-        else -> 0.34f
+        1 -> glass.lyricAdjacent.alpha
+        else -> glass.lyricFar.alpha
     }
     // 命名必须避开 `alpha`：`graphicsLayer { }` 的接收者 GraphicsLayerScope 也有 alpha，
     // 而局部委托属性优先级高于隐式接收者成员 —— 叫 alpha 会让下方 `alpha = ...` 变成
@@ -863,6 +946,14 @@ private fun PlayPauseButton(
     val interactionSource = remember { MutableInteractionSource() }
     Box(
         modifier
+            // A6 未落地（有意跳过，非遗漏）：pressScale 的 animationSpec 在 Glass.kt 内部写死
+            // GlassMotion.tweenPress()，函数签名不接受 spec，因此**无法从这个调用点**把它换成
+            // GlassSpring.gentle()。要做需要在 Glass.kt 给 pressScale 加一个可选的 spec 参数——
+            // 而 Glass.kt 本轮是别人的写域，且它是全 App 的按压基元，签名一改六屏都要重读。
+            // 正确的做法是下一轮由 Glass.kt 的 owner 统一加上 `spec: AnimationSpec<Float> =
+            // GlassMotion.tweenPress()` 默认参数（默认值保持现状 → 零回归），之后各调用点再按
+            // 「按钮类用 spring / 进度类用 tween」逐步切换。
+            // 66dp 大按钮本身的 0.93 缩放幅度是对的，这条只差动效曲线。
             .pressScale(interactionSource, pressed = 0.93f)
             .size(66.dp)
             .clip(CircleShape)
@@ -1006,8 +1097,10 @@ private fun GroupLabel(text: String) {
     Text(
         text,
         color = LocalGlassColors.current.textTertiary,
-        fontSize = 11.sp,
-        letterSpacing = 0.3.sp,
+        // A1：SectionLabelMicro = 11sp/14 + 0.3 字距，与旧的三处裸值（fontSize 11 + letterSpacing 0.3
+        // + 默认行高）逐项一致。字距是这个档位**唯一的层级信号**（它代替了「小号大写字母」的
+        // 视觉角色），所以必须由 token 一并携带，不能在调用点手写。
+        style = GlassText.SectionLabelMicro,
         modifier = Modifier.padding(start = 6.dp, top = 10.dp, bottom = 4.dp),
     )
 }
@@ -1016,15 +1109,25 @@ private fun GroupLabel(text: String) {
  * 已播时长文本：把「10Hz 变化」的 state 读取隔离成极小组件。
  *
  * 为什么单独抽：`state.progressSec` 每 100ms 写一次，若在控制台函数体里读取，整条控制台
- * （模式行 / 音量 / 播放键 / 队列入口……）都会每 tick 重组。进度轨已改为绘制期读，
+ * （模式行 / 播放键 / 队列入口……）都会每 tick 重组。进度轨已改为绘制期读，
  * 而 Text 必须组合期排版、绕不开——那就把重组范围缩到「一张文本」。
+ *
+ * [previewFraction]（2.2-D）：拖动进度条期间非空，此时显示**预览位置**而不是真实播放位置。
+ * 读取发生在本组件内部，因此拖动时只有这一张文本逐帧重组，控制台其余部分零重组。
+ * 拖动结束（回调传 null）后自动回到真实进度。
  */
 @Composable
-private fun ElapsedTimeText(state: AppState) {
+private fun ElapsedTimeText(state: AppState, previewFraction: MutableState<Float?>) {
+    // 拖动中读预览值；未拖动走真实进度。两个来源都在本组件内读 → 重组域最小
+    val preview = previewFraction.value
+    val shownSec = if (preview != null) preview * state.durationSec else state.progressSec
     Text(
-        state.progressSec.toInt().asTime(),
+        shownSec.toInt().asTime(),
         color = LocalGlassColors.current.textSecondary,
-        fontSize = 11.sp,
+        // B4 等宽数字：Numeric 带 fontFeatureSettings="tnum"。逐秒递增时比例数字下 "1" 比 "8" 窄，
+        // 文本宽度每秒跳变一次，且与右侧 TotalTimeText 的右对齐关系会轻微呼吸；
+        // tnum 让每个数字占同一字宽，时间轴彻底静止。字号/行高与旧裸 11sp 同档。
+        style = GlassText.Numeric,
     )
 }
 
@@ -1038,6 +1141,8 @@ private fun TotalTimeText(state: AppState) {
     Text(
         state.durationSec.toInt().asTime(),
         color = LocalGlassColors.current.textSecondary,
-        fontSize = 11.sp,
+        // B4：与 ElapsedTimeText 同走 Numeric（等宽）：两端同为 tnum 才能保证
+        // 「已播 / 总时长」这组对照数字宽度关系恒定（只改一侧会让两端的字宽基准不同）。
+        style = GlassText.Numeric,
     )
 }

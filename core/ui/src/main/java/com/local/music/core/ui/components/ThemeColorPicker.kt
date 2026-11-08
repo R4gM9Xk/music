@@ -29,6 +29,7 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.AuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
@@ -118,7 +119,7 @@ fun AuroraMiniPreview(
         Text(
             "极光预览",
             color = Color.White.copy(alpha = 0.9f),
-            fontSize = 12.sp,
+            style = GlassText.Caption,
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .padding(start = 12.dp, bottom = 10.dp),

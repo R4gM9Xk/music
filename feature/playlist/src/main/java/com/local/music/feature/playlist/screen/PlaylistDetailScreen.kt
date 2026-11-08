@@ -32,24 +32,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.AddSongsSheet
 import com.local.music.core.ui.components.ArtThumb
 import com.local.music.core.ui.components.CollectionActionsSheet
@@ -72,9 +63,11 @@ import com.local.music.core.ui.components.pressScale
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.theme.GlassIcons
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.onSeedColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 
@@ -152,36 +145,45 @@ fun PlaylistDetailScreen(
                     DetailHeader(state, data, onPlayAll = { playAll(it) }, onExportM3u = onExportM3u)
                     DetailHero(data, onPlayAll = { playAll(it) })
 
-                    // 曲目玻璃卡（.card glass → md 层级）；自建歌单且无失效引用时曲目行可长按拖拽重排
-                    GlassSurface(
-                        modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
-                        level = GlassLevel.Md,
-                        shape = RoundedCornerShape(R.Card18.dp),
-                    ) {
-                        Column(Modifier.padding(vertical = 6.dp)) {
-                            // 拖拽域 = 自建歌单的 addedTracks 序；列表随页面滚动（autoscroll 关闭：
-                            // 页面滚动容器含头图等额外内容，视口估算不成立，长歌单 v1 可接受）
-                            // dataVersion = 内容指纹（id 序列）：拖拽期间收藏/播放计数等任何写库
-                            // 导致 tracks 位移时，四道防错闸据此作废本次拖拽，堵住不可撤销的错位提交
-                            //（P2-17：原先未传 → 默认 null → 全部退化为"永不变"）
-                            ReorderableColumn(
-                                count = data.tracks.size,
-                                rowHeight = SongRowHeight,
-                                scrollState = pageScroll,
-                                dataVersion = data.tracks.map { it.id },
-                                onMove = { from, to -> state.movePlaylistTrack(state.detail.id, from, to) },
-                            ) { index ->
-                                DetailTrackRow(
-                                    state = state,
-                                    track = data.tracks[index],
-                                    tracks = data.tracks,
-                                    title = data.title,
-                                    // 可重排列表里长按专属于拖拽手势，菜单只走 ⋯ 按钮
-                                    reorderable = true,
-                                )
-                            }
-                            if (data.tracks.isEmpty()) EmptyTracksHint()
+                    // E1 视觉审计（曲目列表一律裸行）：此处原有 GlassSurface(Md) 玻璃卡外壳，已去掉。
+                    // 为什么裸行：曲库页 / 搜索结果 / 队列面板的歌单行都是裸行，唯独详情页把同一批
+                    // SongRow 关进一张玻璃卡——同一行组件在三个页面呈现两种层级，读者要靠卡片边缘
+                    // 才能判断"这些是歌"，而歌名/副标题本身已经承担了全部信息。卡片还额外吃掉
+                    // 左右各 20dp，使详情页行文字比曲库页深缩 20dp，跨页切换时列表像"抖"了一下。
+                    //
+                    // 为什么**只**去掉外壳、保留这层 Column：ReorderableColumn 的 KDoc 前提是
+                    // 「位于 scrollState 对应滚动容器的内容里」，且 autoscroll 为 false（本页不启用
+                    // 边缘自动滚动——滚动容器含头图等额外内容，视口估算不成立）。包裹层结构与改前
+                    // 逐字相同，拖拽的两条数学（行高网格、scrollState 值差补偿）因此零变化。
+                    // 行内边距（SongRow 自带 6dp 外边距 + 14dp 内边距 = 20dp 页面边距）正好落在
+                    // 全 App 统一的 PageMargin 上，裸行后无需再补任何左右内缩。
+                    //
+                    // 保留下来的 14dp 下内距：改前它是 GlassSurface 自己的外距（卡片底边到下一元素
+                    // 的呼吸），卡去掉后这段空白仍需要——否则最后一行会紧贴迷你条。上方的 6dp
+                    // （卡片内距）则按 E1 一并去掉，让首行直接承接 Hero 的 16dp 下距。
+                    Column(Modifier.fillMaxWidth().padding(bottom = 14.dp)) {
+                        // 拖拽域 = 自建歌单的 addedTracks 序；列表随页面滚动（autoscroll 关闭：
+                        // 页面滚动容器含头图等额外内容，视口估算不成立，长歌单 v1 可接受）
+                        // dataVersion = 内容指纹（id 序列）：拖拽期间收藏/播放计数等任何写库
+                        // 导致 tracks 位移时，四道防错闸据此作废本次拖拽，堵住不可撤销的错位提交
+                        //（P2-17：原先未传 → 默认 null → 全部退化为"永不变"）
+                        ReorderableColumn(
+                            count = data.tracks.size,
+                            rowHeight = SongRowHeight,
+                            scrollState = pageScroll,
+                            dataVersion = data.tracks.map { it.id },
+                            onMove = { from, to -> state.movePlaylistTrack(state.detail.id, from, to) },
+                        ) { index ->
+                            DetailTrackRow(
+                                state = state,
+                                track = data.tracks[index],
+                                tracks = data.tracks,
+                                title = data.title,
+                                // 可重排列表里长按专属于拖拽手势，菜单只走 ⋯ 按钮
+                                reorderable = true,
+                            )
                         }
+                        if (data.tracks.isEmpty()) EmptyTracksHint()
                     }
                     Spacer(Modifier.height(16.dp))
                 }
@@ -199,53 +201,32 @@ fun PlaylistDetailScreen(
                     item(key = "detail-hero") { DetailHero(data, onPlayAll = { playAll(it) }) }
 
                     if (data.tracks.isEmpty()) {
-                        // 空态独占一张完整的卡（与原实现同一形状：单块 glass 卡 + 内边距）
-                        item(key = "detail-empty") {
-                            GlassSurface(
-                                modifier = Modifier.fillMaxWidth()
-                                    .padding(start = 20.dp, end = 20.dp, bottom = 14.dp),
-                                level = GlassLevel.Md,
-                                shape = RoundedCornerShape(R.Card18.dp),
-                            ) {
-                                Column(Modifier.padding(vertical = 6.dp)) { EmptyTracksHint() }
-                            }
-                        }
+                        // 空态：与可重排分支同样走裸行（E1），不再独占一张 18dp 玻璃卡。
+                        // 空态本来就是一句话，套卡片会让"没有内容"这件事看起来像一块内容。
+                        item(key = "detail-empty") { EmptyTracksHint() }
                     } else {
-                        // 曲目卡：原实现是一整块 GlassSurface 里放 Column 全量行。LazyColumn 的懒项必须是
-                        // 直接子级（不能被卡片包住），所以把同一块卡按行切成**连续色带**逐段绘制：
-                        // 每段只画自己那条带的填充 + 左右边线，首/末段再补圆角、顶高光线与底边。
-                        // 各段填充同色且首尾相接，拼起来与单块卡视觉等价；而且逐段绘制不依赖行高是否恒等于
-                        // SongRowHeight（大字号下 SongRow 可能变高，仍是连续带，不会出现接缝）。
-                        itemsIndexed(listedTracks, key = { _, song -> song.id }) { index, track ->
-                            val isFirst = index == 0
-                            val isLast = index == listedTracks.lastIndex
-                            Box(
-                                Modifier
-                                    .fillMaxWidth()
-                                    // 卡片的左右 20dp 内缩与末段 14dp 外距（同原 GlassSurface 的 modifier）
-                                    .padding(
-                                        start = 20.dp,
-                                        end = 20.dp,
-                                        bottom = if (isLast) 14.dp else 0.dp,
-                                    )
-                                    .detailCardSegment(isFirst = isFirst, isLast = isLast),
-                            ) {
-                                // 卡片内容原有的上下 6dp 内边距，折进首/末段的绘制范围内（否则卡片会缺一条边）
-                                Box(
-                                    Modifier.padding(
-                                        top = if (isFirst) 6.dp else 0.dp,
-                                        bottom = if (isLast) 6.dp else 0.dp,
-                                    ),
-                                ) {
-                                    DetailTrackRow(
-                                        state = state,
-                                        track = track,
-                                        tracks = listedTracks,
-                                        title = data.title,
-                                        reorderable = false,
-                                    )
-                                }
-                            }
+                        // E1：曲目列表一律裸行。改前是「一整块 GlassSurface 被切成连续色带」的
+                        // 手绘方案（detailCardSegment），一行为一段填充 + 左右边线，首末段补圆角与
+                        // 顶高光线——为的是在 LazyColumn 里伪造一张不可分割的玻璃卡。卡本身去掉
+                        // 之后，这套分段绘制失去存在理由，函数一并删除。
+                        //
+                        // 关键约束（本次结构改动的风险点，逐条核对过）：
+                        // - item key 逻辑**一字未改**：仍是 song.id（P3-40 的唯一性约定），
+                        //   去重仍由上面的 listedTracks 负责 → 不会引入 "Key already used" 崩溃；
+                        // - DetailTrackRow 的四个实参完全不变（tracks 仍传去重后的 listedTracks，
+                        //   与播放队列口径一致）；
+                        // - 每行的 Item 结构从 Box(两三层) 变成直接 DetailTrackRow，
+                        //   组合层级变浅、行高仍由 SongRow 内容撑开 → 懒加载测量行为只变简单。
+                        // 左右 20dp 不再补：SongRow 自带 6dp 外边距 + 14dp 内边距，
+                        // 裸行后行文字正好落在全 App 统一的 20dp 页面边距上（与曲库页对齐）。
+                        itemsIndexed(listedTracks, key = { _, song -> song.id }) { _, track ->
+                            DetailTrackRow(
+                                state = state,
+                                track = track,
+                                tracks = listedTracks,
+                                title = data.title,
+                                reorderable = false,
+                            )
                         }
                     }
                     // 底部避让（原 18，归 16 刻度）
@@ -329,7 +310,9 @@ private fun DetailHeader(
             // 有意 null、非遗漏：语义已挂在外层圆钮上，子图标再给描述会重复播报
             Icon(GlassIcons.Back, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
         }
-        Text(data.header, color = LocalGlassColors.current.textPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        // A1 字号 token：16sp Bold 三连 → GlassText.TitleCompact（16 Bold 22）。
+        // 顶栏页名与下方 Hero 大标题刻意差两档（16/20），靠这里定死的档位表达，不再散在调用点
+        Text(data.header, color = LocalGlassColors.current.textPrimary, style = GlassText.TitleCompact)
         Spacer(Modifier.weight(1f))
         // 添加歌曲入口（顶栏 ＋，PageHeader 双动作钮同款惯例）：仅歌单类且非动态歌单——
         // 动态歌单（收藏 / 最近播放 / 最常播放）由状态实时解析，addToPlaylist 写入的叠加层
@@ -401,6 +384,15 @@ private fun DetailHeader(
 @Composable
 private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
     val palette = LocalAuroraPalette.current
+    // A4 对比度：压在 palette.seed 实底上的前景色必须由 seed 亮度派生，不能写死白色。
+    // 项目允许用户把主题色设成琥珀 #E0A800 / 草绿 #57A94A，白字压上去实测对比只有 ≈2:1
+    // ——"播放"这颗全页最重要的按钮反而成了最难读的元素。onSeedColor() 按 WCAG 相对亮度
+    // 阈值 0.5 在近黑/白之间二选一，浅色系 seed 自动转黑字。
+    //
+    // **必须在组合作用域内取值**：onSeedColor() 是 @Composable（它读 LocalAuroraPalette），
+    // 不能塞进 clickable / Icon 的 lambda 里裸调——那不在组合作用域内，编译直接报错。
+    // 这里在 DetailHero 函数体（组合期）取一次，两个消费点共用同一个色值。
+    val onSeed = onSeedColor()
     Row(
         Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 16.dp),
         verticalAlignment = Alignment.Bottom,
@@ -411,17 +403,24 @@ private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
             Modifier
                 .size(132.dp)
                 .shadow(18.dp, RoundedCornerShape(R.Card24.dp))
-                .border(1.dp, Color.White.copy(alpha = 0.28f), RoundedCornerShape(R.Card24.dp)),
+                // D5 硬编码白清扫：描边原写死 Color.White.copy(alpha = 0.28f)，浅色模式下
+                // 白描边压在近白极光 + 浅玻璃上等于**完全消失**，132dp 大封面失去边缘定义。
+                // stroke token 深色档本就是"白 0.28"（观感零变化），浅色档自动反转为近黑 0.14，
+                // 这是 token 存在的意义——同一处描边在两套主题下都画得出来。
+                .border(1.dp, LocalGlassColors.current.stroke, RoundedCornerShape(R.Card24.dp)),
             RoundedCornerShape(R.Card24.dp),
             bitmap = data.cover,
             artworkUri = data.coverUri,
         )
         Column(Modifier.weight(1f)) {
-            Text(data.title, color = LocalGlassColors.current.textPrimary, fontSize = 20.sp,
-                fontWeight = FontWeight.Bold, lineHeight = 26.sp,
+            // A1 字号 token：20sp Bold / lineHeight 26 三连 → GlassText.Title。
+            // 重要：行高原本裸写 26.sp 与新 token 的 LHTitle 同为 26——这里不是"顺手换个数"，
+            // 而是让 20/26 这组比值从"调用点手抄"变成"token 唯一定义"，后续调整只改一处
+            Text(data.title, color = LocalGlassColors.current.textPrimary, style = GlassText.Title,
                 maxLines = 2, overflow = TextOverflow.Ellipsis)
             Spacer(Modifier.height(6.dp))
-            Text(data.meta, color = LocalGlassColors.current.textSecondary, fontSize = 12.sp)
+            // A1：meta 12sp → GlassText.Caption（12 Normal 16），与全 App 副标题同档
+            Text(data.meta, color = LocalGlassColors.current.textSecondary, style = GlassText.Caption)
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 // 播放：seed 填充胶囊 + seed 色投影
@@ -447,8 +446,11 @@ private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     // 有意 null、非遗漏：同行「播放」文字已表达语义
-                    Icon(GlassIcons.Play, null, Modifier.size(16.dp), tint = Color.White)
-                    Text("播放", color = Color.White, fontSize = 13.sp) // seed 实底上保持白字
+                    // A4：tint 走 onSeed（压在 seed 实底上按亮度反转），不再写死 Color.White
+                    Icon(GlassIcons.Play, null, Modifier.size(16.dp), tint = onSeed)
+                    // A1：13sp 裸字号 → GlassText.BodyMedium（13 Medium 18）；
+                    // A4：文字色同上改 onSeed——琥珀 seed 下白字不可读
+                    Text("播放", color = onSeed, style = GlassText.BodyMedium)
                 }
                 // 随机：玻璃胶囊（玻璃底上用主题文字色，浅色下保持对比度）
                 // 读屏：GlassSurface 内部走 combinedClickable，同样不带 role，这里补上
@@ -465,7 +467,8 @@ private fun DetailHero(data: DetailData, onPlayAll: (Boolean) -> Unit) {
                     ) {
                         // 有意 null、非遗漏：同行「随机」文字已表达语义
                         Icon(GlassIcons.Shuffle, null, Modifier.size(16.dp), tint = LocalGlassColors.current.textPrimary)
-                        Text("随机", color = LocalGlassColors.current.textPrimary, fontSize = 13.sp)
+                        // A1：13sp → GlassText.BodyMedium，与「播放」胶囊同档（两个胶囊视觉等重）
+                        Text("随机", color = LocalGlassColors.current.textPrimary, style = GlassText.BodyMedium)
                     }
                 }
             }
@@ -524,86 +527,11 @@ private fun DetailTrackRow(
 private fun EmptyTracksHint() {
     Text(
         "这里还没有歌曲",
-        color = LocalGlassColors.current.textTertiary, fontSize = 13.sp,
+        // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
+        color = LocalGlassColors.current.textTertiary, style = GlassText.Body,
         modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
         textAlign = TextAlign.Center,
     )
-}
-
-/**
- * 曲目卡的「分段」外观：LazyColumn 的懒项不能被一整块 GlassSurface 包住，因此把一张
- * 18dp 圆角 / 1dp 描边 / 顶部高光线的 md 玻璃卡，按行切成首尾相接的色带。
- *
- * 为什么按 index 判定首/末、而不是「整卡画一次再按偏移裁剪」：后者需要知道每行相对卡片顶部的
- * 偏移，也就隐含「所有行高恒等于 SongRowHeight」——大字号下 SongRow 会长高，一旦假设不成立就是
- * 错位接缝。分段画与行高完全解耦。
- *
- * 填充走 clip + background（与 GlassSurface 同路子），**不要**自己再叠一层半透明 drawRect：
- * glass.md 是 alpha≈0.10 的白色，同层绘制两次会把圆角之外那几条边压深（视觉上出现一道暗带）。
- * 描边则只能手画：Modifier.border 会画满四条边，中段需要的是「只有左右两条」——
- * 否则每行之间都会多一条 1dp 横线，拼接后被看成 N 张卡而不是一张卡。
- */
-@Composable
-private fun Modifier.detailCardSegment(isFirst: Boolean, isLast: Boolean): Modifier {
-    val glass = LocalGlassColors.current
-    val corner = 18.dp
-    val shape = RoundedCornerShape(
-        topStart = if (isFirst) corner else 0.dp,
-        topEnd = if (isFirst) corner else 0.dp,
-        bottomStart = if (isLast) corner else 0.dp,
-        bottomEnd = if (isLast) corner else 0.dp,
-    )
-    return this
-        .clip(shape)
-        .background(glass.md)
-        // A3-09：几何量与 Brush/Stroke 全部进 drawWithCache——旧 drawBehind 每次绘制都
-        // new 一个 horizontalGradient（Shader 级分配）+ Stroke，滚动/面板动画期间首段
-        // 持续重绘时累积 GC 压力，违背 Glass.kt glassTopLine 的既定规约。
-        // cache 块在尺寸/玻璃配色变化时才重算，帧间复用
-        .drawWithCache {
-            val radius = corner.toPx()
-            val strokeW = 1.dp.toPx()
-            val half = strokeW / 2f // 描边内缩半像素：与 Modifier.border 被 clip 后的观感一致
-            val w = size.width
-            val h = size.height
-            val arcR = (radius - half).coerceAtLeast(0f)
-            val arcSize = Size(arcR * 2f, arcR * 2f)
-            val stroke = Stroke(strokeW)
-            val strokeColor = glass.strokeSoft
-            // 顶部高光线：与 GlassSurface 的 glassTopLine 同参数，只在首段画一次（否则每行一道）
-            val topLineBrush = Brush.horizontalGradient(
-                listOf(Color.Transparent, glass.topLine, Color.Transparent),
-                startX = w * 0.08f,
-                endX = w * 0.92f,
-            )
-            onDrawBehind {
-                // 左右竖边：首/末段从圆角之后起画（圆角那段由下面的弧线负责），中段通高
-                val sideTop = if (isFirst) half + arcR else 0f
-                val sideBottom = if (isLast) h - half - arcR else h
-                drawLine(strokeColor, Offset(half, sideTop), Offset(half, sideBottom), strokeW)
-                drawLine(strokeColor, Offset(w - half, sideTop), Offset(w - half, sideBottom), strokeW)
-
-                if (isFirst) {
-                    // 上圆角（左上 180°→270°、右上 270°→360°）+ 顶边
-                    drawArc(strokeColor, 180f, 90f, false, Offset(half, half), arcSize, style = stroke)
-                    drawArc(strokeColor, 270f, 90f, false, Offset(w - half - arcR * 2f, half), arcSize, style = stroke)
-                    drawLine(strokeColor, Offset(half + arcR, half), Offset(w - half - arcR, half), strokeW)
-                    drawLine(
-                        brush = topLineBrush,
-                        start = Offset(w * 0.08f, 0.5f),
-                        end = Offset(w * 0.92f, 0.5f),
-                        strokeWidth = strokeW,
-                    )
-                }
-                if (isLast) {
-                    // 下圆角（左下 90°→180°、右下 0°→90°）+ 底边
-                    val bottomTop = h - half - arcR * 2f
-                    drawArc(strokeColor, 90f, 90f, false, Offset(half, bottomTop), arcSize, style = stroke)
-                    drawArc(strokeColor, 0f, 90f, false, Offset(w - half - arcR * 2f, bottomTop), arcSize, style = stroke)
-                    drawLine(strokeColor, Offset(half + arcR, h - half), Offset(w - half - arcR, h - half), strokeW)
-                }
-            }
-        }
 }
 
 /**

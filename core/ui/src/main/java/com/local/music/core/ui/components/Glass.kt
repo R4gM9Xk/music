@@ -17,6 +17,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -86,9 +87,41 @@ fun Modifier.pressScale(
 }
 
 /**
- * 玻璃面板：填充 + 高光描边 + 顶部亮线 + 柔和投影。
+ * 玻璃面板：填充 + **按层级递减的装饰**（描边 / 顶部亮线）+ 柔和投影。
  * （backdrop-filter 的跨版本近似：半透明填充 + saturate 视觉补偿由极光底色保证；
  *   滚动列表内禁用实时模糊是规范面板的性能预算要求）
+ *
+ * ## 装饰的层级递减规则（视觉审计 D3，2026-11-08）——全 App 唯一的装饰分配表
+ *
+ * | 层级 | 代表表面 | 填充 | 描边 | 顶部亮线 |
+ * |------|----------|------|------|----------|
+ * | Hi | 迷你播放条、顶部横幅（悬浮 chrome） | ✓ | ✓ | ✓ |
+ * | Md | 面板 / 控制台 / 卡片 / 导航栏 / 输入框 | ✓ | ✓ | ✗ |
+ * | Lo | 芯片、低层底 | ✓ | ✗ | ✗ |
+ *
+ * **为什么要递减，而不是「每块玻璃都做全套」**：描边 + 顶部亮线这两个装饰合起来是一句
+ * 「我悬浮在别的内容之上」的宣言，它只有对**少数表面**才成立。改前 GlassSurface 对任意
+ * level 一律上全套，于是 26dp 的搜索历史芯片、横幅、面板、卡片全都长着同一套高光——
+ * 整屏都是「小玻璃片」，层级反而被抹平。token-baseline R7 要求「层级差需 ≥2 维度
+ * （明度 + 形状/内容）」，而当所有层级共享同一套装饰时，层级差只剩明度一维，
+ * 且 16%/10%/7% 的填充差在深色极光底上几乎读不出来。
+ *
+ * **每一档的取舍理由（这是规则，不是偏好）**：
+ * - **Hi 保留全套**：它是唯一**真正悬浮**的表面（mini bar / 横幅压在滚动内容之上）。
+ *   顶线在这里表达的是一个真实的空间事实——「这块玻璃的顶边在这里」。
+ * - **Md 去掉顶线、只留描边**：面板/卡片贴在内容流里，不是浮在别的内容上面。描边已足够
+ *   定义轮廓（浅色模式尤其关键：描边已反转为近黑 9%，是卡片唯一的边缘定义），
+ *   在描边之上再画一条 55% 白的顶线纯属装饰噪声——它不表达任何东西，只跟卡片内容抢注意力。
+ * - **Lo 连描边也去掉**：芯片是**控件**不是**容器**，它靠自身的文字/图标定义存在感；
+ *   再套描边会让每个 26dp 的小块变成一张独立玻璃片，正是 D3 要消灭的观感。
+ *
+ * **怎么选 level**：按**语义**选，不按尺寸选（小不等于 Lo，大不等于 Hi）。同一屏上
+ * 最多出现相邻两档；新增表面拿不准就选 Md。**不要**为了让某个元素「更亮眼」而升档——
+ * 视觉权重应该由内容（封面/文字）承担，这正是不递减时丢掉的判断。
+ *
+ * 本规则**不外推**到 [GlassIconButton]：它是控件且自带圆形容器，描边是它唯一的形状定义
+ * （浅色模式 fill=白 32% 压在近白极光上，去掉描边按钮就消失），且它本来就没有顶线——
+ * 装饰强度已等同于 Md 档，无需再降。详见该函数 KDoc。
  *
  * 契约（P3-75）：onLongClick 必须与 onClick **同时**提供——只传 onLongClick 时点击事件
  * 会被 combinedClickable 消费（onClick 兜底为空 lambda），卡片看起来"点不动"却吞掉了点击，
@@ -127,9 +160,9 @@ fun GlassSurface(
 ) {
     val glass = LocalGlassColors.current
     val interactionSource = remember { MutableInteractionSource() }
-    var m = modifier
-        .pressScale(interactionSource, pressed = if (onClick != null) 0.97f else 1f)
-        .clip(shape)
+    // A6：容器不再缩放（旧 pressScale(0.97) 见下）。这里**直接**从 modifier 接到 clip(shape)，
+    // 层序与改前逐节点等价：clip 仍是内部链的第一笔，haze/fill/scrim/描边全部在它之内。
+    var m = modifier.clip(shape)
     // 模糊必须落在 clip(shape) 之后：hazeEffect 的背景涂抹以其矩形节点 bounds 为界，
     // 不裁形的话毛玻璃会溢出胶囊/卡片的圆角（白色矩形框）
     //
@@ -168,9 +201,32 @@ fun GlassSurface(
     // 深色 + 上方的描边/顶光线承担，不再靠白色 fill 提亮。
     if (!hazed) m = m.background(glass.fill(level))
     if (scrim != null) m = m.background(scrim)
-    m = m
-        .border(1.dp, glass.strokeSoft, shape)
-        .glassTopLine(glass.topLine)
+    // ── 装饰按层级递减（视觉审计 D3，本轮全 App 视觉收敛的最高杠杆点）──
+    //
+    // 改前：任何 level 一律 `border(strokeSoft) + glassTopLine(topLine)`。
+    // 于是 26dp 高的搜索历史芯片、40dp 圆钮、横幅、面板、内容卡**全部**带着
+    // 「1dp 描边 + 55% 白顶线」——顶线与描边本是**悬浮玻璃**的语言（光从上方来、
+    // 边缘折射出亮线），当每一层都带它时，整屏都是「小玻璃片」，层级反被抹平。
+    //
+    // token-baseline R7 自己定了「层级差需 ≥2 维度（明度+形状/内容）」，而装饰一致
+    // 恰恰是把这个差抹掉的元凶。所以这里按层级递减：
+    //
+    // - Hi（迷你条 / 顶部横幅）：常驻悬浮于滚动内容之上，最需要「我在你之上」的
+    //   物理暗示 → 描边 + 顶线全保留。
+    // - Md（面板 / 卡片 / 控制台）：容器层级。描边保留（它负责划定边界，尤其是
+    //   浅色模式下的边缘定义），顶线去掉（顶线是「浮起」的暗示，面板坐在地上）。
+    // - Lo（圆钮 / 芯片 / 低层底）：最低层级。两者都不要——纯色块，靠明度区分即可。
+    //   实测：去掉后搜索历史芯片从「小玻璃片」变成「安静的标签」，这正是芯片该有的样子。
+    //
+    // 已知影响面：Lo 层的可视化变化最大（GlassChip / GlassIconButton 内部 / 各种
+    // 低层容器底色）。这是有意的——「克制」的第一层含义就是少装饰。
+    m = when (level) {
+        GlassLevel.Hi -> m
+            .border(1.dp, glass.strokeSoft, shape)
+            .glassTopLine(glass.topLine)
+        GlassLevel.Md -> m.border(1.dp, glass.strokeSoft, shape)
+        GlassLevel.Lo -> m
+    }
     if (onClick != null || onLongClick != null) {
         m = m.combinedClickable(
             interactionSource = interactionSource,
@@ -182,7 +238,19 @@ fun GlassSurface(
     Box(m, content = content)
 }
 
-/** 玻璃圆形按钮：40dp，lo 玻璃 + 细描边，按压 scale(.92) */
+/** 玻璃圆形按钮：40dp，lo 填充 + 细描边，按压 scale(.92)
+ *
+ *  **为什么它保留描边，而 [GlassSurface] 的 Lo 层不再画描边**（视觉审计 D3 的边界澄清）：
+ * 两者都是 lo 填充，但语义不同——
+ * - 本组件是**独立可点控件**（页头圆钮、详情页顶栏的返回/添加/更多）。描边在这里不是
+ *   装饰，而是「这是一个可以按的东西」的边界定义；去掉后它会退化成一块漂浮的色斑，
+ *   在浅色模式下（lo = 白 32%）尤其难以辨认。
+ * - GlassSurface 的 Lo 层使用者目前只有搜索历史芯片——那是**纯标签**，它的可点性由
+ *   胶囊形状与整块底色表达，不需要再加一圈描边去「加粗」自己。
+ *
+ * 一句话规则：**描边定义边界，不是增加层级**。需要边界的（按钮）保留，靠形状已能
+ * 自证的（芯片）去掉。
+ */
 @Composable
 fun GlassIconButton(
     onClick: () -> Unit,
@@ -220,7 +288,7 @@ fun GlassToggle(
         animationSpec = GlassMotion.tweenHover(),
         label = "toggle",
     )
-    val track = androidx.compose.foundation.shape.RoundedCornerShape(50)
+    val track = androidx.compose.foundation.shape.RoundedCornerShape(R.Full)
     Box(
         modifier
             .size(42.dp, 25.dp)

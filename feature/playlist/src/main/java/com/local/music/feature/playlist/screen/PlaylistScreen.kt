@@ -28,13 +28,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.ArtThumb
 import com.local.music.core.ui.components.ChromeBottomInset
@@ -51,10 +48,11 @@ import com.local.music.core.ui.components.PageHeader
 import com.local.music.core.ui.components.PlaylistCard
 import com.local.music.core.ui.components.SectionHeader
 import com.local.music.core.ui.components.SheetAction
-import com.local.music.core.ui.components.pressScale
+import com.local.music.core.ui.components.rowPressFeedback
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.theme.GlassIcons
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
 
@@ -116,9 +114,15 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                             leading = null,
                             onSearch = {
                                 if (newName.isNotBlank() && !duplicate) {
-                                    state.createPlaylist(newName)
+                                    val created = state.createPlaylist(newName)
                                     newName = ""
                                     modal.requestDismiss()
+                                    // 增-U1：创建后**直达新歌单详情**（旧实现只收面板，
+                                    // 用户在歌单墙里要自己找到新卡再点开才有「＋添加歌曲」，
+                                    // 空歌单尤其没有下一步提示）。详情页顶栏 ＋ 就是唯一的
+                                    // 「加歌」入口，直达等于把下一步摆在用户面前。
+                                    // detailReturn 由 openDetail 记为当前屏（歌单页），返回即回原位。
+                                    state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, created.id))
                                 }
                             },
                         )
@@ -134,9 +138,11 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                             emphasized = newName.isNotBlank() && !duplicate,
                             onClick = {
                                 if (newName.isNotBlank() && !duplicate) {
-                                    state.createPlaylist(newName)
+                                    val created = state.createPlaylist(newName)
                                     newName = ""
                                     modal.requestDismiss()
+                                    // 同 onSearch 分支：创建后直达详情（见上注释）
+                                    state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, created.id))
                                 }
                             },
                         )
@@ -252,7 +258,10 @@ private fun FavoriteRow(
             .fillMaxWidth()
             .padding(horizontal = 6.dp)
             .clip(RoundedCornerShape(R.Card14.dp))
-            .pressScale(interactionSource, pressed = 0.98f)
+            // A6：行级缩放改按压底色（与 SongRow/SettingRow/GroupRow 统一，见 rowPressFeedback
+            // 的 KDoc）。旧 pressScale(0.98) 在嵌于 GlassSurface 的短行组里尤其突兀——
+            // 缩放的是行，卡片外壳不动，按下时行像是从卡里 "浮起来" 再落回去。
+            .rowPressFeedback(interactionSource)
             .then(rowClickable)
             // 读屏（无障碍 P0-4）：整行可点（= 进入该动态歌单详情），但 clickable /
             // combinedClickable 不带 role，读屏只会念「收藏，12 首」而不会提示「按钮」。
@@ -265,9 +274,14 @@ private fun FavoriteRow(
     ) {
         ArtThumb(art, Modifier.size(48.dp), RoundedCornerShape(R.Thumb10.dp), bordered = true)
         Column(Modifier.weight(1f)) {
-            Text(title, color = LocalGlassColors.current.textPrimary, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+            // A1 字号 token：15sp Medium 三连 → GlassText.Row（15 Medium 21）。
+            // 与曲库页 GroupRow / 详情页曲目行同档——动态歌单行本质就是列表行。
+            // 有意不加 maxLines：原实现允许换行，本轮只做 token 接线，不夹带行为变化
+            //（FavoriteRow 无 maxLines 而 GroupRow 有，属跨组件不一致，已登记在报告里待下一轮）
+            Text(title, color = LocalGlassColors.current.textPrimary, style = GlassText.Row)
             Spacer(Modifier.height(2.dp))
-            Text(meta, color = LocalGlassColors.current.textTertiary, fontSize = 12.sp)
+            // A1：meta 12sp → GlassText.Caption（12 Normal 16）
+            Text(meta, color = LocalGlassColors.current.textTertiary, style = GlassText.Caption)
         }
         // 装饰性 chevron，**有意 null、非遗漏**：语义由整行的 role = Button 表达
         Icon(GlassIcons.ChevronRight, null, Modifier.size(16.dp),

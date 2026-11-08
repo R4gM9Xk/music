@@ -88,9 +88,15 @@ fun AuroraBackground(modifier: Modifier = Modifier) {
             // 光源柔边：单位空间径向渐变（center=0、radius=1），绘制时按光源半径缩放。
             // 颜色停靠点与漂移无关（alpha 固定），所以能整帧复用——这是本文件「零每帧分配」
             // 的关键：若在 onDrawBehind 里按新圆心 new Brush，就是每帧 3 个 Shader。
+            //
+            // 强度（视觉审计 D4）：0.55 / 0.28 → 0.34 / 0.16。
+            // 改前三团光源在高饱和暗底上是**主导视觉**，背景自己在表演；而本 App 的主角
+            // 是封面与歌词，Apple Music 的氛围底是「几乎静止的弱色场」——它的存在感应低于
+            // 任何一张封面。降到此量级后，背景仍然给整屏定调（色相还在），但不再与内容争。
+            // 注意这不是「调暗」，是**降低对内容的干扰**：色相与位置全部保留，只压幅度。
             fun blobBrush(c: Color) = Brush.radialGradient(
-                0f to c.copy(alpha = 0.55f),
-                0.55f to c.copy(alpha = 0.28f),
+                0f to c.copy(alpha = 0.34f),
+                0.55f to c.copy(alpha = 0.16f),
                 1f to Color.Transparent,
                 center = Offset.Zero,
                 radius = 1f,
@@ -103,21 +109,26 @@ fun AuroraBackground(modifier: Modifier = Modifier) {
             val blendTransitioning = themeFraction > 0.01f && themeFraction < 0.99f
 
             // 固定几何（px）：半径基准与 CSS 定位偏移
+            //
+            // 漂移幅度（视觉审计 D4）：原 46/30、40/44、30/36 全部 ×0.5 → 23/15、20/22、15/18。
+            // 周期保持 14/17/20s 不变——**降的是幅度不是速度**：慢速小幅的位移读起来是
+            // 「呼吸」，而快速大幅就是「飘动」。前者在被内容遮住大半之后几乎察觉不到，
+            // 后者会持续把注意力从歌词上拉走。
             val r1 = px(170)
             val r2 = px(150)
             val r3 = px(130)
             val cx1 = px(100)
             val cy1 = px(80)
-            val dx1 = px(46)
-            val dy1 = px(30)
+            val dx1 = px(23)
+            val dy1 = px(15)
             val cx2 = w - px(40)
             val cy2 = h * 0.26f + px(150)
-            val dx2 = px(40)
-            val dy2 = px(44)
+            val dx2 = px(20)
+            val dy2 = px(22)
             val cx3 = w * 0.14f + px(130)
             val cy3 = h - px(50)
-            val dx3 = px(30)
-            val dy3 = px(36)
+            val dx3 = px(15)
+            val dy3 = px(18)
 
             onDrawBehind {
                 drawRect(baseBrush)

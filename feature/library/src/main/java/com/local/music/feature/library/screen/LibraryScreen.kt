@@ -31,14 +31,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.ArtThumb
 import com.local.music.core.ui.components.ChromeBottomInset
@@ -58,11 +56,12 @@ import com.local.music.core.ui.components.SettingRow
 import com.local.music.core.ui.components.SongActionsSheet
 import com.local.music.core.ui.components.SheetAction
 import com.local.music.core.ui.components.SongRow
-import com.local.music.core.ui.components.pressScale
+import com.local.music.core.ui.components.rowPressFeedback
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.SongSort
 import com.local.music.core.ui.theme.GlassIcons
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
 
@@ -398,8 +397,13 @@ private fun GroupRow(
         modifier
             .fillMaxWidth()
             .padding(horizontal = 6.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .pressScale(interactionSource, pressed = 0.98f)
+            // C4：14dp 即 R 刻度里的 Card14（列表行容器），不再裸写数值
+            .clip(RoundedCornerShape(R.Card14.dp))
+            // A6：行级缩放改按压底色（与 SongRow/SettingRow 统一，见 rowPressFeedback 的 KDoc）。
+            // 旧实现 pressScale(0.98) 缩放整行——文字、封面、chevron 一起向中心位移，长列表里
+            // 相邻行静止而当前行缩小，人眼把这种相对位移读成「列表在抖」而不是「我按下了」。
+            // 底色只改明度、不动任何像素，而行的 6dp 外边距保证反馈底色落在卡片圆角内。
+            .rowPressFeedback(interactionSource)
             .then(rowClickable)
             // 读屏（无障碍 P0-4）：整行可点（= 进入该分组的详情页），但 clickable /
             // combinedClickable 只提供 onClick 动作、**不带 role**，读屏只会把
@@ -418,10 +422,14 @@ private fun GroupRow(
             bordered = true, bitmap = bitmap, artworkUri = artworkUri,
         )
         Column(Modifier.weight(1f)) {
-            Text(title, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1,
+            // A1 字号 token：15sp Medium 三连 → GlassText.Row（15 Medium 21）。
+            // 这是全 App 出现密度最高的文本档，改前与 SongRow / SettingRow 各写一遍字面量，
+            // 任一处调档就会与其余列表行错位
+            Text(title, style = GlassText.Row, maxLines = 1,
                 overflow = TextOverflow.Ellipsis, color = LocalGlassColors.current.textPrimary)
             Spacer(Modifier.height(2.dp))
-            Text(meta, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary,
+            // A1：meta 12sp → GlassText.Caption（12 Normal 16）
+            Text(meta, style = GlassText.Caption, color = LocalGlassColors.current.textTertiary,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         // 装饰性 chevron，**有意 null、非遗漏**：只是「这行能进去」的视觉提示，
@@ -438,7 +446,8 @@ private fun TabEmptyState(text: String) {
     Text(
         text,
         color = LocalGlassColors.current.textTertiary,
-        fontSize = 13.sp,
+        // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
+        style = GlassText.Body,
         textAlign = TextAlign.Center,
         modifier = Modifier.fillMaxWidth().padding(28.dp),
     )
@@ -474,7 +483,8 @@ private fun LibraryEmptyState(audioDenied: Boolean, onRequestAudioPermission: ()
         Text(
             "曲库里还没有歌曲 · 去设置页扫描音乐",
             color = LocalGlassColors.current.textTertiary,
-            fontSize = 13.sp,
+            // A1：13sp 裸字号 → GlassText.Body（13 Normal 18）
+            style = GlassText.Body,
             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 28.dp),
         )

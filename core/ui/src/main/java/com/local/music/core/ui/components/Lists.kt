@@ -3,6 +3,7 @@ package com.local.music.core.ui.components
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -35,7 +36,6 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -48,11 +48,14 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassMotion
+import com.local.music.core.ui.theme.GlassSpring
+import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
@@ -96,6 +99,13 @@ import com.local.music.core.ui.theme.auroraAccentColor
  * 剩下的约束：只能在组合作用域内读取。当前 4 个调用点全部满足；将来若要在非组合处使用，
  * 需要把值由调用方算好传下去，**不要**回头再引入一个写死的常量副本
  * （那就又回到「视觉一种高度、数学另一种高度」的双源漂移，本函数的全部意义就没了）。
+ *
+ * **本轮（A1）追加的耦合关系**：[SongRow] 的标题/副标题已改读 `GlassText.Row`（15sp）与
+ * `GlassText.Caption`（12sp），下面的推导式**必须**继续跟着这两个 token 走。
+ * 目前 token 字号与这里的字面量恰好一致，所以数值不变；但若将来有人调
+ * `GlassType.BodyEmph` / `GlassType.Caption`，这里必须同步——否则又会重新裂成
+ * 「token 是 15sp、行高数学按 14sp 算」的隐性失配。行高系数 1.35× 是刻意的保守估计
+ * （token 的 lineHeight 是 21/16sp，即 1.4/1.33×），取大值可保证不算矮。
  */
 val SongRowHeight: Dp
     @Composable get() {
@@ -108,6 +118,64 @@ val SongRowHeight: Dp
         // 大字号下文本列反超，行高随之上浮——这正是我们要的行为
         return 18.dp + maxOf(48.dp, textColumn)
     }
+
+/**
+ * 列表行的按压反馈：一层由 `pressedOverlay` 驱动的极淡底色，**不缩放**。
+ *
+ * **为什么列表行不能用 pressScale**（视觉审计 A6，2026-11-08）
+ *
+ * 改造前 SongRow / SettingRow 都是 `pressScale(0.98f)`。0.98 这个值看起来「很克制」，
+ * 但它缩放的是**整行**——文字、封面、图标、尾部控件全部一起向中心收缩。单行按下时
+ * 这 2% 是察觉不到的，可它带来两个真实问题：
+ *
+ * 1. **长列表里像抖动而不是按压**：相邻行静止、当前行缩小，人眼把这种相对位移读成
+ *    「列表在动」。滚动惯性未停时按下尤其明显——两种位移叠加，观感很廉价。
+ * 2. **缩放在视觉上不表达「按的是哪一行」**：缩放是位置/尺寸信号（那是拖拽与弹窗的语言），
+ *    而列表行的按压要回答的是「我按的这一行是哪一行」——这是**明度**问题。
+ *
+ * 所以改用一层 `pressedOverlay`（深色白 6%，浅色黑 5%）铺在行的范围内：
+ * 底色变化不移动任何像素，只在按下那一瞬间把整行轻微提亮。这也是系统原生的做法
+ * （ColorOS/Android 的 ripple 本质就是明度层，只是还带扩散动画）。
+ *
+ * **为什么用弹簧而不是 tween**：按压是一来一回的短动作，tween 是「定时播放」——
+ * 快速连点会让两次 tween 排队重启，出现「按下去还没回来又往下走」的僵硬感；
+ * 弹簧继承当前速度、可被打断，这是 ColorOS 原生手感的来源
+ * （`GlassSpring.gentle()` 阻尼接近临界、不振荡，用于按压回弹正合适）。
+ *
+ * **为什么画方角矩形、而不是在这里也声明 R.Card14 圆角**：这个助手的两个使用者语境不同——
+ * [SongRow] 自己带 `clip(RoundedCornerShape(Card14))`（行有 6dp 外边距，需要圆角），
+ * 而 [SettingRow] 是设置卡内部**通栏**的一行（无外边距，行底就该是竖直边缘）。
+ * 同一个硬编码圆角在两边必有一边是错的。Compose 的 `clip()` 会裁剪其**之后**的绘制，
+ * 所以这里只负责铺一块满宽的明度层，圆角由调用方已有的 clip 决定——
+ * 这样圆角只有一个来源，不会出现「助手圆角 14、行 clip 圆角 18」的错位。
+ *
+ * 注意本函数只负责**画**反馈，不挂 clickable / semantics——交互仍由调用点的
+ * `clickable(interactionSource = ...)` 承担，两者靠同一个 source 串起来。
+ * 这样纯展示行（无 onClick）也不会误带按压态。
+ */
+@Composable
+fun Modifier.rowPressFeedback(source: MutableInteractionSource): Modifier {
+    val pressed by source.collectIsPressedAsState()
+    // 刻意**不**用 `by` 解构动画值：把 State 对象本身带进 drawBehind，让数值只在绘制期读取。
+    // 组合期读（`val a by ...`）会让这一整行在按下的每一帧重组；而底色变化只影响绘制结果，
+    // 不值得付重组代价——同一红线在 WaveIndicator 与 ArtThumb 里都已登记过。
+    // 弹簧也吃得住 alpha 的「快上慢回」：gentle() 阻尼接近临界，按下与松手的
+    // 收束时长天然对称，不需要拆成两条曲线。
+    val overlay = animateFloatAsState(
+        targetValue = if (pressed) 1f else 0f,
+        // 显式写 <Float>：本次改造在无构建验证的条件下交付，去掉一处「靠返回类型推断
+        // 去解 spring<T> 的 T」的依赖，类型对不上会直接编译失败——这个风险不值得省两个字符
+        animationSpec = GlassSpring.gentle<Float>(),
+        label = "rowPressOverlay",
+    )
+    val color = LocalGlassColors.current.pressedOverlay
+    return drawBehind {
+        // 绘制期读值：只在按下/松手的那几帧触发重绘，不产生重组
+        val a = overlay.value
+        // a == 0 时整段跳过：绝大多数帧行都不处于按压态，不该白付一次绘制指令
+        if (a > 0f) drawRect(color.copy(alpha = color.alpha * a))
+    }
+}
 
 /**
  * 大标题页头：30sp 粗体 + 可选右侧玻璃圆钮（.hd），可挂第二动作（渲染在主动作左侧）。
@@ -141,8 +209,10 @@ fun PageHeader(
         verticalAlignment = Alignment.Bottom,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Text(title, color = LocalGlassColors.current.textPrimary, fontSize = 30.sp, fontWeight = FontWeight.Bold,
-            letterSpacing = (-0.6).sp)
+        // A1：字号/字重/行高整体读 GlassText.Display，不再在调用点手写三连。
+        // 同时**删掉**原来的 letterSpacing = (-0.6).sp（B5）：负字距是拉丁排版的压排手段，
+        // CJK 字形等宽且笔画已顶到字身框，压字距只会让笔画互相挤，30sp 大标题上尤其明显。
+        Text(title, color = LocalGlassColors.current.textPrimary, style = GlassText.Display)
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             if (action2Icon != null && onAction2 != null) {
                 GlassIconButton(
@@ -201,7 +271,7 @@ fun GlassSearchBox(
             Icon(GlassIcons.Search, null, Modifier.size(18.dp),
                 tint = if (placeholder) LocalGlassColors.current.textSecondary else LocalGlassColors.current.textPrimary)
             Text(
-                text, fontSize = 15.sp,
+                text, style = GlassText.Row,
                 color = if (placeholder) LocalGlassColors.current.textSecondary else LocalGlassColors.current.textPrimary,
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
@@ -244,13 +314,13 @@ fun GlassTabs(
                     .pressScale(interactionSource, pressed = 0.95f)
                     // .tab.on：box-shadow 0 6px 16px seed 45%（elevation 动画，颜色恒定）
                     .shadow(
-                        shadowElevation, RoundedCornerShape(50), clip = false,
+                        shadowElevation, RoundedCornerShape(R.Full), clip = false,
                         ambientColor = palette.seed.copy(alpha = 0.45f),
                         spotColor = palette.seed.copy(alpha = 0.45f),
                     )
-                    .clip(RoundedCornerShape(50))
+                    .clip(RoundedCornerShape(R.Full))
                     .background(bg)
-                    .border(1.dp, borderColor, RoundedCornerShape(50))
+                    .border(1.dp, borderColor, RoundedCornerShape(R.Full))
                     .clickable(interactionSource = interactionSource, indication = null) { onSelect(index) }
                     .semantics {
                         // 读屏语义：tab 角色 + 选中态（与 Chrome.kt 底导航 GlassNavBar 同款）
@@ -259,11 +329,10 @@ fun GlassTabs(
                     }
                     .padding(horizontal = 15.dp, vertical = 7.dp),
             ) {
-                Text(
-                    label, fontSize = 13.sp,
-                    color = textColor,
-                    fontWeight = if (on) FontWeight.Medium else FontWeight.Normal,
-                )
+                // A1：13sp 档 token 化。选中态用 BodyMedium（13 Medium）、未选中用 Body（13 Normal）——
+                // 与改造前「fontSize 13 + 字重条件」的观感完全一致，只是把「选中加粗」这个层级
+                // 信号从裸 fontWeight 改成两个 token 的选择，字重不再是一个可以随手填的值。
+                Text(label, style = if (on) GlassText.BodyMedium else GlassText.Body, color = textColor)
             }
         }
     }
@@ -305,8 +374,12 @@ fun SongRow(
         modifier
             .fillMaxWidth()
             .padding(horizontal = 6.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .pressScale(interactionSource, pressed = 0.98f)
+            // C4：14dp 是 R 刻度里的 Card14（列表行卡片），不再裸写数值
+            .clip(RoundedCornerShape(R.Card14.dp))
+            // A6：行级缩放改按压底色（见 rowPressFeedback 的 KDoc）。
+            // 旧实现 pressScale(0.98) 只把整行缩 2%，长列表里文字/封面一起位移，
+            // 视觉上更像「抖动」而不是「按下了」；底色反馈只动明度，位置完全静止。
+            .rowPressFeedback(interactionSource)
             .then(rowClickable)
             // ── 读屏语义（无障碍 P0-4）──
             //
@@ -347,13 +420,13 @@ fun SongRow(
         )
         Column(Modifier.weight(1f)) {
             Text(
-                song.title, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1,
+                song.title, style = GlassText.Row, maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 // 播放/选中态强调色用 auroraAccentColor()（浅色回退 seed）：seed3 过浅压不住浅色背景
                 color = if (playing || selected) auroraAccentColor() else LocalGlassColors.current.textPrimary,
             )
             Spacer(Modifier.height(2.dp))
-            Text(song.subtitle, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary,
+            Text(song.subtitle, style = GlassText.Caption, color = LocalGlassColors.current.textTertiary,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         // A3-03：尾槽随播放/选中/操作态交叉淡化（tweenHover）——旧实现 if 硬换，
@@ -378,7 +451,8 @@ fun SongRow(
                     WaveIndicator(barCount = 4, playing = wavePlaying)
                 }
                 "selected" -> {
-                    Text("已选", fontSize = 12.sp, color = auroraAccentColor(), fontWeight = FontWeight.Medium)
+                    // A1：尾部状态标记用 CaptionMedium（12 Medium），与主/副标题同阶梯的强调档
+                    Text("已选", style = GlassText.CaptionMedium, color = auroraAccentColor())
                 }
                 "remove" -> {
                     Box(
@@ -437,7 +511,11 @@ fun SongRow(
                 }
                 else -> {
                     if (trailing != null) {
-                        Text(trailing, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary)
+                        // B4：尾槽常态是时长（mm:ss），必须走 Numeric 等宽数字 token——
+                        // 比例数字下 "1" 比 "8" 窄，一列时长右对齐会参差不齐，滑动时字宽还会闪。
+                        // 特例：ActionsSheet 会把这里换成「已添加」，tnum 对 CJK 无副作用（只作用数字），
+                        // 所以同一个 token 可以安全覆盖两种文案，不需要再加分支。
+                        Text(trailing, style = GlassText.Numeric, color = LocalGlassColors.current.textTertiary)
                     }
                 }
             }
@@ -448,13 +526,37 @@ fun SongRow(
 /** 分组小标题（.sec） */
 @Composable
 fun SectionHeader(text: String, modifier: Modifier = Modifier) {
+    // A1：SectionLabel 自带 0.3 字距——小号标签没有字号/字重可用时，字距是它唯一的层级信号，
+    // 所以这个 +0.3 不是装饰而是语义，必须跟 token 一起走，不能留在这里裸写
     Text(
-        text, fontSize = 12.sp, color = LocalGlassColors.current.textTertiary, letterSpacing = 0.3.sp,
+        text, style = GlassText.SectionLabel, color = LocalGlassColors.current.textTertiary,
         modifier = modifier.padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 8.dp),
     )
 }
 
-/** 歌单卡：md 玻璃卡 + 封面 1.6:1 + 底部 lo 玻璃文字区（.pcard glass / .pt）；onLongClick = 操作菜单 */
+/**
+ * 歌单卡：md 玻璃卡 + 封面 **1:1** + 底部 lo 玻璃文字区（.pcard glass / .pt）；onLongClick = 操作菜单
+ *
+ * **C1（视觉审计，本轮最高优先）**：封面比例由 1.6f 改为 1f。
+ * 1.6:1 是横幅/头图的构图比例（宽银幕），用在**歌单封面卡**上时，封面被裁成一条扁带：
+ * 专辑/歌单封面的原始素材几乎都是正方形，非等比裁切会切掉构图主体（人脸、唱片、
+ * 文字标题都在中心区），而且卡片整体变成一个矮宽的「色块」——它看起来像一条横幅，
+ * 不像一张可以点进去的唱片。全 App 的封面语言（SongRow 48dp 方图、详情页 Hero、
+ * 播放页封面）都是方的，只有这里是扁的，比例本身就在跟其它页面对不上。
+ * 改 1:1 之后：封面题材不被裁、卡片轮廓与其它封面元素同源、歌单页的栅格也变得更整齐。
+ *
+ * 内层 [ArtThumb] 的 `RoundedCornerShape(0.dp)` **保持不动**：封面是卡片的顶边元素，
+ * 必须由外层 [GlassSurface] 的 R.Card18 一次性裁出上圆角，自己再带圆角会在顶部
+ * 与卡片边缘形成「双圆弧」，也就是嵌套圆角里最难看的那种错位（C4）。
+ *
+ * **A6 按下反馈：本卡片没有单独接 [rowPressFeedback]，这是有意的**
+ * 卡片的点击完全委托给 [GlassSurface]（onClick/onLongClick 都是它的参数），而
+ * GlassSurface 内部自建 MutableInteractionSource、**不对外暴露**——要从外面接一层底色，
+ * 只能给 GlassSurface 加一个 interactionSource 参数，而那是 Glass.kt 的写域且属改签名。
+ * 更重要的是**没必要**：GlassSurface 自身正在由材质层负责改为 pressedOverlay 反馈
+ * （task-2 A6），本卡片作为它的直接使用者会自动获得同一套观感。
+ * 在这里再叠一层会出现「两层底色叠加」= 双倍亮度，也就是同一个反馈被画了两次。
+ */
 @Composable
 fun PlaylistCard(
     title: String,
@@ -470,13 +572,15 @@ fun PlaylistCard(
     GlassSurface(
         modifier = modifier,
         level = GlassLevel.Md,
-        shape = RoundedCornerShape(18.dp),
+        // C4：18dp = R.Card18（标准卡片容器）。封面靠这一层裁上圆角（见函数 KDoc 末段）
+        shape = RoundedCornerShape(R.Card18.dp),
         onClick = onClick,
         onLongClick = onLongClick,
     ) {
         Column {
             ArtThumb(
-                art, Modifier.fillMaxWidth().aspectRatio(1.6f), RoundedCornerShape(0.dp),
+                // C1：1:1 方形封面（原本 1.6f）——理由见函数 KDoc
+                art, Modifier.fillMaxWidth().aspectRatio(1f), RoundedCornerShape(0.dp),
                 bitmap = bitmap, artworkUri = artworkUri,
             )
             Column(
@@ -485,9 +589,9 @@ fun PlaylistCard(
                     .background(glass.lo)
                     .padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 12.dp),
             ) {
-                Text(title, color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium,
+                Text(title, color = LocalGlassColors.current.textPrimary, style = GlassText.BodyMedium,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(meta, color = LocalGlassColors.current.textTertiary, fontSize = 11.sp,
+                Text(meta, color = LocalGlassColors.current.textTertiary, style = GlassText.Micro,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
@@ -525,12 +629,14 @@ fun SettingRow(
     Row(
         modifier
             .fillMaxWidth()
-            // A2-08：有 onClick 时补按压回弹——旧实现 indication=null 且无 pressScale，
-            // 设置页全部行按下零反馈，与 SheetAction/SongRow 的玻璃按压语言断裂
+            // A2-08：有 onClick 时补按压反馈——旧实现 indication=null 且零视觉反馈，
+            // 设置页全部行按下毫无响应，与其它玻璃元件的按压语言断裂。
+            // A6：反馈从 pressScale(0.98) 换成底色层（见 rowPressFeedback 的 KDoc）：
+            // 整行等比缩放会让图标块与文字一起位移，设置页一行里有开关等控件时尤其像抖动。
             .then(
                 if (onClick != null) {
                     Modifier
-                        .pressScale(interactionSource, pressed = 0.98f)
+                        .rowPressFeedback(interactionSource)
                         .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
                         // 语义只在真可点时挂，见函数 KDoc
                         .semantics { this.role = Role.Button }
@@ -553,9 +659,16 @@ fun SettingRow(
             Icon(icon, null, Modifier.size(18.dp), tint = LocalGlassColors.current.textPrimary)
         }
         Column(Modifier.weight(1f)) {
-            Text(title, color = LocalGlassColors.current.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Text(title, color = LocalGlassColors.current.textPrimary, style = GlassText.BodyMedium)
             Spacer(Modifier.height(2.dp))
-            Text(subtitle, color = LocalGlassColors.current.textTertiary, fontSize = 11.sp)
+            // B5：副标题补 maxLines = 2 —— 副标题里的「当前 x」状态说明（如导入/更新失败原因）
+            // 文案长度不可控，此前换行无上限：长文案会折到 3 行以上，把整行撑高，
+            // 相邻行的基线随之错位（设置页是密集列表，一处撑高整段看起来就"散"了）。
+            // 两行是「说清楚一件事」与「不破坏行节奏」的折中，超出用省略号收尾。
+            Text(
+                subtitle, color = LocalGlassColors.current.textTertiary, style = GlassText.Micro,
+                maxLines = 2, overflow = TextOverflow.Ellipsis,
+            )
         }
         trailing()
     }
