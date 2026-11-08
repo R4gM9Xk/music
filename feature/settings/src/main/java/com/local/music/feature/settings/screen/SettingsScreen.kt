@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.AuroraMiniPreview
 import com.local.music.core.ui.components.ChromeBottomInset
+import com.local.music.core.ui.components.DropdownOption
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassToggle
@@ -36,6 +37,7 @@ import com.local.music.core.ui.components.ModalSheet
 import com.local.music.core.ui.components.PageHeader
 import com.local.music.core.ui.components.ProgressTrack
 import com.local.music.core.ui.components.SectionHeader
+import com.local.music.core.ui.components.SettingDropdown
 import com.local.music.core.ui.components.SettingRow
 import com.local.music.core.ui.components.SheetAction
 import com.local.music.core.ui.components.ThemeColorSwatches
@@ -279,56 +281,51 @@ fun SettingsScreen(
                 SettingRow(
                     // A5 图标语义：三条音效链之外，「玻璃强度」是**外观档位**设置，
                     // 用齿轮表达「设置项」；原 Book 是文档语义，与下方崩溃日志/版本行混淆
-                    GlassIcons.Gear, "玻璃强度", "${state.glassLevel.label}（可改通透 / 浓郁）",
-                    onClick = {
-                        modal.show {
-                            ModalSheet(modal, "玻璃强度") {
-                                GlassIntensity.entries.forEach { level ->
-                                    SheetAction(
-                                        // 面板项沿用行图标的「档位设置」语义（Gear），
-                                        // 让用户从行到面板看到同一个符号，不必重新认一遍
-                                        icon = GlassIcons.Gear,
-                                        label = level.label,
-                                        subtitle = when (level) {
-                                            GlassIntensity.Transparent -> "填充与描边减淡，更通透"
-                                            GlassIntensity.Standard -> "设计稿默认档位"
-                                            GlassIntensity.Rich -> "填充加浓，玻璃感更强"
-                                        },
-                                        emphasized = state.glassLevel == level,
-                                        onClick = {
-                                            state.glassLevel = level
-                                            modal.requestDismiss()
-                                        },
-                                    )
-                                }
-                            }
-                        }
+                    GlassIcons.Gear, "玻璃强度", "填充与描边浓淡，影响全部玻璃表面",
+                    // 真机反馈改为**行内下拉**（系统设置「自动息屏」同款）：
+                    // 三选一的档位不值得付一次模态转场 + 整屏遮挡的代价。
+                    // 回调在选中瞬间生效，没有「确定」——单选没有可失败的提交。
+                    trailing = {
+                        SettingDropdown(
+                            value = state.glassLevel.label,
+                            label = "玻璃强度",
+                            selected = state.glassLevel,
+                            options = GlassIntensity.entries.map { level ->
+                                DropdownOption(
+                                    label = level.label,
+                                    subtitle = when (level) {
+                                        GlassIntensity.Transparent -> "填充与描边减淡，更通透"
+                                        GlassIntensity.Standard -> "设计稿默认档位"
+                                        GlassIntensity.Rich -> "填充加浓，玻璃感更强"
+                                    },
+                                    payload = level,
+                                )
+                            },
+                            onSelect = { state.glassLevel = it },
+                        )
                     },
                 )
                 RowDivider()
                 SettingRow(
-                    GlassIcons.Gear, "动效强度", "${state.motionLevel.label}（可改克制 / 增强）",
-                    onClick = {
-                        modal.show {
-                            ModalSheet(modal, "动效强度") {
-                                MotionIntensity.entries.forEach { level ->
-                                    SheetAction(
-                                        icon = GlassIcons.Gear,
-                                        label = level.label,
-                                        subtitle = when (level) {
-                                            MotionIntensity.Restrained -> "过渡更快（×0.6）"
-                                            MotionIntensity.Standard -> "设计稿默认档位"
-                                            MotionIntensity.Enhanced -> "过渡更绵长（×1.4）"
-                                        },
-                                        emphasized = state.motionLevel == level,
-                                        onClick = {
-                                            state.motionLevel = level
-                                            modal.requestDismiss()
-                                        },
-                                    )
-                                }
-                            }
-                        }
+                    GlassIcons.Gear, "动效强度", "过渡动画的快慢，不影响极光与波形",
+                    trailing = {
+                        SettingDropdown(
+                            value = state.motionLevel.label,
+                            label = "动效强度",
+                            selected = state.motionLevel,
+                            options = MotionIntensity.entries.map { level ->
+                                DropdownOption(
+                                    label = level.label,
+                                    subtitle = when (level) {
+                                        MotionIntensity.Restrained -> "过渡更快（×0.6）"
+                                        MotionIntensity.Standard -> "设计稿默认档位"
+                                        MotionIntensity.Enhanced -> "过渡更绵长（×1.4）"
+                                    },
+                                    payload = level,
+                                )
+                            },
+                            onSelect = { state.motionLevel = it },
+                        )
                     },
                 )
                 RowDivider()

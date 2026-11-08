@@ -374,13 +374,44 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         // 24 会把封面压回 363dp 以下；20 是「取整到 S 刻度后的下限」——封面与屏幕
                         // 边缘的呼吸感仍在，同时与歌名组的左边距**同值**，于是封面左缘和歌名左缘
                         // 在宽度受限的机型上天然对齐（见 titleBlock）。
+                        //
+                        // ## 真机反馈修正（2026-11-08 装机后）：上一版封面仍然太大
+                        //
+                        // 上一版留白 20dp + 高度档是唯一约束，411dp 屏上算出来 371dp ——
+                        // 占屏宽 90%，把歌名组和玻璃控制台一起压到屏幕最下面，读起来是
+                        // 「一张图 + 一条尾巴」而不是「一张唱片 + 一套控制台」。
+                        // 封面**不该吃掉整个舞台**：它需要给上方的顶栏、下方的歌名留出可呼吸的空
+                        // 白，否则「内容优先」会退化成「封面优先」。
+                        //
+                        // 修正为**三档取小**，并给宽度档加一个 0.82 的比例上限：
+                        // 1. 宽度档 = stageW × 0.82（不是 stageW − 留白：留白随屏幕走，
+                        //    比例才是跨机型稳定的构图关系。0.82 在 411dp 屏上 ≈ 337dp，
+                        //    两侧各余 ~37dp，与歌名的 20dp 左边距形成「外向留白 > 内向留白」的
+                        //    经典构图比例）；
+                        // 2. 高度档 = stageH − 纯音乐预留 − stageH × 0.16（呼吸从 8% 提到 16%：
+                        //    8% 在 905dp 高的屏上只有 72dp，扣掉纯音乐预留后几乎不留白）；
+                        // 3. 绝对上限 360dp——**这是本仓唯一允许的常量上限**，理由见下。
+                        //
+                        // 为什么要重新引入一个常量上限（上一轮刚取消掉 280dp）：纯比例推导在
+                        // 平板/折叠屏上会让封面长到 600dp+，而唱片封面是**有视觉合理尺寸**的
+                        // 内容——超过约 360dp 后它不再「随屏幕变大而更清晰」，只是把同一张
+                        // 位图放大插值。所以比例负责**跨机型比例感**，常量负责**质量上限**，
+                        // 两者取小才是完整的表达式。360 这个值来自：411dp 屏 × 0.82 ≈ 337 < 360
+                        // （窄机仍由比例主导），平板才触顶。
                         val coverEdgePx = with(density) { S.Gap20.dp.toPx() }
                         // 纯音乐空态文案（封面下方 20dp 起、Micro 行高 14 + 折行余量 ≈ 18）预留 38dp。
                         // 这个数**必须从封面可用高度里扣**：不扣的话，高度受限的机型上文案会被
                         // 推出舞台、压进歌名组（文案是 offset 定位的，不受舞台高度裁剪）。
                         val pureMusicReservePx = if (pureMusic) with(density) { 38.dp.toPx() } else 0f
-                        val availH = (stageH - pureMusicReservePx - stageH * 0.08f).coerceAtLeast(0f)
-                        val bigSize = minOf(stageW - coverEdgePx * 2f, availH).coerceAtLeast(0f)
+                        val coverMaxPx = with(density) { 360.dp.toPx() }
+                        val availH = (stageH - pureMusicReservePx - stageH * 0.16f).coerceAtLeast(0f)
+                        val bigSize = minOf(
+                            // 宽度档：比例为主，但要保证不小于「屏宽 − 2×边距」，否则用户手动
+                            // 用超窄分屏时封面会被压成比边距还小的碎片
+                            minOf(stageW * 0.82f, stageW - coverEdgePx * 2f).coerceAtLeast(0f),
+                            availH,
+                            coverMaxPx,
+                        ).coerceAtLeast(0f)
                         // 封面中心：扣掉预留后那段区域的中心（纯音乐时整体上移半个预留高）
                         val bigCenterY = (stageH - pureMusicReservePx) / 2f
                         val smallRect = Rect(smallLeft, smallTop, smallLeft + smallSize, smallTop + smallSize)
@@ -710,48 +741,71 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     // `shuffleOn` / `repeatMode` 两个字段名与语义**一字未改**（旧快照、旧入口、
                     // 引擎下发全部照旧），映射与派生逻辑收敛在 AppState.cyclePlayMode() 的
                     // KDoc 里（一张表，读它即可）。
+                    // ## 控制键行的排布：为什么不用 SpaceBetween（真机装机后修正）
+                    //
+                    // 上一版是 `Row(SpaceBetween)` 塞 5 个子项（模式钮 / 上一首 / 播放 / 下一首 /
+                    // 32dp 占位）。实测（411dp 屏，截图逐像素测量）：
+                    //   模式钮图标中心 13.8% ｜ 上一首 29% ｜ 播放 50% ｜ 下一首 71% ｜ 右侧空
+                    // 左右**不对称**——左边有个真实控件占位、右边是个空 Spacer，两者宽度不同
+                    // （模式钮 32dp vs Spacer 32dp 看似相同，但 SpaceBetween 均分的是
+                    // 「剩余空间」，5 个宽度不等的子项被均分后，播放键与两侧的**间距**并不相等）。
+                    // 肉眼读作「播放键偏右、左边挤了一个模式钮」，正是用户反馈的「排版有点错误」。
+                    //
+                    // 修正：**两侧等权重的三段式** —— 左段 weight(1f)、中段固定宽度（三枚控制键
+                    // 居中）、右段 weight(1f)。这样播放键**恒在屏幕正中**，与下方进度条严格对齐；
+                    // 上一首/下一首以播放键为中心对称分布；模式钮落在左段右缘。
+                    // 右段刻意留空（不放任何控件）：它不是「待填的坑」，而是让左段的模式钮
+                    // 有对手的**配重**——不对称的排布在视觉上永远读作「错位」，除非两侧都有内容。
                     Row(
-                        Modifier.fillMaxWidth().padding(top = 10.dp, start = 2.dp, end = 2.dp),
+                        Modifier.fillMaxWidth().padding(top = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        PlayModeButton(
-                            state = state,
-                            // 按钮只上报「切到哪一档了」，停留计时的 State 在屏幕级（见上方 modeLabel）
-                            onModeChanged = { modeLabel = it },
-                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
-                        )
-                        ConsoleIcon(
-                            onClick = { state.prev() },
-                            contentDescription = "上一首",
-                            modifier = Modifier.graphicsLayer { alpha = softAlpha() },
-                        ) {
-                            Icon(GlassIcons.Prev, null, Modifier.size(28.dp),
-                                tint = LocalGlassColors.current.textSecondary)
+                        // 左段：模式钮靠右对齐（贴近中段，不贴屏幕边缘——贴边会让它读作
+                        // 「页面的边距元素」而不是「控制行的一员」）
+                        Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+                            PlayModeButton(
+                                state = state,
+                                // 按钮只上报「切到哪一档了」，停留计时的 State 在屏幕级（见上方 modeLabel）
+                                onModeChanged = { modeLabel = it },
+                                modifier = Modifier.graphicsLayer { alpha = softAlpha() },
+                            )
                         }
-                        PlayPauseButton(
-                            playing = state.playing,
-                            onClick = state::togglePlayPause,
-                            modifier = Modifier
-                                .trackFlight(FlightKeys.PlayerPlay)
-                                .graphicsLayer { alpha = sharedInnerAlpha() },
-                        )
-                        ConsoleIcon(
-                            onClick = { state.next() },
-                            contentDescription = "下一首",
-                            modifier = Modifier
-                                .trackFlight(FlightKeys.PlayerNext)
-                                .graphicsLayer { alpha = sharedInnerAlpha() },
+                        // 中段：三枚控制键固定间距。用 spacedBy 而不是 SpaceBetween——
+                        // 中段内部宽度由子项决定，播放键两侧的缝隙必须相等，这只有显式间距能保证。
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(S.Gap16.dp),
                         ) {
-                            Icon(GlassIcons.Next, null, Modifier.size(28.dp),
-                                tint = LocalGlassColors.current.textSecondary)
+                            ConsoleIcon(
+                                onClick = { state.prev() },
+                                contentDescription = "上一首",
+                                modifier = Modifier.graphicsLayer { alpha = softAlpha() },
+                            ) {
+                                Icon(GlassIcons.Prev, null, Modifier.size(28.dp),
+                                    tint = LocalGlassColors.current.textSecondary)
+                            }
+                            PlayPauseButton(
+                                playing = state.playing,
+                                onClick = state::togglePlayPause,
+                                modifier = Modifier
+                                    .trackFlight(FlightKeys.PlayerPlay)
+                                    .graphicsLayer { alpha = sharedInnerAlpha() },
+                            )
+                            ConsoleIcon(
+                                onClick = { state.next() },
+                                contentDescription = "下一首",
+                                modifier = Modifier
+                                    .trackFlight(FlightKeys.PlayerNext)
+                                    .graphicsLayer { alpha = sharedInnerAlpha() },
+                            ) {
+                                Icon(GlassIcons.Next, null, Modifier.size(28.dp),
+                                    tint = LocalGlassColors.current.textSecondary)
+                            }
                         }
-                        // 右侧第 5 个位置是「配重」而非控件：播放模式在左、这一格在右，
-                        // 中间三枚是真正的播放控制。SpaceBetween 下若只有 4 个子项，
-                        // 播放键会被推到正中偏右，视觉重心与下方进度条对不齐。
-                        // 用等宽占位（而非把队列钮留在这里）是因为收藏/队列已随歌名出卡
-                        // 上移到卡外——那一组才是它们的新家，这里只是几何平衡。
-                        Spacer(Modifier.width(32.dp))
+                        // 右段：**等权重留白**。见上方注释——它保证播放键绝对居中。
+                        // 刻意不塞控件：收藏/队列已随歌名出卡到卡外，这里再放一枚会让
+                        // 控制行变成「五个功能挤一行」，重心重新偏移。
+                        Spacer(Modifier.weight(1f))
                     }
                 }
             }
@@ -778,8 +832,8 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             // 三条候选路线里只有本行可行：
             // - 按钮上方浮出 → 被玻璃卡的 `clip(RoundedCornerShape(R.Player28))` 裁掉
             //   （按钮是卡内最底一行，向上 20dp 正好压进时间行）；
-            // - 按钮旁 overlay → 会顶飞 SpaceBetween 那一行的配重（测量参与与否必须选一个，
-            //   而这条提示行的**高度本来就是恒定的**，加一段文字零成本）；
+            // - 按钮旁 overlay → 会挤压控制行（该行已改为三段等权重布局，多一个兄弟节点
+            //   就破坏播放键的绝对居中；而这条提示行的**高度本来就是恒定的**，加一段文字零成本）；
             // - 新建全局浮层 → 任务明令禁止。
             // 本行的既有契约正好是「恒定一行、恒定高度、可换文案」——它本来就是为
             // 「不出字也要占位」设计的，模式标签只是又一个消费者。

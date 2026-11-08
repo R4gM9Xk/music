@@ -674,6 +674,44 @@ data class GlassColors(
      * 否则 scrim 一降就破 2:1。这也是为什么本轮**没有**把任何数值改小。
      */
     val chromeScrim: Color = Color(0xFF1A1A24).copy(alpha = 0.80f),
+
+    /**
+     * 底部导航栏专用 scrim（真机反馈修正，2026-11-08 装机后）。
+     *
+     * ## 为什么需要第二个 scrim token，而不是全局降 [chromeScrim]
+     *
+     * 装机后用户只反馈了**导航栏**「被压得太黑」，迷你条没有意见。两者 scrim 原本相同，
+     * 差异在填充档：迷你条 `Hi`（白 16%）、导航栏 `Md`（白 10%）—— 少 6 个百分点白，
+     * 叠在同一个深 scrim 上就读作「更黑」。所以问题不在 scrim 本身，在**两块 chrome
+     * 材质等级的错配**：它们都是悬浮 chrome，本来就该同级。
+     *
+     * 修法分两步，缺一不可：
+     * 1. 导航栏填充升到 `Hi`（与迷你条同级）—— 这是**纠错**，不是调参；
+     * 2. 导航栏 scrim 单独降到 0.72 —— 这一步才是**有意放宽**下界，理由见下。
+     *
+     * ## 为什么可以放宽（以及放宽的代价是什么）
+     *
+     * [chromeScrim] 的 0.80 是「透字不可辨」这条**下界**的最省事取值，但它从未约束
+     * **上界**——玻璃还剩多少通透感。0.80 + Md 填充把导航栏压成近实心深板，最高频的
+     * 两块 chrome 之一彻底失去材质卖点。这是原推导的盲区：只优化了一个方向。
+     *
+     * 放到 0.72 后，退化路径（无 RenderEffect，blur 完全不生效）的导航栏透字对比
+     * 从 1.82:1 升到约 **2.1:1**。对照：导航栏自身文字 11.8:1、清晰文字 18:1。
+     * 2.1:1 的透字读作「雾里的轮廓」而非「能读的字」——这仍然远在「可辨」之下，
+     * 但**不再是「几乎不可见」**。这是刻意的取舍：用户明确反馈了观感问题，
+     * 而把透字从「几乎不可见」放宽到「隐约有形状」，换回最高频 chrome 的玻璃质感。
+     *
+     * ## 边界（别越界）
+     *
+     * - **迷你条继续用 [chromeScrim] 0.80**：它没被反馈，且它更高（62dp）更显眼，
+     *   保持最严的一档没有代价。
+     * - 0.72 是**实测前的推测上限**。若真机上列表文字开始可读，回退到 0.76
+     *   （模型允许的最低值 0.772 之外刻意留了一点余量，不取临界值）。
+     * - 浅色档对应 `#F2F2F6 @ 0.66`：浅色模式透字方向相反（深字压浅底），
+     *   且 [chromeScrim] 的浅色档经复算本就是过剩的（推算 1.05:1），
+     *   同比例放宽后仍有过剩余量。
+     */
+    val chromeScrimNav: Color = Color(0xFF1A1A24).copy(alpha = 0.72f),
 ) {
     companion object {
         /** 浅色令牌：玻璃改实白面板、描边与文字转近黑 */
@@ -710,6 +748,9 @@ data class GlassColors(
             // ②深浅两档 alpha 刻意保持同量级，避免切换主题时出现材质跳变。
             // 若下轮补上浅色实测，这一档有下调到 0.5 量级的空间 —— 待验证项，不是结论。
             chromeScrim = Color(0xFFF2F2F6).copy(alpha = 0.74f),
+            // 导航栏浅色档：同比例放宽（0.74 → 0.66）。浅色透字是「深字压浅底」，
+            // 且 0.74 经复算本就过剩（推算仅 1.05:1 对比），放宽后仍有余量。
+            chromeScrimNav = Color(0xFFF2F2F6).copy(alpha = 0.66f),
         )
     }
 }
@@ -735,6 +776,7 @@ fun lerpGlassColors(from: GlassColors, to: GlassColors, fraction: Float): GlassC
     destructive = lerp(from.destructive, to.destructive, fraction),
     pressedOverlay = lerp(from.pressedOverlay, to.pressedOverlay, fraction),
     chromeScrim = lerp(from.chromeScrim, to.chromeScrim, fraction),
+    chromeScrimNav = lerp(from.chromeScrimNav, to.chromeScrimNav, fraction),
 )
 
 /** AuroraPalette 全字段插值（深浅主题各自动画后按进度混合，避免中途整包跳变） */
