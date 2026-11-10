@@ -68,6 +68,11 @@ fun Modifier.glassHaze(level: GlassLevel): Modifier {
                 GlassLevel.Hi -> 26.dp
                 GlassLevel.Md -> 20.dp
                 GlassLevel.Lo -> 12.dp
+                // Liquid 取 26dp（与 Hi 同级）：它的差异化在装饰层不在模糊强度。
+                // **不要因为「液态应该更糊」把它往上调**——半径是保均值线性滤波的增益，
+                // 本文件 KDoc 已经算过：26→48dp 只能把残余调制砍掉约 45%，
+                // 而采样窗会按 Rect.inflate(r) 外扩，大面板上代价是实打实的 GPU。
+                GlassLevel.Liquid -> 26.dp
             },
             noiseFactor = 0.05f,
             fallbackTint = HazeTint(glass.fill(level)),

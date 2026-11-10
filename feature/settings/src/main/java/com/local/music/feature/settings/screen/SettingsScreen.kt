@@ -27,6 +27,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.AuroraMiniPreview
+import com.local.music.core.ui.components.BackgroundMode
 import com.local.music.core.ui.components.ChromeBottomInset
 import com.local.music.core.ui.components.DropdownOption
 import com.local.music.core.ui.components.GlassLevel
@@ -125,8 +126,20 @@ fun SettingsScreen(
      * 两个动作。权限引导也整个丢回 app 层——canDrawOverlays / ACTION_MANAGE_OVERLAY_PERMISSION
      * 都是 framework 细节，feature:settings 不该知道。
      */
-    desktopLyricsEnabled: Boolean = false,
-    onDesktopLyricsEnabledChange: (enabled: Boolean) -> Unit = {},
+    desktopLyricsEnabled: Boolean = false,    onDesktopLyricsEnabledChange: (enabled: Boolean) -> Unit = {},
+    /**
+     * 照片背景（v11）。
+     *
+     * 与桌面歌词同一套解耦模式：SAF 选择器与文件 IO 全在 app 层，本屏只拿到
+     * 「三个动作」。为什么不在本屏直接拉选择器——`feature:settings` 不该知道
+     * `ActivityResultContracts` / uri 持久授权 / 私有目录落盘这些 framework 细节。
+     *
+     * [backgroundPhotoSelected] 只用来决定副标题写什么（「已设置」/「未设置」），
+     * 不承载任何状态判定：真正的生效与否由 [AppState.backgroundMode] 决定。
+     */
+    onPickBackgroundPhoto: () -> Unit = {},
+    onClearBackgroundPhoto: () -> Unit = {},
+    backgroundPhotoSelected: Boolean = false,
     // 悬浮窗权限未授予时的引导跳转（去系统「显示在其他应用上层」页）
     onDesktopLyricsPermission: () -> Unit = {},
     modifier: Modifier = Modifier,
@@ -214,12 +227,76 @@ fun SettingsScreen(
                 SettingRow(
                     // A5 图标语义：取色这件事的**来源是封面**——唱片（Disc）一眼指向「封面」，
                     // 而 Wave 已被整组音效占用，取色再用它等于两件不同的事共用一个符号
-                    GlassIcons.Disc, "跟随封面取色",
-                    // P2-6：副标题必须与三态真相一致——自定义色存在时封面取色被短路，开关说了不算
+                    GlassIcons.Disc, "跟随封面取色",                    // P2-6：副标题必须与三态真相一致——自定义色存在时封面取色被短路，开关说了不算
                     if (state.customSeedArgb != null) "已被自定义主题色覆盖（点上方主题色可恢复）" else "极光背景取自当前专辑封面",
                     onClick = { state.applyFollowCover(!state.followCover) },
                     trailing = { GlassToggle(state.followCover, onToggle = state::applyFollowCover) },
                 )
+                RowDivider()
+                // 照片背景（v11）：极光 / 照片二选一。
+                //
+                // 为什么用行内 SettingDropdown 而不是「选图按钮」：模式与图片是**两个决策**
+                // （要不要照片背景 / 用哪张），但用户心里其实是同一件事。折中做法——
+                // 下拉切模式，行本身点了就拉选择器：切到「照片」时自动进选图流程，
+                // 已经是照片时点击 = 换一张。比两个独立控件少一次点击，也不容易「切了模式但没选图」。
+                SettingRow(
+                    // 图标语义：Moon 已被「深色模式」占用、Disc 被取色占用。这里用 Wave（背景是
+                    // 整屏铺开的氛围），与音效那一组的 Wave 分属不同分组，且副标题已自解释
+                    GlassIcons.Wave, "背景来源",
+                    when {
+                        state.backgroundMode == BackgroundMode.Photo && state.photoBacking?.bitmap != null ->
+                            "照片 · 玻璃会模糊这张图（再点可更换）"
+                        state.backgroundMode == BackgroundMode.Photo ->
+                            "照片（载入中 / 已失效，暂时显示极光）"
+                        backgroundPhotoSelected -> "极光 · 已保存一张照片，可切换"
+                        else -> "极光 · 从当前专辑封面派生"
+                    },
+                    onClick = {
+                        when {
+                            // 照片模式且已就绪：点击 = 换一张
+                            state.backgroundMode == BackgroundMode.Photo -> onPickBackgroundPhoto()
+                            // 已有照片但当前是极光：点击 = 切回照片（不再让用户选一次图）
+                            backgroundPhotoSelected -> state.selectBackgroundMode(BackgroundMode.Photo)
+                            // 从没有过照片：拉选择器
+                            else -> onPickBackgroundPhoto()
+                        }
+                    },
+                    trailing = {
+                        SettingDropdown(
+                            value = state.backgroundMode.label,
+                            label = "背景来源",
+                            selected = state.backgroundMode,
+                            options = BackgroundMode.entries.map { mode ->
+                                DropdownOption(
+                                    label = mode.label,
+                                    subtitle = when (mode) {
+                                        BackgroundMode.Aurora -> "由当前专辑封面取色派生的极光"
+                                        BackgroundMode.Photo -> "用一张自己的照片铺满整屏"
+                                    },
+                                    payload = mode,
+                                )
+                            },
+                            onSelect = { mode ->
+                                // 切到照片但从未选过图：直接接上选择器，免得多点一次
+                                if (mode == BackgroundMode.Photo && !backgroundPhotoSelected) {
+                                    onPickBackgroundPhoto()
+                                } else {
+                                    state.selectBackgroundMode(mode)
+                                }
+                            },
+                        )
+                    },
+                )
+                if (backgroundPhotoSelected) {
+                    RowDivider()
+                    SheetAction(
+                        icon = GlassIcons.Trash,
+                        label = "清除背景照片",
+                        subtitle = "连同私有副本一起删除，回到极光",
+                        destructive = true,
+                        onClick = onClearBackgroundPhoto,
+                    )
+                }
                 RowDivider()
                 // F2 自定义主题色：三态（自定义 > 跟随封面 > 品牌靛紫），选中即生效
                 SettingRow(

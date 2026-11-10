@@ -325,8 +325,15 @@ class SettingsStore(context: Context) : SnapshotStore {
          * v 号是「这个文件可能包含旧版本读不懂的东西」的唯一信号，而本字段体积可达 1MB 级，
          * 一旦被旧版 App 静默忽略后再写回，用户那份备份的指纹就永久没了（旧版无法恢复它）。
          * 升版后旧版解码会走 P3-62 的「来自更新版本」拒绝分支，宁可明确失败也不静默拆解。
+         *
+         * v11：新增 `backgroundMode` / `backgroundPhotoUri`（照片背景）。
+         * **这一版其实不必升**——两个字段都很小、靠 opt 默认值即可零迁移，而且丢了也只是
+         * 「背景回到极光」，不属于用户数据丢失。但**照旧升**：本 App 的版本策略是
+         * 「宁可明确拒绝，也不让旧版静默拆解后再写回」，一个版本一个号比逐字段辩论
+         * 哪个字段够重要更不容易出错。代价：v10 及更早的 App 读不了 v11 备份
+         * （提示「来自更新版本」，用户升级即可）。
          */
-        private const val VERSION = 10
+        private const val VERSION = 11
 
         /** P2-27：损坏快照留档份数上限（见 [dumpCorrupt]），够人工排查即可 */
         private const val CORRUPT_KEEP = 3
@@ -478,6 +485,13 @@ class SettingsStore(context: Context) : SnapshotStore {
                     }
                 },
             )
+            // 照片背景（v11）：模式名 + 照片 uri。
+            //
+            // **只存 uri 不存图**：全屏照片解码后是 10MB 级位图，塞进快照会把几百 KB 的
+            // JSON 撑到不可用，而且位图本来就不可序列化。uri 失效（用户删图/换相册）时
+            // 解码侧返回 null，渲染回落极光——这条路径必须有，不能假定 uri 永远可读。
+            put("backgroundMode", s.backgroundMode)
+            put("backgroundPhotoUri", s.backgroundPhotoUri ?: JSONObject.NULL)
         }.toString()
 
         /**
@@ -587,6 +601,12 @@ class SettingsStore(context: Context) : SnapshotStore {
             // 逐项容错：单个条目的数组残缺/类型错乱只丢弃该条，不让整份备份解码失败——
             // 指纹是「锦上添花」的数据，绝不能因为它坏而让用户的歌单/收藏一起读不出来。
             trackRefs = parseTrackRefs(o.optJSONObject("trackRefs")),
+            // 照片背景（v11）：旧版本（≤v10）无此字段 → 默认极光 + 无照片，观感不变。
+            // 模式名的合法性由 AppState.restore 的 valueOf 容错兜住（坏值回落极光），
+            // 这里不重复校验 —— 背景是装饰，不能因为它让整份快照解码失败。
+            backgroundMode = o.optString("backgroundMode", "Aurora"),
+            backgroundPhotoUri = o.takeIf { it.has("backgroundPhotoUri") && !it.isNull("backgroundPhotoUri") }
+                ?.optString("backgroundPhotoUri"),
         )
 
         /**

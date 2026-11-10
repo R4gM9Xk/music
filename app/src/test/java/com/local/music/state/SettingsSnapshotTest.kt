@@ -167,4 +167,50 @@ class SettingsSnapshotTest {
         assertNotNull(back)
         assertEquals(false, back!!.shuffleOn)
     }
+
+    // ── 照片背景（v11）────────────────────────────────────────
+
+    @Test
+    fun `照片背景往返正确`() {
+        // uri 里带中文与特殊字符是常态（用户可能从「相册/截图」这类目录选），
+        // 顺便验证 JSON 编解码不会把它弄坏
+        val uri = "content://media/external/images/media/12345?名字=截图"
+        val s = empty.copy(backgroundMode = "Photo", backgroundPhotoUri = uri)
+        val back = roundTrip(s)
+        assertNotNull(back)
+        assertEquals("Photo", back!!.backgroundMode)
+        assertEquals(uri, back.backgroundPhotoUri)
+    }
+
+    @Test
+    fun `未设置照片时 uri 往返为 null 而不是空串`() {
+        // 区分「没选过」（null）与「选了空串」（非法但可能来自坏备份）：
+        // 前者是回落极光的正常路径，后者应被当成没选过
+        val back = roundTrip(empty)
+        assertNotNull(back)
+        assertEquals("Aurora", back!!.backgroundMode)
+        assertNull(back.backgroundPhotoUri)
+    }
+
+    @Test
+    fun `旧版备份缺少背景字段时回落极光且不丢照片`() {
+        // v10 备份没有 backgroundMode / backgroundPhotoUri 这两个键：
+        // 解码必须走默认值（极光 + null），而不是让整份备份解码失败
+        val v10 = """{"v": 10, "favorites": ["f/a.mp3"]}"""
+        val decoded = SettingsStore.decodeBackup(v10)
+        assertNotNull(decoded)
+        val back = decoded!!
+        assertEquals("Aurora", back.backgroundMode)
+        assertNull(back.backgroundPhotoUri)
+        assertEquals(setOf("f/a.mp3"), back.favorites)
+    }
+
+    @Test
+    fun `照片背景字段显式为 null 时解码不崩溃`() {
+        // 编码侧把 null 写成 JSONObject.NULL；解码侧必须能把它还原成 null
+        val json = """{"v": 11, "backgroundMode": "Aurora", "backgroundPhotoUri": null}"""
+        val back = SettingsStore.decodeBackup(json)
+        assertNotNull(back)
+        assertNull(back!!.backgroundPhotoUri)
+    }
 }

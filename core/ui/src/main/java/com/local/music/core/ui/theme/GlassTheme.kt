@@ -480,6 +480,45 @@ data class GlassColors(
     val stroke: Color = Color.White.copy(alpha = 0.28f),       // 高光描边
     val strokeSoft: Color = Color.White.copy(alpha = 0.14f),   // 常规描边
     val topLine: Color = Color.White.copy(alpha = 0.55f),      // 顶部亮线
+
+    /**
+     * 液态档（[GlassLevel.Liquid]）的**方向性斜面**四笔 —— 这是「第四档玻璃」的唯一新增装饰族。
+     *
+     * ## 为什么不是「把 topLine 加粗一点」
+     *
+     * Hi 档的四边描边是**均匀**的（`border(1.dp, strokeSoft)` 一圈同色）。均匀描边表达的是
+     * 「这里有一个边界」，但**不表达光从哪来**。真实玻璃的边是一圈**被光切开的斜面**：
+     * 上沿迎着光源所以最亮、两侧逐渐变暗、下沿背光甚至发暗。四笔各自的 alpha 差就是
+     * 「光源方向」这个物理事实的编码，它让一块平面玻璃读起来**有厚度**。
+     *
+     * 数值来源（不是拍脑袋，是本轮 `docs/proto/glass-3tiers.png` 的渲染标定）：
+     * - 顶白 55%：与既有 [topLine] 同值 —— 顶边是「亮线」这件事两档共识，不新造语义；
+     * - 侧白 22%：介于 [stroke] 28% 与 [strokeSoft] 14% 之间，是「侧壁受光但入射角大」的量级；
+     * - 底黑 18%：**全仓唯一的暗边**。项目此前所有描边都是白色系（玻璃=反光），
+     *   而真实玻璃下沿是暗的（光被折射走）。这一笔是「液态」与「悬浮」在观感上最大的分野。
+     *
+     * ⚠️ 已知代价：渲染标定用的力度（渲染器里顶 70%/侧 30%/底 34%）**远超**这里采用的
+     * 真实产品值——因为在静态图里要让两档「可辨」必须夸张。落到 App 里必须收敛，
+     * 否则会读作「塑料反光条」。所以这里取的是克制的产品值，**真机观感本轮未验证**。
+     */
+    val liquidEdgeTop: Color = Color.White.copy(alpha = 0.55f),
+    val liquidEdgeSide: Color = Color.White.copy(alpha = 0.22f),
+    val liquidEdgeBottom: Color = Color.Black.copy(alpha = 0.18f),
+
+    /**
+     * 液态档内部**镜面高光**（specular）：右上角一块大半径、极淡的椭圆亮斑，
+     * 模拟环境光在玻璃表面的反射。
+     *
+     * 它与边缘四笔是两件事：边缘是「厚度」，specular 是「表面反光」。
+     * 取白 10%：压在 [hi] 白 16% 的玻璃上，合计仍远低于文字 1.0 的层级，
+     * 不会与内容争焦点（`R-C1` 的对比度分级同理）。
+     *
+     * 已知缺陷（诚实记录，不要当成 bug 去修）：**它是叠加的，不参与背后内容的扭曲**。
+     * 真实液态玻璃的 specular 是折射的结果，会随视角变化；这里是一块静态/缓慢漂移的
+     * 半透明亮斑。缺折射（见下方 `liquidEdge*` 的说明与 docs/proto 的结论），
+     * 它读作「玻璃上有反光」，而不是「一汪水」。
+     */
+    val liquidSpecular: Color = Color.White.copy(alpha = 0.10f),
     val textPrimary: Color = Color.White,
     val textSecondary: Color = Color.White.copy(alpha = 0.60f),
     val textTertiary: Color = Color.White.copy(alpha = 0.50f),
@@ -724,6 +763,14 @@ data class GlassColors(
             stroke = Color(0xFF23232B).copy(alpha = 0.14f),
             strokeSoft = Color(0xFF23232B).copy(alpha = 0.09f),
             topLine = Color.White.copy(alpha = 0.90f),
+            // 液态档方向性斜面（浅色档）：顶边仍往亮压（白 90%，与 topLine 同值），
+            // 侧边**反转成近黑**（白侧边压在白玻璃 + 近白极光上等于消失，见上方 stroke 的
+            // 反转理由）；底边在浅色下改成「亮」而不是暗——浅色玻璃的底面是反光面，
+            // 深色档的暗底边是因为深色玻璃底面吸光，两档方向必须相反，不能直接搬。
+            liquidEdgeTop = Color.White.copy(alpha = 0.90f),
+            liquidEdgeSide = Color(0xFF23232B).copy(alpha = 0.16f),
+            liquidEdgeBottom = Color.White.copy(alpha = 0.30f),
+            liquidSpecular = Color.White.copy(alpha = 0.42f),
             textPrimary = Color(0xFF23232B),
             textSecondary = Color(0xFF23232B).copy(alpha = 0.62f),
             textTertiary = Color(0xFF23232B).copy(alpha = 0.52f),
@@ -777,6 +824,12 @@ fun lerpGlassColors(from: GlassColors, to: GlassColors, fraction: Float): GlassC
     pressedOverlay = lerp(from.pressedOverlay, to.pressedOverlay, fraction),
     chromeScrim = lerp(from.chromeScrim, to.chromeScrim, fraction),
     chromeScrimNav = lerp(from.chromeScrimNav, to.chromeScrimNav, fraction),
+    // 液态档四笔必须一起插值：深浅两档的底边方向**相反**（深色暗底边 / 浅色亮底边），
+    // 漏掉会出现「浅色模式下液态玻璃还挂着一圈黑色底边」的硬边。
+    liquidEdgeTop = lerp(from.liquidEdgeTop, to.liquidEdgeTop, fraction),
+    liquidEdgeSide = lerp(from.liquidEdgeSide, to.liquidEdgeSide, fraction),
+    liquidEdgeBottom = lerp(from.liquidEdgeBottom, to.liquidEdgeBottom, fraction),
+    liquidSpecular = lerp(from.liquidSpecular, to.liquidSpecular, fraction),
 )
 
 /** AuroraPalette 全字段插值（深浅主题各自动画后按进度混合，避免中途整包跳变） */

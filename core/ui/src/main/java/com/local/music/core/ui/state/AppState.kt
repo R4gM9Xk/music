@@ -12,6 +12,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.ArtworkBitmapCache
+import com.local.music.core.ui.components.BackgroundMode
 import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoData
 import com.local.music.core.ui.components.DemoPlaylist
@@ -20,6 +21,7 @@ import androidx.compose.ui.graphics.Color
 import com.local.music.core.ui.components.DetailData
 import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.LyricLine
+import com.local.music.core.ui.components.PhotoBacking
 import com.local.music.core.ui.components.asTime
 import com.local.music.core.ui.theme.AuroraPalette
 import com.local.music.core.ui.theme.GlassIntensity
@@ -90,6 +92,23 @@ data class AppStateSnapshot(
      * addedTracks/playCounts 同量级，可接受（且只在恢复/备份时需要完整内容）。
      */
     val trackRefs: Map<String, SongRematch.TrackRef> = emptyMap(),
+    /**
+     * 背景来源（v11 起编码）：极光 / 照片。
+     *
+     * 存**名字**而不是序号：与 glassLevel/motionLevel 同口径——序号会在增删枚举成员时
+     * 静默错位（用户的前一个档位变成另一个档位），名字不会。
+     */
+    val backgroundMode: String = BackgroundMode.Aurora.name,
+    /**
+     * 照片背景的 uri（v11 起编码；null = 没选过）。
+     *
+     * **只存 uri 不存图**：全屏照片解码后是 10MB 级位图，进快照会把几百 KB 的 JSON
+     * 撑到不可用；而且位图本来就不可序列化。uri 失效（用户删了图 / 卸载相册）时
+     * 解码侧返回 null，渲染回落极光——这条路径必须有，不能假定 uri 永远可读。
+     *
+     * 旧版本（≤v10）没有这两个字段 → 解码走默认值（极光），用户升级后观感不变。
+     */
+    val backgroundPhotoUri: String? = null,
 )
 
 /** 持久化桥接：AppState 只面向它，实现在 app 模块（DataStore） */
@@ -536,6 +555,72 @@ class AppState(
     var playbackSpeed by mutableFloatStateOf(1f) // 播放速度档（快照 v5 持久化；服务端 Sonic 变速不变调）
         private set
     var themeMode by mutableStateOf(ThemeMode.Dark)
+
+    // ── 照片背景（v11）──────────────────────────────────────
+    /**
+     * 背景来源：极光（默认）/ 照片。
+     *
+     * 为什么要做成**设置项**而不是「跟随封面自动」：照片背景的成本（一次全屏解码 +
+     * 每帧一张全屏位图参与合成）与收益（玻璃终于有高频内容可透）都很大，
+     * 应由用户明确选择，而不是在每次切歌时静默触发。
+     */
+    var backgroundMode by mutableStateOf(BackgroundMode.Aurora)
+
+    /**
+     * 用户选中的照片 uri（持久化）。null = 没选过。
+     *
+     * **只存 uri，不存位图**：全屏照片解码后动辄 10MB+ 级，进快照会把它撑爆
+     * （快照现在是几百 KB 的 JSON），而且位图本来就不能序列化。
+     * 解码由 app 层（`PhotoBackgroundStore`）在需要时做，结果经 [photoBacking] 下发。
+     */
+    var backgroundPhotoUri by mutableStateOf<String?>(null)
+
+    /**
+     * 已解码好的照片背景（**运行时态，不持久化**）。
+     *
+     * null 有两种含义，调用方必须区分：
+     * - [backgroundMode] == Aurora：不需要照片，正常；
+     * - [backgroundMode] == Photo 但 backing 为 null：**还在解码 / 文件失效**，
+     *   此时渲染回落极光（不要画黑板，否则会闪一块不透明黑）。
+     */
+    var photoBacking by mutableStateOf<PhotoBacking?>(null)
+
+    /**
+     * 切换背景来源（持久化）。
+     *
+     * 切到 Photo 但没有可用位图时**不做任何拦截**：让 UI 落回极光并显示「正在解码」，
+     * 比拒绝切换更诚实——用户点了他就想要，解码是异步的。
+     *
+     * 命名注意：不能叫 `setBackgroundMode`——它与 `var backgroundMode` 自动生成的 JVM
+     * setter 签名完全相同（`setBackgroundMode(BackgroundMode)V`），会触发
+     * 「Platform declaration clash」。本仓其他设置项的公开动作一律用动词命名
+     * （`toggleTheme` / `selectSongSort` / `applyFollowCover`），这里遵循同一约定。
+     */
+    fun selectBackgroundMode(mode: BackgroundMode) {
+        if (backgroundMode == mode) return
+        backgroundMode = mode
+        scheduleSave()
+    }
+
+    /**
+     * 选定照片（uri 持久化；位图由 app 层解码后经 [applyPhotoBacking] 下发）。
+     *
+     * 传 null = 清除（同时回落极光）。同样避开 `setBackgroundPhotoUri` 这个与
+     * 属性 setter 撞名的写法，见 [selectBackgroundMode] 的说明。
+     */
+    fun selectBackgroundPhoto(uri: String?) {
+        backgroundPhotoUri = uri
+        // 换图必须立即丢掉旧 backing：否则解码完成前会继续显示上一张（用户会以为没生效）
+        photoBacking = null
+        backgroundMode = if (uri != null) BackgroundMode.Photo else BackgroundMode.Aurora
+        scheduleSave()
+    }
+
+    /** 解码完成回调（app 层调用）：位图就绪或解码失败（传 null） */
+    fun applyPhotoBacking(backing: PhotoBacking?) {
+        photoBacking = backing
+    }
+
     var songSort by mutableStateOf(SongSort.Title)
         private set
     val excludedFolders = mutableStateSetOf<String>()
@@ -1118,6 +1203,9 @@ class AppState(
     /** 设置指纹：GlassApp 用 snapshotFlow 监听设置变更触发存盘 */
     fun settingsKey(): String =
         "$followCover|$lyricEnabled|${glassLevel.name}|${motionLevel.name}|${eqPreset.name}|${themeMode.name}|" +
+            // 背景来源与照片 uri 必须进指纹：否则「只换了背景图」不会触发存盘，
+            // 重启后回到上一张（用户会以为选择没生效）
+            "${backgroundMode.name}|${backgroundPhotoUri.orEmpty()}|" +
             "$shuffleOn|${repeatMode.name}|$playbackSpeed|$scanFilterShort|$customSeedArgb|${queueSource.orEmpty()}|" +
             // 音效链也要进指纹：否则「只拨音效开关」不会触发存盘，重启后开关回弹（用户会以为设置没保存）
             "$audioFx|" +
@@ -1160,6 +1248,8 @@ class AppState(
                 sleepTimerDeadlineMs = sleepTimerDeadlineMs,
                 audioFx = audioFx,
                 trackRefs = trackRefsSnapshot(),
+                backgroundMode = backgroundMode.name,
+                backgroundPhotoUri = backgroundPhotoUri,
             )
         } else {
             AppStateSnapshot(
@@ -1194,6 +1284,8 @@ class AppState(
                 sleepTimerDeadlineMs = sleepTimerDeadlineMs,
                 audioFx = audioFx,
                 trackRefs = trackRefsSnapshot(),
+                backgroundMode = backgroundMode.name,
+                backgroundPhotoUri = backgroundPhotoUri,
             )
         }
     }
@@ -1214,6 +1306,11 @@ class AppState(
             virtualLevel = snapshot.audioFx.safeVirtualLevel,
         )
         themeMode = runCatching { ThemeMode.valueOf(snapshot.themeMode) }.getOrDefault(ThemeMode.Dark)
+        // 背景来源（v11）：旧版本（≤v10）无这两字段 → 默认极光 + 无照片，用户观感不变。
+        // 枚举名容错：坏数据回落极光而不是让整份快照解码失败（背景是装饰，不是用户数据）。
+        backgroundMode = runCatching { BackgroundMode.valueOf(snapshot.backgroundMode) }
+            .getOrDefault(BackgroundMode.Aurora)
+        backgroundPhotoUri = snapshot.backgroundPhotoUri
         songSort = runCatching { SongSort.valueOf(snapshot.songSort) }.getOrDefault(SongSort.Title)
         shuffleOn = snapshot.shuffleOn
         repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeatMode) }.getOrDefault(RepeatMode.Off)

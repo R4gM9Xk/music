@@ -680,9 +680,19 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     )
                     .trackFlight(FlightKeys.PlayerGlass)
                     .graphicsLayer { alpha = sharedAlpha() },
-                level = GlassLevel.Md,
+                // 液态档（v11，第四档玻璃）：这块控制台是「液态层」的第一处落点。
+                //
+                // 为什么是它：它背后是封面位图 + 舞台（无滚动列表文字穿越），是本 App
+                // 唯一一块「玻璃后面有照片」的常驻面板——液态档的方向性斜面与 specular
+                // 只有在背后有内容时才读得出立体感，压在纯色极光上会像一圈没必要的亮边。
+                level = GlassLevel.Liquid,
                 shape = RoundedCornerShape(R.Player28.dp),
-                blur = GlassLevel.Md,
+                // 模糊升到 Hi（26dp）：液态档的差异化在装饰层，模糊强度与 Hi 同级即可。
+                blur = GlassLevel.Hi,
+                // 光影驱动：绑**播放进度**（已有连续值，零新增基础设施）。
+                // 传 lambda 而不是解构后的 Float —— 它在绘制期逐帧读取，不触发重组；
+                // 传值会让整块控制台在播放中每帧重组（本仓反复点名的错误写法）。
+                liquidMotion = { state.progressFraction },
             ) {
                 Column(
                     Modifier.padding(

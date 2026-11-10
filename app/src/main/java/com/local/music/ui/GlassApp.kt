@@ -78,6 +78,7 @@ import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionToken
 import com.local.music.crash.CrashHandler
 import com.local.music.core.ui.components.AuroraBackground
+import com.local.music.core.ui.components.BackgroundMode
 import com.local.music.core.ui.components.GlassChrome
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSurface
@@ -90,6 +91,7 @@ import com.local.music.core.ui.components.SystemActions
 import com.local.music.core.ui.components.ModalSheetHost
 import com.local.music.core.ui.components.ModalState
 import com.local.music.core.ui.components.PlayerFlight
+import com.local.music.core.ui.components.PhotoBackground
 import com.local.music.core.ui.components.asTime
 import com.local.music.core.ui.components.trackFlight
 import com.local.music.core.ui.state.AppState
@@ -116,6 +118,7 @@ import com.local.music.lyrics.DesktopLyricsStore
 import com.local.music.player.AutoStartGuide
 import com.local.music.player.MediaControllerEngine
 import com.local.music.player.MediaLibrary
+import com.local.music.player.PhotoBackgroundStore
 import com.local.music.player.MusicPlaybackService
 import com.local.music.player.M3uPlaylistIO
 import com.local.music.player.QueueStateStore
@@ -161,6 +164,32 @@ fun GlassApp() {
     }
     val scope = rememberCoroutineScope()
     val store = remember { SettingsStore(context) }
+
+    // ── 照片背景解码（v11）──
+    // 三种触发：(a) 启动时已有 uri；(b) 用户刚选了新图；(c) 用户切回「照片」模式。
+    // 全部走同一个 effect，按 (uri, mode) 作为 key —— 同一张图不会重复解码。
+    //
+    // **为什么解码必须离开主线程**：全屏照片降采样后仍要解出约 12MB 位图，
+    // 主线程解会在中低端机卡 100ms+（正是「点了选图后界面僵一下」的成因）。
+    // 解码期间 photoBacking 为 null，渲染自然回落极光，不需要额外 loading 态。
+    LaunchedEffect(state.backgroundPhotoUri, state.backgroundMode) {
+        val uri = state.backgroundPhotoUri
+        if (uri == null) {
+            state.applyPhotoBacking(null)
+            return@LaunchedEffect
+        }
+        // 已就绪且是同一张：不重复解（切换极光/照片来回时不该重解码）
+        state.photoBacking?.let { if (it.uri == uri) return@LaunchedEffect }
+        val backing = withContext(Dispatchers.IO) {
+            PhotoBackgroundStore.loadPersisted(context, uri)
+        }
+        state.applyPhotoBacking(backing)
+        // 解码失败（图被删/uri 失效）：清掉设置，避免每次启动都白试一次，
+        // 并让用户看到「照片没了」这个事实——静默保留一个永远失败的 uri 更难排查。
+        if (backing == null) {
+            state.selectBackgroundPhoto(null)
+        }
+    }
 
     // 播放现场写盘串行器（C4）：单线程 + 后写覆盖先写，避免 tick 高频写乱序
     val queueStateExecutor = remember {
@@ -716,6 +745,27 @@ fun GlassApp() {
             )
         }
     }
+    // ── 照片背景选择器（v11）──
+    // 用 OpenDocument 而不是 GetContent：后者给的 uri 是**一次性临时授权**，
+    // 重启后读不了；OpenDocument 才允许 takePersistableUriPermission。
+    // 即便拿到持久授权，PhotoBackgroundStore 仍会把图复制到私有目录 —— 双保险，
+    // 因为用户可以随时在系统设置里撤销这个应用的授权。
+    val pickBackgroundPhotoLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        // 持久授权失败不阻断流程（私有副本才是真正用的那份），只记一条日志便于排查
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }.onFailure { android.util.Log.w("GlassApp", "takePersistableUriPermission failed", it) }
+        // 只存 uri；解码与落盘由下面的 LaunchedEffect 统一做（与启动路径同一份逻辑，
+        // 不在这里另写一遍 decode —— 两条路径分叉是本仓反复踩过的坑）
+        state.selectBackgroundPhoto(uri.toString())
+        ioMessage = "正在载入背景照片…"
+    }
     val backupExportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json"),
     ) { uri ->
@@ -940,7 +990,10 @@ fun GlassApp() {
                     // 用 derivedStateOf 把连续值折成**布尔**：只有「走满 1f」那一刻结果才变，
                     // 组合期只重组两次（开、关），过渡期零额外重组。
                     val rootAuroraVisible by remember { derivedStateOf { recede < 1f } }
-                    if (rootAuroraVisible) {
+                    // 照片模式：极光让位（两份背景同时画没有意义，且照片是不透明的）。
+                    val photoActive = state.backgroundMode == BackgroundMode.Photo &&
+                        state.photoBacking?.bitmap != null
+                    if (rootAuroraVisible && !photoActive) {
                         AuroraBackground()
                     }
 
@@ -967,6 +1020,18 @@ fun GlassApp() {
                                 .hazeSource(appHazeState)
                                 .graphicsLayer { alpha = flight.baseContentAlpha() },
                         ) {
+                            // 照片背景（v11）：**必须在这个 hazeSource 子树内**，否则
+                            // 玻璃只把它当普通底色 tint、拿不到模糊（见 PhotoBackground 的 KDoc）。
+                            // 它画在内容之下、不参与 alpha 门控（baseContentAlpha 是给内容让位
+                            // 飞行替身用的，背景一淡就会露出底下的极光层，闪过一帧深色）。
+                            if (photoActive) {
+                                Box(Modifier.graphicsLayer { alpha = 1f }) {
+                                    PhotoBackground(
+                                        bitmap = state.photoBacking!!.bitmap!!,
+                                        tint = state.photoBacking?.tint,
+                                    )
+                                }
+                            }
                             if (!state.librarySettled) {
                                 // 启动收敛中（曲库缓存/首扫未到）：不渲染任何演示内容。
                                 // 视觉审计 B1/E2：这是「首帧用户看到的唯一文字」，用 Caption 档
@@ -1103,6 +1168,20 @@ fun GlassApp() {
                                         onExportBackup = {
                                             backupExportLauncher.launch("music-backup.json")
                                         },
+                                        // 照片背景（v11）：选择器在 app 层持有（SAF/uri 权限是
+                                        // framework 细节），屏内只发起。清除时连私有副本一起删——
+                                        // 否则「恢复极光」后磁盘上还留着 1MB 全屏图，
+                                        // 而这个 App 的 allowBackup=false，它永远不会被清理。
+                                        onPickBackgroundPhoto = {
+                                            pickBackgroundPhotoLauncher.launch(arrayOf("image/*"))
+                                        },
+                                        onClearBackgroundPhoto = {
+                                            PhotoBackgroundStore.clear(context)
+                                            state.selectBackgroundPhoto(null)
+                                        },
+                                        // 副标题用「有没有存过照片」，而不是「当前是不是照片模式」——
+                                        // 后者会让副标题在下拉切档时跳变，而这一行本来就在说同一件事
+                                        backgroundPhotoSelected = state.backgroundPhotoUri != null,
                                         onImportBackup = {
                                             backupImportLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
                                         },
@@ -1255,18 +1334,30 @@ fun GlassApp() {
                         },
                     ) {
                         Box(Modifier.fillMaxSize()) {
-                            // 覆盖层自带极光（否则整屏透明会透视到下层曲库），
+                            // 覆盖层自带背景（否则整屏透明会透视到下层曲库），
                             // 但**透明度必须跟播放页内容的揭示曲线同步**（softAlpha）：
                             // 飞行期播放页是「先不可见、随 t 渐显」的，极光若一上来就不透明，
                             // 点击瞬间背景会从根层极光硬换成覆盖层极光（两份漂移相位不同）→ 闪一下。
                             // 跟着 softAlpha：起飞时透出根层极光（与旧结构连续），
                             // 随播放页内容一起显影；收起时反向淡出，下层曲库重新露出来。
+                            //
+                            // 照片模式（v11）：这里也换成同一张照片 —— 播放页的 haze 源是
+                            // **自己那套** playerHaze（PlayerScreen.kt:237），它采样的是本覆盖层
+                            // 子树。若这里仍画极光，播放页的控制台玻璃会模糊到极光而不是照片，
+                            // 出现「同一个 App 两块玻璃背后不是同一个世界」的断裂。
                             Box(
                                 Modifier
                                     .fillMaxSize()
                                     .graphicsLayer { alpha = flight.softAlpha() },
                             ) {
-                                AuroraBackground()
+                                if (photoActive) {
+                                    PhotoBackground(
+                                        bitmap = state.photoBacking!!.bitmap!!,
+                                        tint = state.photoBacking?.tint,
+                                    )
+                                } else {
+                                    AuroraBackground()
+                                }
                             }
                             PlayerScreen(state)
                         }
