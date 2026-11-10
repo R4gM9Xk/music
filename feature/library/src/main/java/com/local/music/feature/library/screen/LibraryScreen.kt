@@ -300,7 +300,7 @@ fun LibraryScreen(
                 }
                 // 文件夹（排除项不显示，与设置联动）
                 3 -> {
-                    val groups = state.folderGroups(state.excludedFolders)
+                    val groups = state.folderGroups()
                     if (groups.isEmpty()) {
                         item(key = "tab-empty-3") {
                             // 图标复用既有 Folder：这一档语义最直白

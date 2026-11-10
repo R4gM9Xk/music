@@ -139,10 +139,13 @@
 
           meta-data 的 android:resource 指向 res/xml/music_widget_4x1.xml（appwidget-provider）。
 
-          注意 intent-filter 里只声明 APPWIDGET_UPDATE：
-          - APPWIDGET_DELETED / APPWIDGET_OPTIONS_CHANGED 等由 AppWidgetProvider
-            的回调分发**自动**送达同名 receiver，不需要单独声明；
-          - 把它们也写进来反而会绕过系统的组件校验路径，属于无意义放大。
+          intent-filter 的 action 声明（本轮修正了这里原先的错误结论）：
+          - **APPWIDGET_UPDATE**：放置/周期刷新，必须声明。
+          - **APPWIDGET_OPTIONS_CHANGED**：尺寸变化，**必须声明**。旧注释写「由回调分发
+            自动送达、不需要单独声明」，实际系统是按 action 匹配 receiver 才唤起 onReceive，
+            再由 AppWidgetProvider 分派 —— 不声明就收不到，表现为「拖拽改尺寸后不重绘」。
+          - **APPWIDGET_DELETED / APPWIDGET_DISABLED**：这两个确实由系统按组件直接投递
+            （不经 action 匹配），保持不声明。
           ════════════════════════════════════════════════════════════════════
         -->
         <receiver
@@ -151,6 +154,17 @@
             android:label="@string/widget_label_wide">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <!-- APPWIDGET_OPTIONS_CHANGED 必须显式声明（本轮修复）。
+                     旧注释断言「由 AppWidgetProvider 的回调分发自动送达，不需要单独声明」，
+                     这个断言是错的：系统是**按 action 匹配 receiver** 才唤起 onReceive，
+                     再由 AppWidgetProvider.onReceive 分派到 onAppWidgetOptionsChanged。
+                     不声明 ⇒ 该回调不会到达 ⇒ 用户拖拽改变小部件尺寸后不会重绘，
+                     按 OPTION_APPWIDGET_MIN_WIDTH 选横条/封面版的逻辑要等到下一次播放事件
+                     才生效（本模块是事件驱动 + updatePeriodMillis=0），
+                     观感即「拖窄了还是老样子」。
+                     APPWIDGET_DELETED / APPWIDGET_DISABLED 则确实由系统按组件直接投递
+                     （它们不经过 APPWIDGET_UPDATE 的 action 匹配），保持不声明。 -->
+                <action android:name="android.appwidget.action.APPWIDGET_OPTIONS_CHANGED" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
@@ -163,6 +177,8 @@
             android:label="@string/widget_label_square">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <!-- 同 MusicWidgetWideProvider：OPTIONS_CHANGED 必须显式声明 -->
+                <action android:name="android.appwidget.action.APPWIDGET_OPTIONS_CHANGED" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"

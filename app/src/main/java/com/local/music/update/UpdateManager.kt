@@ -91,6 +91,14 @@ class UpdateManager(
                         changelog = info.changelog,
                     ).also { pendingInfo = info }
                 }
+                // **UpToDate / Failed 时清掉 pendingInfo**（本轮修复）：旧实现只在 Available
+                // 分支赋值、任何分支都不清理，于是「检查到 v9 → 用户没更新 → 服务端回滚到 v8
+                // → 再检查得 UpToDate」之后 pendingInfo 仍指向 v9 的下载地址。
+                // 设置页的失败分流又用 versionName != null 判断「进过下载链路」
+                // （SettingsScreen.kt 的 Failed 分支），会把 UpToDate 之后的
+                // Failed 误判成「下载失败 → 可重试」而实际是检查失败。
+                // 这里显式清空，让 pendingInfo 的生命周期 = 「当前 state 是 Available」这一条。
+                if (info == null || info.versionCode <= currentVersionCode()) pendingInfo = null
             } finally {
                 // 必须无条件释放：fetchManifest 内部是 runCatching 兜底的，但「协程被取消」
                 // 同样会走到这里——漏放会让本次进程内再也无法检查更新
@@ -108,7 +116,20 @@ class UpdateManager(
             try {
                 val info = fetchManifest() ?: return@launch
                 if (info.versionCode > currentVersionCode() &&
-                    state.status == UpdateUiState.Status.Idle
+                    // **Failed 也必须允许静默检查接管**（本轮修复）：旧条件只放行 Idle，
+                    // 于是「用户曾经手动检查过一次、那次网络不通 → Failed」之后，
+                    // 本次进程内每次冷启动的静默检查都静默跳过，
+                    // 设置页「发现新版本」那条点亮永远不会再出现 ——
+                    // 用户感知是「这个 App 不再提示更新了」，而且没有任何办法自愈
+                    // （除非用户自己想起来再点一次「检查更新」）。
+                    // Downloading/ReadyToInstall 仍必须排除：那两种状态下 pendingInfo 指向
+                    // 一个正在进行/已完成的下载，覆盖 state 会丢掉进度与安装入口。
+                    (
+                        state.status == UpdateUiState.Status.Idle ||
+                            state.status == UpdateUiState.Status.Failed ||
+                            state.status == UpdateUiState.Status.UpToDate ||
+                            state.status == UpdateUiState.Status.Checking
+                        )
                 ) {
                     pendingInfo = info
                     state = UpdateUiState(

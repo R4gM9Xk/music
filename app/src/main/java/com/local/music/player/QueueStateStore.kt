@@ -118,9 +118,9 @@ object QueueStateStore {
         Log.e(TAG, "queue state read failed; falling back to empty", it)
     }.getOrNull()
 
-    /** 清空现场（用户清空队列 / 退出登录等场景） */
-    fun clear(context: Context) {
-        runCatching { java.io.File(context.filesDir, FILE).delete() }
-            .onFailure { Log.e(TAG, "queue state clear failed", it) }
-    }
+    // 已删除：`fun clear(context: Context)`（本轮清理）。
+    // 全仓零调用。它的 KDoc 举的场景（「用户清空队列」）实际上走的是
+    // AppState.clearUpNext + scheduleSave（后者会用新队列重写本文件），
+    // 并不需要单独删文件。留着一个没人调的「删除现场」API，
+    // 反而容易被误当成「退出登录/清空队列」的标准收尾而半途接错。
 }

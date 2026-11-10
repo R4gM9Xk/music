@@ -467,14 +467,19 @@ fun CollectionActionsSheet(
             )
         }
         // D2：M3U 导出（任何歌单都可导出；动态歌单导出的就是当前解析结果）
-        if (target.kind == DetailTarget.Kind.Playlist && tracks.isNotEmpty()) {
+        // **onExportM3u == null 时整项不渲染**（本轮修复）：旧实现只在 onClick 里写
+        // `onExportM3u?.invoke()`，菜单项照常显示 —— 未接线场景下用户点下去只会
+        // 关掉面板、什么都没发生，正是本文件与 SystemActions.kt 都反复点名的红线
+        //（「点了没反应比没有这项更伤」）。当前唯一调用点恒传非空，所以这是防回归的守卫。
+        val exportAction = onExportM3u
+        if (target.kind == DetailTarget.Kind.Playlist && tracks.isNotEmpty() && exportAction != null) {
             SheetAction(
                 icon = GlassIcons.Down,
                 label = "导出 M3U 歌单",
                 subtitle = "${tracks.size} 首 · 可在其他播放器打开",
                 onClick = {
                     onDismiss()
-                    onExportM3u?.invoke()
+                    exportAction()
                 },
             )
         }

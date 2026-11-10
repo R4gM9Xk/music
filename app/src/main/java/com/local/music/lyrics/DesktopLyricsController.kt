@@ -268,7 +268,13 @@ class DesktopLyricsController(private val appContext: Context) {
     /** 二分找「时间 ≤ pos 的最后一行」；纯文本降级（无有效时间戳）恒显示首行 */
     private fun currentLineText(posSec: Float): String {
         if (lines.isEmpty()) return "♪ 暂无歌词"
-        if (lines.first().timeSec <= 0f) return lines.first().text
+        // **判据是「只有一行」而不是「首行 timeSec ≤ 0」**（本轮修复）：
+        // 旧实现用 `lines.first().timeSec <= 0f` 判「纯文本降级」，但**合法的歌词文件
+        // 第一行就是 `[00:00.00]`**（极常见）——于是正常的时间轴被误判成纯文本，
+        // 悬浮窗永远停在第一行、不随进度滚动，看起来像桌面歌词卡死。
+        // 真正的纯文本降级形态由 DesktopLyricsLoader / parseLrcOrPlainText 决定：
+        // 它把整段文字压成 **单条** LyricLine(text, 0f)，所以「size == 1」才是那个语义。
+        if (lines.size == 1) return lines.first().text
         var lo = 0
         var hi = lines.size - 1
         var idx = 0

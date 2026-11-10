@@ -131,7 +131,9 @@ fun ArtThumb(
     artworkUri: String? = null,
 ) {
     // 只读缓存不复用 bitmap 参数语义：bitmap 优先（调用方已持有），其次按 uri 按需解码。
-    // getOrDecode 命中 LRU 时为纯查表，未命中才解码一次 256px 缩略图。
+    // getOrDecode 命中 LRU 时为纯查表，未命中才解码一次 256px 缩略图；
+    // 解码失败会进负缓存（ArtworkBitmapCache.failed），同一 uri 后续不再重解 ——
+    // 否则「封面 PNG 已被清理但 artworkUri 还指着它」的条目在列表滚动时每帧都在主线程解码。
     val resolved = bitmap ?: ArtworkBitmapCache.getOrDecode(artworkUri)
     // 占位色源（R8，#10/#11）：真曲库无封面时，占位渐变从当前极光 palette 同色相派生
     // （deep2→deep→seed 中间带），保证与整屏氛围同源；演示内容仍走 ArtStyle 设计稿固有渐变。
@@ -279,7 +281,7 @@ private const val WaveBarMaxPx = 13f
 
 /** 曲目：id 供收藏/歌单/队列引用；时长以秒为单源，duration 为显示串。
  *  真曲库文件：mediaUri = MediaStore content uri；coverBitmap = 内嵌封面缩略图；
- *  lyricLines = 同名 .lrc 解析结果（缺省用 DemoCatalog.lyrics 演示歌词）；
+ *  lyricLines = 同名 .lrc 解析结果（无文件时为 null，UI 显示「纯音乐，请欣赏」空态）；
  *  格式参数：codec/sampleRateHz/bitDepth/bitrateKbps（0 = 未知，展示时降级）；
  *  元数据：genre 为扫描真值（空 = 未知流派，分组视图归一展示）；year/trackNo/discNo 取 MediaStore（0 = 未知）；
  *  albumArtist 空串 = 标签缺失（专辑分组时回退到 [artist]，见 AppState.albumGroupsFrom）。
@@ -325,7 +327,10 @@ data class DemoSong(
      * 给 false 会让升级后的首屏把所有老歌都标成「不支持」，那才是真正的事故。
      */
     val playable: Boolean = true,
-    val inLibrary: Boolean = true,
+    // 已删除：`val inLibrary: Boolean = true`（本轮清理）。全仓零读取 ——
+    // 唯一写入点是 placeholder 传 false，而没有任何一处按它分支。
+    // 它原本大概想表达「这条是否属于曲库」，实际所有过滤都走
+    // `realLibraryLoaded` + `songIndex()` 解析失败即丢弃，与本字段无关。
     val mediaUri: String? = null,
     val coverBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
     val artworkUri: String? = null,
@@ -358,10 +363,17 @@ object DemoData {
         album = "未扫描",
         durationSec = 1,
         art = ArtStyle.Night,
-        inLibrary = false,
     )
 
-    /** 演示曲库已移除：曲库内容唯一来源 = MediaStore 真实扫描（含曲库缓存） */
+    /**
+     * 演示曲库**已彻底移除**（本轮清理）：曲库内容唯一来源 = MediaStore 真实扫描/缓存。
+     *
+     * 保留这个函数（而不是删掉它）纯粹是为了让 `DemoCatalog.songById` 的
+     * 非真库兜底分支保持可编译——那条分支本身对空表是无害空转，
+     * 而改动它会牵动 AppState 里封板的快照/恢复链。
+     * **不要**再往这里加回任何曲目：那会让「真曲库装载前的搜索/歌单解析突然有内容」
+     * 这个早已被删掉的行为重新出现。
+     */
     val songs: List<DemoSong> get() = emptyList()
 }
 

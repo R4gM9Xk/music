@@ -73,10 +73,13 @@ internal object MusicWidgetViews {
      * 新增尺寸时**必须同步加到这里**，否则新尺寸的小部件不会随播放状态刷新
      * （只在被放置时刷新一次，之后就冻住了）—— 这是那种「看着能用、用一会儿发现
      * 不更新」的隐性 bug，所以集中一处声明并把约束钉在注释里。
+     *
+     * 第二个元素 = 该 provider 是否用「横条」作为默认布局：用于
+     * `OPTION_APPWIDGET_MIN_WIDTH` 读不到时的回退（见 [build]）。
      */
     private val WIDGET_PROVIDERS = listOf(
-        MusicWidgetWideProvider::class.java,
-        MusicWidgetSquareProvider::class.java,
+        MusicWidgetWideProvider::class.java to true,
+        MusicWidgetSquareProvider::class.java to false,
     )
 
     /**
@@ -88,22 +91,33 @@ internal object MusicWidgetViews {
      *
      * 连接次数恒为 1（先读一次状态，再刷 N 个实例），不会随实例数放大 ——
      * 这点在 onUpdate 这种有 ANR 时限的入口很关键。
+     *
+     * @param preConnected 调用方**已经持有**的 controller（[WidgetActionReceiver] 在
+     *   下发完命令后复用同一条连接做反馈刷新）。传非 null 时不再新建连接 ——
+     *   否则一次点击会出现「建连 → 下发 → 建连 → 刷新」两次 2s 阻塞。
+     *   **生命周期归调用方**：本函数不会释放它。
      */
-    fun refreshAll(context: Context) {
+    fun refreshAll(context: Context, preConnected: MediaController? = null) {
         val manager = AppWidgetManager.getInstance(context) ?: return
         // 两个尺寸是两个独立 receiver，各取一次 id 再合并：
         // 只取一个的话，用户同时放了 4x1 和 4x2 时只有一个会刷新。
-        val ids = WIDGET_PROVIDERS
-            .flatMap { provider ->
-                runCatching {
-                    manager.getAppWidgetIds(ComponentName(context, provider)).toList()
-                }.getOrDefault(emptyList())
-            }
-            .distinct()
-        if (ids.isEmpty()) return // 用户没放小部件：直接返回，别白连一次播放服务
-        val state = readStateBlocking(context)
-        ids.forEach { id ->
-            runCatching { manager.updateAppWidget(id, build(context, manager, id, state)) }
+        // 用 (id → isWideProvider) 合并：id 全局唯一，所以 distinct 的语义不变，
+        // 同时把「这个实例属于哪个 provider」带下去，供 build 在缺 OPTION_MIN_WIDTH 时回退。
+        val idToWide = LinkedHashMap<Int, Boolean>()
+        WIDGET_PROVIDERS.forEach { (provider, wideDefault) ->
+            val ids = runCatching {
+                manager.getAppWidgetIds(ComponentName(context, provider)).toList()
+            }.getOrDefault(emptyList())
+            ids.forEach { id -> idToWide.putIfAbsent(id, wideDefault) }
+        }
+        if (idToWide.isEmpty()) return // 用户没放小部件：直接返回，别白连一次播放服务
+        val state = if (preConnected != null) {
+            WidgetState.read(preConnected)
+        } else {
+            readStateBlocking(context)
+        }
+        idToWide.forEach { (id, wideDefault) ->
+            runCatching { manager.updateAppWidget(id, build(context, manager, id, state, wideDefault)) }
                 .onFailure { Log.w(TAG, "updateAppWidget failed id=$id", it) }
         }
     }
@@ -155,12 +169,23 @@ internal object MusicWidgetViews {
         manager: AppWidgetManager,
         id: Int,
         state: WidgetState,
+        isWideProvider: Boolean,
     ): RemoteViews {
         val options = runCatching { manager.getAppWidgetOptions(id) }.getOrNull()
         val minWidthDp = options?.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH, 0) ?: 0
         // 阈值 180dp：4 格在主流 ROM 上约 250-290dp，2 格约 110-140dp。
         // 取 180 让「1 行高但够宽」也走横条，只有真被拖窄了才退化成封面竖版。
-        val wide = minWidthDp >= WIDE_LAYOUT_MIN_WIDTH_DP
+        //
+        // **读不到 OPTION_APPWIDGET_MIN_WIDTH 时按 provider 身份回退**（本轮修复）：
+        // 旧实现取不到就落 0 → wide=false → 一律渲染成封面竖版。
+        // 而部分 ROM 在 onUpdate 首帧、以及跨版本升级后的首次刷新里并不写该键，
+        // 于是 4x1 播放条会被塞进竖版布局（一张被压扁的方卡）。
+        // 4x1/4x2 本就是两个独立 receiver，`isWideProvider` 是比 0dp 可靠得多的默认值。
+        val wide = if (minWidthDp > 0) {
+            minWidthDp >= WIDE_LAYOUT_MIN_WIDTH_DP
+        } else {
+            isWideProvider
+        }
         val views = RemoteViews(context.packageName, if (wide) LAYOUT_WIDE else LAYOUT_SQUARE)
         bindCommon(context, views, state)
         if (wide) bindWide(views, state) else bindSquare(views, state)

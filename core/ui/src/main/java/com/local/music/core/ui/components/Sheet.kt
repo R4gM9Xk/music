@@ -101,9 +101,29 @@ class ModalState {
      * 起表差一帧、退场期掉帧、动效强度乘数变化都会让 delay 先于动画结束，content 提前
      * 清空 → 退场最后 1-2 帧被截断。用代数而不是回调，是为了让宿主用 snapshotFlow 观测，
      * 不必关心时序与重入（重开面板时代数不变，宿主 effect 直接被取消）。
+     *
+     * **只统计「属于当前关闭代次」的信号**（见 [dismissSeq] / [onSheetExitFinished]）。
      */
     var exitAnimationId by mutableIntStateOf(0)
         private set
+
+    /**
+     * 关闭请求代次：每次 [requestDismiss] +1。
+     *
+     * **为什么需要它（本轮修复）**：一个 modal 生命周期内可能同时存在多个 [GlassSheet]。
+     * `SongActionsSheet` 就有三个互斥子面板（主面板 / 加入歌单 / 歌曲信息），
+     * `CollectionActionsSheet` 同样有三个（主面板 / 重命名 / 删除确认）。
+     * 子面板之间的切换（主面板退出、子面板进入）也会让**旧子面板**播完退场动画并上报信号。
+     * 宿主那时若正好在等一次 dismiss 的收尾信号，就会被这个**属于另一次切换**的信号
+     * 提前唤醒 → `clearContent()` 提前执行 → 当前正在退场的那一块被截断最后几帧。
+     *
+     * 修法：退场**开始**时冻结当时的代次，完成时带回；宿主只认代次等于当前值的信号。
+     * 子面板切换发生在 dismiss 之前，携带的是旧代次 → 天然被忽略。
+     */
+    private var dismissSeq = 0
+
+    /** 当前关闭请求代次（[GlassSheet] 在退场开始时取一次快照） */
+    internal fun currentDismissSeq(): Int = dismissSeq
 
     /** 面板存在（含退场期）：返回键 / Chrome 门控 / 控制台让位统一读这里 */
     val isOpen: Boolean get() = content != null
@@ -125,11 +145,20 @@ class ModalState {
 
     /** 请求关闭当前面板（返回键 / scrim 点击 / 动作完成统一走这里） */
     fun requestDismiss() {
+        // 代次先行：让「这次 dismiss」与「之前/之后面板切换产生的退场信号」可区分
+        if (visible) dismissSeq++
         visible = false
     }
 
-    /** 退场动画结束时由 GlassSheet 回传（宿主机制不外泄：仅 ModalSheet 接线） */
-    internal fun notifyExitAnimationFinished() {
+    /**
+     * 退场动画结束时由 GlassSheet 回传（宿主机制不外泄：仅 ModalSheet 接线）。
+     *
+     * @param seq 该 GlassSheet **开始退场时**冻结的 [currentDismissSeq] 值。
+     *   只有与当前 [dismissSeq] 相等才计入 —— 见 dismissSeq 的 KDoc（子面板切换的
+     *   退场动画不能唤醒宿主的 dismiss 收尾等待）。
+     */
+    internal fun notifyExitAnimationFinished(seq: Int) {
+        if (seq != dismissSeq) return
         exitAnimationId++
     }
 
@@ -165,7 +194,12 @@ val LocalModalState = compositionLocalOf<ModalState> {
 @Composable
 fun ModalSheetHost(modal: ModalState) {
     // 退场收尾信号的下发通道：内层 GlassSheet 退场真正结束时回调（详见 LocalSheetExitFinished）
-    val exitSignal = remember(modal) { { modal.notifyExitAnimationFinished() } }
+    val exitReporter = remember(modal) {
+        SheetExitReporter(
+            currentSeq = { modal.currentDismissSeq() },
+            notify = { seq -> modal.notifyExitAnimationFinished(seq) },
+        )
+    }
     LaunchedEffect(modal) {
         // collectLatest：visible 翻回 true 时取消本次等待，清理随之取消（重开面板不清内容，
         // 与旧「退场中途重开撤销待注销注册」逐帧等价）
@@ -187,22 +221,37 @@ fun ModalSheetHost(modal: ModalState) {
     }
     val content = modal.content
     if (content != null) {
-        CompositionLocalProvider(LocalSheetExitFinished provides exitSignal) {
+        CompositionLocalProvider(LocalSheetExitFinished provides exitReporter) {
             content()
         }
     }
 }
 
 /**
- * 面板退场收尾信号：由 [ModalSheetHost] 在 content 外层提供，内层 [GlassSheet] 的
- * AnimatedVisibility 退场**动画结束**时回调。
+ * 面板退场收尾信号通道：由 [ModalSheetHost] 在 content 外层提供，内层 [GlassSheet] 的
+ * AnimatedVisibility 退场**动画结束**时经它上报。
  *
  * 为什么走 CompositionLocal 而不是给每个调用点加参数：GlassSheet 的直接调用点分散在
  * 各 feature 屏（PlayerScreen 等），而宿主清理只需要一份信号；用一个「宿主作用域内的
  * 环境回调」可以让既有调用点零改动（新增参数必须默认值、不能逼别人改文件，见写域约束）。
  * 默认空实现 = 非宿主场景（如二级面板自渲染、将来预览）静默降级。
+ *
+ * **为什么是两个成员而不是一个 `() -> Unit`**（本轮修复）：一个 modal 生命周期内可以有
+ * 多个 GlassSheet（`SongActionsSheet` / `CollectionActionsSheet` 各三个互斥子面板），
+ * 子面板**切换**也会跑退场动画并上报。旧实现只上报「我退场完了」，宿主无法区分那一次退场
+ * 属于「当前这次关闭」还是「面板内部切换」→ 会被无关信号提前唤醒、把当前面板的退场
+ * 末帧截断（正是该机制本来要消灭的观感问题）。
+ * 现在 GlassSheet 在退场**开始那一刻**取 [currentSeq] 快照，完成时带回；宿主只接受
+ * 等于当前关闭代次的信号。
  */
-internal val LocalSheetExitFinished = staticCompositionLocalOf<() -> Unit> { {} }
+internal class SheetExitReporter(
+    val currentSeq: () -> Int,
+    val notify: (seq: Int) -> Unit,
+)
+
+internal val LocalSheetExitFinished = staticCompositionLocalOf {
+    SheetExitReporter(currentSeq = { 0 }, notify = { })
+}
 
 /**
  * 退场收尾信号的活性兜底余量（ms，约 4 帧@60Hz）：只在「本次关闭没有任何子面板跑过退场
@@ -286,18 +335,23 @@ fun GlassSheet(
     // 仍是单树切换（不引 contentKey 双子树），无退场残留。
     val visibilityState = remember { MutableTransitionState(false) }
     visibilityState.targetState = visible
-    val onExitFinished = LocalSheetExitFinished.current
+    val exitReporter = LocalSheetExitFinished.current
     // 只有「先真的可见过、现在退场跑完」才算一次退场结束：
     // - 初次组合就是 visible=false 的嵌套子面板（动作面板里 sub 未选中的那些）一上来
     //   就是 idle + target=false，若只看这个组合会立刻误报一次退场；
     // - 入场结束时 idle + target=true，也必须不报（否则宿主会把刚打开的面板清掉）。
     var hasBeenVisible by remember { mutableStateOf(false) }
+    // 退场开始时冻结的 dismiss 代次：随信号一起回传，让宿主能区分「这次关闭」与
+    // 「同生命周期内其它子面板切换产生的退场」（见 ModalState.dismissSeq 的 KDoc）。
+    var exitSeq by remember { mutableIntStateOf(0) }
     LaunchedEffect(visibilityState.isIdle, visibilityState.currentState, visibilityState.targetState) {
         if (!visibilityState.isIdle) {
             hasBeenVisible = true
+            // 非空闲且有退场倾向 = 正在进入退场：冻结当下代次（而不是用组合首帧的死值）
+            if (!visibilityState.targetState) exitSeq = exitReporter.currentSeq()
         } else if (hasBeenVisible && !visibilityState.targetState) {
             hasBeenVisible = false
-            onExitFinished()
+            exitReporter.notify(exitSeq)
         }
     }
     AnimatedVisibility(

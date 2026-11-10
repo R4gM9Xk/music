@@ -100,11 +100,6 @@ class WidgetActionReceiver : BroadcastReceiver() {
             } finally {
                 forwarding = false
                 pending.finish()
-                // 命令是异步下发的（binder 单向），finish 之后再刷一次界面：
-                // 此刻播放器多半还没切完，状态会稍旧 —— 所以这里**不**指望它准确，
-                // 真正保证界面正确性的是服务侧的主动刷新（MusicWidgetProvider.refreshAll）。
-                // 这里刷一次只是为了让「点了有反馈」，避免按钮看起来没被按到。
-                runCatching { MusicWidgetViews.refreshAll(context) }
             }
         }, "widget-action").start()
     }
@@ -116,6 +111,14 @@ class WidgetActionReceiver : BroadcastReceiver() {
      * 不用 `sendCustomCommand` —— 后者需要在服务侧 `onConnect` 里显式声明
      * （见 MusicPlaybackService 的 CMD_SET_EQ 那套），为三个标准动作付出那个成本
      * 没有必要，而且标准接口天然受 SessionCommand/PlayerCommand 的权限校验保护。
+     *
+     * ## 为什么反馈刷新复用**本次连接**（本轮修复）
+     *
+     * 旧实现在 finally 里额外调一次 `MusicWidgetViews.refreshAll(context)`，那会
+     * **再建一个 MediaController 并再阻塞最多 2s**。于是一次点击最多两次 2s 阻塞，
+     * 与这个类自己写在头顶的「连一次 10-50ms、不要排队」的取舍直接矛盾。
+     * 现在在 release 之前用**同一个 controller** 读一次状态再刷，
+     * 整条路径的连接次数恒为 1。
      */
     private fun forward(context: Context, action: String) {
         val future: ListenableFuture<MediaController> = MediaController.Builder(
@@ -143,6 +146,13 @@ class WidgetActionReceiver : BroadcastReceiver() {
                     ACTION_NEXT ->
                         if (controller.hasNextMediaItem()) controller.seekToNextMediaItem()
                 }
+                // 「点了有反馈」：复用**本次已有**的 controller 读一次状态就地刷新。
+                // 命令是单向 binder，此刻播放器多半还没切完，所以这次刷新只是让按钮看起来
+                // 被按下过；真正保证界面正确性的是服务侧 MusicWidgetRefresher 的事件驱动刷新
+                // （onMediaItemTransition / onIsPlayingChanged）。这里不建第二个连接。
+                runCatching {
+                    MusicWidgetViews.refreshAll(context, preConnected = controller)
+                }.onFailure { Log.w(TAG, "post-action refresh failed action=$action", it) }
             } finally {
                 // releaseFuture 而不是 controller.release()：前者会取消尚未完成的连接，
                 // 对两者都安全。**必须无条件释放**，否则每点一次泄漏一个 binder 连接。

@@ -113,7 +113,7 @@ sealed class SnapshotReadResult {
  * - 旧版控制字符分隔格式（v1）在读取时一次性迁移
  * - schedule 防抖 500ms 写盘；write 失败只记日志（不杀死防抖 collector）；
  *   flush 供退后台 / 关键节点立即落盘
- * - scanFilterShort 另存独立 Preferences 键：MediaLibrary 扫描不经 AppState 就能读到当前开关（见 readScanFilterShort）
+ * - scanFilterShort 另存独立 Preferences 键（只写不读，见 KEY_SCAN_FILTER_SHORT 的注释）
  * - All-Files 引导的一次性标记同样走独立键（见 allFilesPrompted）：权限页无回调，只能靠磁盘记住「已提示过」
  * - 生命周期由宿主掌控：Activity 重建前须调 [cancel]，否则自建 scope 与防抖 collector 逐次泄漏
  */
@@ -158,8 +158,8 @@ class SettingsStore(context: Context) : SnapshotStore {
      * GlassApp 里的 `jumpedAllFiles` 只是进程内变量，重启即失忆 → 每次冷启动都再弹一次
      * 系统设置页，属于骚扰。把「已提示过」落到磁盘，才能真正做到「每台设备只引导一次」。
      *
-     * 与 [readScanFilterShort] 同款：独立 Preferences 键（不走 SharedPreferences，免第二条 IO 通道），
-     * 也不进 AppStateSnapshot——引导状态不是用户设置，不该随备份/恢复曲库迁移。
+     * 与 scanFilterShort 的独立键同款：不经过 AppStateSnapshot（不走 SharedPreferences，
+     * 免第二条 IO 通道），也不进快照——引导状态不是用户设置，不该随备份/恢复曲库迁移。
      */
     suspend fun allFilesPrompted(): Boolean = withContext(Dispatchers.IO) {
         runCatching { appContext.appDataStore().data.first()[KEY_ALL_FILES_PROMPTED] ?: false }
@@ -191,15 +191,15 @@ class SettingsStore(context: Context) : SnapshotStore {
         }
     }
 
-    suspend fun read(): AppStateSnapshot? = withContext(Dispatchers.IO) {
-        val raw = appContext.appDataStore().data.first()[KEY_STATE] ?: return@withContext null
-        decode(raw)
-    }
+    // 已删除：`suspend fun read(): AppStateSnapshot?`（本轮清理）。
+    // 它被 readResult() 的三态读取取代 —— 那个二态签名把「键不存在（真首装）」与
+    // 「解码失败（损坏）」混成同一个 null，正是 P1-② 数据丢失的根因。
+    // 保留它只会在下一个人手里重新制造那条链，故直接删掉而不是标注 @Deprecated。
 
     /**
      * P2-27：三态读取（宿主接线点：GlassApp 启动恢复）。
      *
-     * 为什么要三态：旧 [read] 的 `AppStateSnapshot?` 把「键不存在（真首装）」与
+     * 为什么要三态：旧的二态 `AppStateSnapshot?` 把「键不存在（真首装）」与
      * 「解码失败（损坏）」混成同一个 null，宿主只能一律 markHydrated 放行存盘——
      * 于是损坏快照被全默认状态覆盖写盘，用户设置不可恢复（P1-②）。
      *
@@ -345,16 +345,19 @@ class SettingsStore(context: Context) : SnapshotStore {
         private const val FLUSH_BLOCKING_TIMEOUT_MS = 400L
 
         /**
-         * 扫描过滤开关的同步读取（MediaLibrary.load 扫描线程专用；GlassApp 调用点无需感知该设置）：
-         * 独立键随快照防抖落盘，切换后到下一次手动重扫之间可能有 ≤500ms 窗口读到旧值。
-         * 必须在后台线程调用；读失败回退默认 true（默认过滤短音频）。
+         * 扫描过滤开关的**独立** Preferences 键（与快照原子同写，见 write()）。
+         *
+         * **当前没有任何调用点读取它**（本轮核对，原 KDoc 声称「MediaLibrary.load 扫描线程
+         * 专用」已不成立）：P2-④ 之后扫描恒定全量（`GlassApp.loadRealLibrary` 写死
+         * `filterShort = false`），过滤只发生在 `AppState.visibleLibrary()` 的输出层，
+         * 而那一层读的是内存里的 `state.scanFilterShort`。
+         * 键仍然被 `write()` 写入 —— **保留写入、删除读取 API**：
+         * 1) 磁盘上已有这个键，贸然停写会让「从旧版本升级回来的用户」看到一次分叉；
+         * 2) 将来若确实需要「不经 AppState 就知道当前开关」的入口（例如把扫描挪到
+         *    WorkManager 进程），这个键是现成的单一事实源。
+         * 但**不要**再写一个 readScanFilterShort 然后忘记接线 —— 那正是它变成死代码的方式。
+         * （原 `fun readScanFilterShort(context)` 已删除。）
          */
-        fun readScanFilterShort(context: Context): Boolean = runBlocking {
-            runCatching {
-                context.applicationContext.appDataStore().data.first()[KEY_SCAN_FILTER_SHORT] ?: true
-            }.getOrDefault(true)
-        }
-
         private fun JSONArray.strings(): List<String> = List(length()) { getString(it) }
 
         private fun JSONObject.stringSet(key: String): Set<String> =

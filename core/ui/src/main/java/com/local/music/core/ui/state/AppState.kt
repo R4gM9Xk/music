@@ -11,6 +11,7 @@ import androidx.compose.runtime.mutableStateSetOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import com.local.music.core.ui.components.ArtStyle
+import com.local.music.core.ui.components.ArtworkBitmapCache
 import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoData
 import com.local.music.core.ui.components.DemoPlaylist
@@ -1260,9 +1261,18 @@ class AppState(
         }
         hiddenBuiltInPlaylists.clear()
         hiddenBuiltInPlaylists.addAll(snapshot.hiddenBuiltInPlaylists)
+        // 用户歌单的曲目在两处都存了一份（snapshot.addedTracks 与 userPlaylists[].trackIds，
+        // 编码侧 encode 时两者同源），所以上面 addedTracks.addAll 之后这里通常已经齐了。
+        // **必须去重的是 trackIds 自身**：旧版本快照、手工编辑过的备份 JSON、legacy v1 迁移
+        // 都可能让同一个 id 在列表里出现两次。旧实现用 `filterNot { it in addedTracks[p.id]!! }`
+        // 只挡「目标列表里已存在的」，挡不住「这一批自身含重复」——恢复后同一首歌在歌单里
+        // 出现两次，用户点「从歌单移除」一次只删掉一条，看起来像「点了没反应」。
+        // distinct() 是关键：同一批里的重复必须先自消，再对已有项去重。
         snapshot.userPlaylists.forEach { p ->
             if (p.trackIds.isNotEmpty()) {
-                addedTracks.getOrPut(p.id) { mutableStateListOf() }.addAll(p.trackIds.filterNot { it in addedTracks[p.id]!! })
+                val target = addedTracks.getOrPut(p.id) { mutableStateListOf() }
+                val existing = target.toHashSet()
+                p.trackIds.distinct().forEach { id -> if (existing.add(id)) target.add(id) }
             }
         }
         pendingPlayback = snapshot.queueIds to (snapshot.queueIndex to snapshot.progressSec)
@@ -1406,6 +1416,10 @@ class AppState(
         library = songs
         realLibraryLoaded = true
         librarySettled = true
+        // 封面失败负缓存必须随曲库刷新一起失效：扫描/缓存到达意味着磁盘上的 covers/*.png
+        // 可能已经被重建（coverLost → 全量重提取 → 按新名落盘），旧 uri 的失败记录
+        // 若留着，新封面会被「记住它解不出来」永久挡掉（见 ArtworkBitmapCache.failed）。
+        ArtworkBitmapCache.clearFailures()
         // 空库终态（删光音乐 / 全部被过滤 / 首次扫描无结果）：队列与播放态一并归零，
         // 否则 currentSong 会落到占位曲而 playing 仍为 true（假播放 + 脏计数）。
         // 这里必须早于下面所有分支——空库时那些分支只会把 queue 设成空列表。
@@ -1438,6 +1452,14 @@ class AppState(
             pendingPlayback = null
             currentSongIdPending = null
             resumePending = false
+            // 换机 re-match 必须在这条早退分支里也跑一次（P0-5 B 的致命时序缺口）：
+            // restore 之后若「服务已在播」（进程被杀后系统续播 / 通知栏恢复 / 蓝牙重连 ——
+            // 正是换机后第一次打开 App 的典型形态），本函数会走上面这个 return，
+            // 而 rematchMissingRefs() 的调用点在函数末尾、位于 return 之后 → 整场会话都不执行。
+            // 后果：favorites / userPlaylists / playCounts 里的旧路径 id 全部解析不到，
+            // resolvePlaylist 的 mapNotNull 静默丢弃 → 歌单全空且**没有恢复横幅**，
+            // 正是 P0-5 B 声称要消灭的那句「我恢复了备份但歌单全空了，而且没有任何提示」。
+            rematchMissingRefs()
             return
         }
         when {
@@ -1620,12 +1642,21 @@ class AppState(
         when {
             shuffleOn && queue.size > 1 -> {
                 val unplayed = queue.indices.filter { it != queueIndex && queue[it].id !in playedIds }
-                if (manual || repeatMode != RepeatMode.Off || unplayed.isNotEmpty()) {
-                    queueIndex = unplayed.randomOrNull()
-                        ?: (0..queue.lastIndex).filter { it != queueIndex }.random()
-                } else {
+                // 判据保持原样（manual / 非 Off / 有未播放曲 三者之一即可切）——
+                // 这是「随机 + 顺序播放」在全部播完后应当停下的语义，不能因为
+                // 「反正还有别的曲目可跳」就继续放，否则 stopAtEnd 永远不会触发。
+                if (!manual && repeatMode == RepeatMode.Off && unplayed.isEmpty()) {
                     stopAtEnd()
                     return
+                }
+                // 候选集**必然非空**：unplayed 空时走「除当前曲外的全部下标」，
+                // 而本分支已由 `queue.size > 1` 守卫 ⇒ 至少一个元素。
+                // 旧写法 `randomOrNull() ?: (...).random()` 读起来像「可能没有候选」，
+                // 实际第二支恒非空；这里把不变量写明，避免下一个人以为需要再加兜底。
+                queueIndex = if (unplayed.isNotEmpty()) {
+                    unplayed.random()
+                } else {
+                    queue.indices.filter { it != queueIndex }.random()
                 }
             }
             queueIndex < queue.lastIndex -> queueIndex++
@@ -2251,24 +2282,36 @@ class AppState(
      * 两层过滤互不替代：MediaLibrary 仍按开关全量扫描并**全量存缓存**（指纹留在缓存里，
      * 关过滤不用重解码），本函数只负责「当前该给用户看哪些」。
      *
-     * 缓存键 = (library 引用, excludedFolders 内容指纹, scanFilterShort)：排除集是
+     * 缓存键 = (library 引用, excludedFolders **内容快照**, scanFilterShort)：排除集是
      * SnapshotStateSet，元素变化不换引用，所以不能只按引用比较。
      */
-    private var visibleLibraryCache: Triple<List<DemoSong>, Int, List<DemoSong>>? = null
+    private var visibleLibraryCache: Triple<List<DemoSong>, VisibleLibraryKey, List<DemoSong>>? = null
+
+    /**
+     * 可见曲库缓存的键。
+     *
+     * **为什么存内容快照而不是「size*31 + hashCode*2」这种手工指纹**（本轮修复）：
+     * 那种算术指纹会碰撞 —— 不同排除集算出同一个 Int 时，只要 library 引用没换，
+     * 就会返回**上一次的过滤结果**。后果是「设置里改了排除目录，曲库列表没变」这类
+     * 需重启才自愈、极难复现的抱怨。排除集通常个位数，直接存一份 Set 比对即可：
+     * 比较成本 O(k) 与算哈希同量级，而正确性是确定的。
+     */
+    private data class VisibleLibraryKey(
+        val excluded: Set<String>,
+        val scanFilterShort: Boolean,
+    )
 
     fun visibleLibrary(): List<DemoSong> {
         val lib = library
         val excluded = excludedFolders
-        // 指纹用 size + 元素哈希：排除集很小（通常个位数），O(k) 可忽略；
-        // 再把 scanFilterShort 并进指纹低位——开关是 Boolean，不占额外比较成本
-        val fingerprint = excluded.size * 31 + excluded.hashCode() * 2 + if (scanFilterShort) 1 else 0
-        visibleLibraryCache?.let { (cachedLib, cachedFp, cachedResult) ->
-            if (cachedLib === lib && cachedFp == fingerprint) return cachedResult
+        val key = VisibleLibraryKey(excluded.toSet(), scanFilterShort)
+        visibleLibraryCache?.let { (cachedLib, cachedKey, cachedResult) ->
+            if (cachedLib === lib && cachedKey == key) return cachedResult
         }
         val filtered = lib
             .filter { excluded.isEmpty() || it.folder !in excluded }
             .filter { !scanFilterShort || it.durationSec >= MIN_TRACK_SEC }
-        visibleLibraryCache = Triple(lib, fingerprint, filtered)
+        visibleLibraryCache = Triple(lib, key, filtered)
         return filtered
     }
 
@@ -2429,15 +2472,28 @@ class AppState(
 
     fun artistGroups(): List<LibraryGroup> = groups().artist
 
-    /** 文件夹分组：排除集已在 [visibleLibrary] 层生效，这里不再二次过滤
-     *  （保留形参是为了不破坏既有调用点签名） */
-    @Suppress("UNUSED_PARAMETER")
-    fun folderGroups(excluded: Set<String>): List<LibraryGroup> = groups().folder
+    /**
+     * 文件夹分组：排除集已在 [visibleLibrary] 层生效，**这里不再二次过滤**。
+     *
+     * **形参已移除**（本轮清理）：旧签名是 `folderGroups(excluded: Set<String>)` 带
+     * `@Suppress("UNUSED_PARAMETER")` —— 参数被完全忽略。两个调用点分别传
+     * `state.excludedFolders` 与 `emptySet()`，读代码的人会以为「排除在这一层生效」，
+     * 而实际生效点在 visibleLibrary。签名在撒谎比没有参数更危险：将来有人为了
+     * 「让某个新入口也尊重排除」而在这里加一个 if，就会变成二次过滤（排除集被应用两次，
+     * 且第二次作用于已过滤列表——行为正确但掩盖了真正的单一事实源）。
+     */
+    fun folderGroups(): List<LibraryGroup> = groups().folder
 
     fun genreGroups(): List<LibraryGroup> = groups().genre
 
-    /** 搜索范围：真曲库装载后搜**可见曲库**（尊重过滤文件夹）；演示模式搜全量演示曲 */
-    private fun searchScope(): List<DemoSong> = if (realLibraryLoaded) visibleLibrary() else DemoData.songs
+    /** 搜索范围：始终是**可见曲库**（尊重过滤文件夹 + 短音频开关）。
+     *
+     *  **演示分支已删除**（本轮清理）：旧实现是
+     *  `if (realLibraryLoaded) visibleLibrary() else DemoData.songs`，而
+     *  `DemoData.songs` 恒为 `emptyList()` —— 于是非真库状态下搜索恒无结果，
+     *  那条分支除了让读者以为「还有一个演示数据源」之外没有任何作用。
+     *  曲库未装载时 `library` 本身也是空的，`visibleLibrary()` 自然返回空表，语义等价。 */
+    private fun searchScope(): List<DemoSong> = visibleLibrary()
 
     fun searchSongs(query: String): List<DemoSong> {
         val q = query.trim()
@@ -2455,15 +2511,13 @@ class AppState(
     fun searchAlbumGroups(query: String): List<LibraryGroup> {
         val q = query.trim()
         if (q.isEmpty()) return emptyList()
-        // 演示模式下 searchScope 与 library 不同源（演示库已移除，此处仅为语义完整）。
-        // 演示分支也必须走 albumGroupsFrom：否则搜索结果里的专辑卡片 id 与详情页
-        // 用的 id 不是同一套编码（一个是 "专辑名\0艺术家"，一个是纯专辑名），
-        // 点进去会定位失败——演示模式只是没有真曲库，不该有独立的一套 id 体系
-        val groups = if (realLibraryLoaded) albumGroups() else albumGroupsFrom(
-            searchScope(),
-            compareBy(groupCollator) { it.key },
-        )
-        return groups.filter { g ->
+        // **演示分支已删除**（本轮清理）：旧实现 `if (realLibraryLoaded) albumGroups()
+        // else albumGroupsFrom(searchScope(), ...)` —— 非真库时 searchScope() 恒为空，
+        // 走 albumGroupsFrom 得到空表，与直接读 albumGroups()（groups() 基于空
+        // visibleLibrary()）结果一致。那条分支的价值只是解释「两套 id 编码要同源」，
+        // 而那件事现在由 albumId() 单一编码点保证（见 albumGroupsFrom 的注释），
+        // 不再需要一个恒空的对照分支来提醒。
+        return albumGroups().filter { g ->
             // 匹配专辑名 / 专辑艺术家 / 任一曲名。专辑艺术家也参与匹配是必要的：
             // 用户搜 "周杰伦" 时，他名下的合辑（专辑艺术家 = 周杰伦）应该出现，
             // 而合辑里可能没有一首歌的曲目艺术家是他，只看 songs.first().artist 会漏
@@ -2568,7 +2622,7 @@ class AppState(
                     it.art, it.songs, coverUri = it.coverUri,
                 )
             }
-            DetailTarget.Kind.Folder -> folderGroups(emptySet()).firstOrNull { it.key == target.id }?.let {
+            DetailTarget.Kind.Folder -> folderGroups().firstOrNull { it.key == target.id }?.let {
                 DetailData("文件夹", it.key, "${it.songs.size} 首", it.art, it.songs, coverUri = it.coverUri)
             }
             DetailTarget.Kind.Genre -> genreGroups().firstOrNull { it.key == target.id }?.let {

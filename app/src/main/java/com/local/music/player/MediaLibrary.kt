@@ -66,7 +66,20 @@ object MediaLibrary {
                 }
             }
             // 重入方拿到的是上次全量结果，同样只做输出层过滤（按本次开关）
-            return lastScan?.songs?.let { outputFiltered(it, filterShort) } ?: emptyList()
+            //
+            // **中止的半截结果不能当全量用**（本轮修复）：主扫描可能因 isCancelled
+            // （Activity 重建 / 离开组合）提前 break，此时 lastScan.songs 是**半截**，
+            // 而 aborted 标志只存在于 ScanResult 里、旧实现的重入路径完全看不见它。
+            // 后果与 writeCache 的 P2-19 防线同型：重入方把半截曲库当成完整结果返回，
+            // 调用方（loadRealLibrary）随后会把它写进缓存、覆盖好数据。
+            // 这里返回空表让调用方走「失败/无结果」分支（不写缓存），
+            // 比返回半截列表安全 —— 反正紧接着的一次重扫会拿到完整结果。
+            val last = lastScan ?: return emptyList()
+            if (last.aborted) {
+                Log.w(TAG, "reentrant load: in-flight scan aborted; returning empty (not half result)")
+                return emptyList()
+            }
+            return outputFiltered(last.songs, filterShort)
         }
         try {
             val result = loadInternal(context, isCancelled)
@@ -82,8 +95,11 @@ object MediaLibrary {
     private fun outputFiltered(songs: List<DemoSong>, filterShort: Boolean): List<DemoSong> =
         if (filterShort) songs.filter { it.durationSec >= MIN_TRACK_SEC } else songs
 
-    /** 最近一次扫描结果（含指纹）：writeCache 需要它写回指纹表 */
-    fun lastScanResult(): ScanResult? = lastScan
+    // 已删除：`fun lastScanResult(): ScanResult?`（本轮清理）。
+    // 全仓零调用：writeCache 直接读私有字段 `lastScan`，没有任何外部消费者。
+    // 保留它等于给「从单例里读跨次扫描状态」留一个后门 —— 正是 P3-32 那类
+    // 「扫描 A 的指纹配到扫描 B 的 songs 上」错位的温床。需要指纹请用 load() 返回的
+    // ScanResult（或 writeCache 的 fingerprints 显式参数）。
 
     /** 缓存指纹：扫描前先按 dataPath 建索引，命中且指纹一致则复用整条记录 */
     /**
@@ -1096,7 +1112,8 @@ object MediaLibrary {
     }.getOrDefault(emptyList())
 
     /** 扫描成功后写缓存（IO 线程调用）；失败静默（下次重扫再写）。
-     *  指纹取自 [fingerprints] 参数或 [lastScanResult]：新扫条目用本次 cursor 值、
+     *  指纹取自 [fingerprints] 参数或单例里的 `lastScan`（内部字段，无公开读取入口）：
+     *  新扫条目用本次 cursor 值、
      *  复用条目沿用旧指纹，保证下一次增量扫描仍能命中（否则退化成每次全量重扫）。
      *  P3-32：[fingerprints] 显式传入时可与 songs **同源**——旧实现固定读单例 lastScan，
      *  两次扫描交错（扫描 A 刚写完 lastScan，扫描 B 才调 writeCache）会把 A 的指纹

@@ -304,6 +304,9 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                 },
                 onPlayPause = state::togglePlayPause,
                 onNext = { state.next() },
+                // 空曲库时迷你条不渲染播放/下一首（否则是可点但无反应的死按钮）。
+                // 旧实现漏传本参数 → 取默认 true → 搜索页在权限被拒时照样显示两个死按钮。
+                hasSongs = state.hasSongs,
             )
         }
     }

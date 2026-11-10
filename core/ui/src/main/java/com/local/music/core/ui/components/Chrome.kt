@@ -310,7 +310,11 @@ fun ProgressTrack(
  *
  *  [hasSongs] = false（空曲库 / 权限被拒）时**不渲染播放与下一首按钮**：
  *  旧实现无门控，空曲库下迷你条显示占位曲「暂无歌曲 / 本地曲库」+ 两个可点按钮，
- *  而 togglePlayPause / next 内部有 hasSongs 守卫 → 点了完全没反应，纯死按钮。 */
+ *  而 togglePlayPause / next 内部有 hasSongs 守卫 → 点了完全没反应，纯死按钮。
+ *
+ *  **本参数刻意不给默认值**（本轮修复）：默认 `true` 让「忘记传」不报错、不崩溃，
+ *  只静默退化成死按钮 —— GlassApp 传了，但 SearchScreen 与 PlaylistDetailScreen
+ *  都漏了（三处调用点只有一处生效）。改成必填后，任何漏传都是编译错误。 */
 @Composable
 fun MiniPlayerBar(
     song: DemoSong,
@@ -319,8 +323,8 @@ fun MiniPlayerBar(
     onClick: () -> Unit,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
+    hasSongs: Boolean,
     modifier: Modifier = Modifier,
-    hasSongs: Boolean = true,
 ) {
     val palette = LocalAuroraPalette.current
     val glass = LocalGlassColors.current
@@ -630,8 +634,8 @@ fun GlassChrome(
     onOpenPlayer: () -> Unit,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
+    hasSongs: Boolean,
     modifier: Modifier = Modifier,
-    hasSongs: Boolean = true,
 ) {
     val flight = LocalPlayerFlight.current
     Column(

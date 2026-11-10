@@ -229,7 +229,7 @@ object ShareActions {
         } ?: return Outcome(false, "「$title」没有音频文件，无法设为铃声")
 
         // 一级：系统选择器。所有异常都收进 failure，交给下面判断要不要降级
-        val pickerFailure = runCatching { startRingtonePicker(context, title, uri) }.exceptionOrNull()
+        val pickerFailure = runCatching { startRingtonePicker(context, uri) }.exceptionOrNull()
         if (pickerFailure == null) {
             return Outcome(true, "已打开系统铃声选择器，选择「$title」并确认即可")
         }
@@ -260,8 +260,9 @@ object ShareActions {
         )
     }
 
-    /** 一级实现：拉起系统铃声选择器（Extras 语义见 [setAsRingtone] 的 KDoc） */
-    private fun startRingtonePicker(context: Context, title: String, uri: Uri) {
+    /** 一级实现：拉起系统铃声选择器（Extras 语义见 [setAsRingtone] 的 KDoc）。
+     *  形参只有 uri：标题不再需要（见下方已删除行留下的说明）。 */
+    private fun startRingtonePicker(context: Context, uri: Uri) {
         val picker = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
             putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_RINGTONE)
             putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "设为来电铃声")
@@ -275,7 +276,14 @@ object ShareActions {
             // 结果 uri 由谁读取：我们不需要读返回值（见 setAsRingtone 的取舍说明），
             // 但部分 ROM 的选择器非 null 才肯正常渲染候选，故按 AOSP 惯例留一个占位
             putExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI, uri)
-            putExtra("android.intent.extra.ringtone.SHOW_SILENT_ITEM", title)
+            // 已删除：旧实现在这里还有一行
+            //   putExtra("android.intent.extra.ringtone.SHOW_SILENT_ITEM", title)
+            // 该 key 是 EXTRA_RINGTONE_SHOW_SILENT 的字符串别名，语义是 **boolean**
+            // （决定「无声」这一项是否出现在候选列表里），而上一行已经用官方常量
+            // 正确地 putExtra(EXTRA_RINGTONE_SHOW_SILENT, false)。把歌名 String 塞进 boolean 键：
+            // AOSP 的 Settings 会忽略它，但按 getBooleanExtra 读该键的实现会撞类型不匹配
+            // （静默回默认值，个别 ROM 直接抛 ClassCastException）。title 在这里也没有任何用途
+            // —— 当前曲已经通过 EXTRA_RINGTONE_EXISTING_URI 显示为已选项。
         }
         startActivitySafely(context, picker)
     }

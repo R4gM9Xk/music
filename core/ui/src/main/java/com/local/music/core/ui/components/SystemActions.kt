@@ -23,7 +23,8 @@ import com.local.music.core.ui.state.AppState
  * ## 为什么默认值全是 null 而不是抛异常的占位
  *
  * 组件必须能在没有 :app 宿主的环境下渲染——Compose Preview、单测、以及「宿主尚未接线」
- * 的启动窗口期。默认空实现让面板安静地不显示这几项（见 [SystemActions.available]），
+ * 的启动窗口期。默认空实现让面板安静地不显示这几项（各菜单项逐项判 null，
+ * 见 [songShareAction] / [songRingtoneAction] / [playlistShareAction]），
  * 比渲染出点了没反应的菜单项好得多：**点了没反应比没有这项更伤**。
  * 这条取舍也保证了本文件可以放在 :core:ui 而不引入任何 :app 依赖。
  *
@@ -39,11 +40,13 @@ data class SystemActions(
     val setRingtone: ((DemoSong) -> Unit)? = null,
     /** 分享歌单（导出 M3U8 后分享）；null = 同上 */
     val sharePlaylist: ((title: String, tracks: List<DemoSong>) -> Unit)? = null,
-) {
-    /** 有任意一项可用（宿主已接线）。全不可用时面板不渲染「分享」分组，避免空动作 */
-    val available: Boolean
-        get() = shareSong != null || setRingtone != null || sharePlaylist != null
-}
+)
+// 已删除：`val available: Boolean get() = shareSong != null || ...`（本轮清理）。
+// 它的 KDoc 写「面板不渲染分享分组时靠它判断」，但全仓**零调用** ——
+// ActionsSheet 的真实实现是逐项判 null（各菜单项分别 `if (onShareSong != null)`
+// 与 `sys.playlistShareAction(...)`），根本没有「分组级」的显隐。
+// 留着一个语义更粗、且与真实实现不一致的判据，只会诱导下一个改动去用它，
+// 于是出现「available 为 false 但某一项其实已接线」的分组消失 bug。
 
 /**
  * 默认空实现（见 [SystemActions] 的「为什么默认值全是 null」）。

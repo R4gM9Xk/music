@@ -276,6 +276,8 @@ fun PlaylistDetailScreen(
                 },
                 onPlayPause = state::togglePlayPause,
                 onNext = { state.next() },
+                // 空曲库时迷你条不渲染播放/下一首（死按钮守卫）。旧实现漏传 → 取默认 true。
+                hasSongs = state.hasSongs,
             )
         }
     }

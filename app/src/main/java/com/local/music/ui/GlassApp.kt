@@ -284,7 +284,14 @@ fun GlassApp() {
                 state.reportEngineFailure("读取媒体库失败，请检查存储权限")
             }
             val songs = result.getOrDefault(emptyList())
-            state.loadLibrary(songs)
+            // **只在扫描成功时装载曲库**（修复：失败分支被下面的 loadLibrary 抢先短路）。
+            // 旧写法无条件 `loadLibrary(songs)`，而失败时 songs 是 emptyList →
+            // loadLibrary 走「空库终态」分支：把 library 置空、librarySettled 置 true、
+            // **并 abandonPendingPlayback 清掉 pending**。于是下面那个精心写的
+            // `else if (!state.librarySettled) settleLibraryKeepingPending()` 永远不执行
+            // （librarySettled 已被置 true），一次 MediaStore 瞬时错误就把用户的恢复队列
+            // 永久丢掉 —— 正是那段注释（302-307 行）声称已修好的问题，实际从未生效。
+            if (result.isSuccess) state.loadLibrary(songs)
             // 缓存写回策略按「扫描是否成功」分流，而不是按「有没有歌」——
             // 旧写法把「扫到 0 首」和「扫描失败」混在同一个 else 里，两种情况都不写缓存，
             // 于是用户删空曲库后旧 library_cache.json 仍保留全部已删曲目：冷启动读回幽灵曲库，

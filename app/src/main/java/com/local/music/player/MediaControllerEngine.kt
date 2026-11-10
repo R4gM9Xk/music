@@ -377,9 +377,17 @@ class MediaControllerEngine(
 
     /**
      * 断连检测：MediaController.Listener 只能在 Builder 注册，而引擎拿到的是成品 controller，
-     * 无处挂 onDisconnected——改用轻量心跳：play/pause/seek/skip/positionSec 等入口检查 isConnected，
+     * 无处挂 onDisconnected——改用轻量心跳：**所有**对外入口检查 isConnected，
      * 断连即上报并置位（重连后清位）；tick 周期调 positionSec，断连一个心跳内可见，
      * UI 走既有错误横幅而非假死。返回 false = 已断连（调用方 no-op 返回）。
+     *
+     * **为什么必须覆盖全部入口（本轮修复）**：旧实现只给 play/pause/seek/skip/positionSec
+     * 挂了守卫，而 `loadQueue / setRepeatMode / setShuffleMode / stopAndClear /
+     * addQueueItems / moveQueueItem / removeQueueItems / mediaIds / currentMediaId` 全部裸调。
+     * media3 的 Player 在未连接时**抛 IllegalStateException**，而这些方法全部由 AppState
+     * 在 UI 线程调用（startCurrent → loadQueue、队列编辑 → add/remove/move、切模式 → setRepeatMode）。
+     * 于是「服务进程被系统杀掉、用户强停，而 Activity 还活着」这个真实场景下，
+     * 用户点「播放」「下一首播放」「清空接下来」= 未捕获异常崩溃。
      */
     private fun checkConnected(): Boolean {
         if (controller.isConnected) {
@@ -396,6 +404,15 @@ class MediaControllerEngine(
         return false
     }
 
+    /**
+     * 只读 / 收尾类入口的连接判断：断连时静默 no-op，**不上报错误横幅**。
+     *
+     * 与 [checkConnected] 的分工：停止播放、读队列长度这类动作在 teardown
+     * （Activity 销毁、服务重启、切到演示曲目）路径上高频发生，那时断连是**预期状态**，
+     * 弹一条「播放服务连接已断开」纯属噪音，还会和真正的错误抢横幅。
+     */
+    private fun connectedSilently(): Boolean = controller.isConnected
+
     /** 整条队列下发给服务端播放器：起始位置随 setMediaItems 原子下发（独立 seekTo 会在装载窗口被丢弃） */
     override fun loadQueue(specs: List<SongSpec>, startIndex: Int, startSec: Float, autoPlay: Boolean) {
         // 换了一整条队列 = 用户换了播放语境（换歌单 / 换搜索结果），上一次「连续跳过」的记录
@@ -403,6 +420,10 @@ class MediaControllerEngine(
         // 就直接放弃——上限被别处的坏文件消耗掉了。此处重置，同时把可能残留的跳过旗标清掉。
         consecutiveSkips = 0
         autoSkipInFlight = false
+        // 断连守卫：此处若放行，setMediaItems/prepare/playWhenReady 三连全部抛
+        // IllegalStateException（AppState.startCurrent 在 UI 线程调它）。
+        // 上报后由 AppState.onError 清播放态，不会出现「界面在播、实际没声」的假象。
+        if (!checkConnected()) return
         val idx = startIndex.coerceIn(0, (specs.size - 1).coerceAtLeast(0))
         val items = specs.map { it.toMediaItem() }.withArtwork(specs, idx)
         val startPositionMs = if (startSec > 0f) (startSec * 1000).toLong() else C.TIME_UNSET
@@ -416,6 +437,9 @@ class MediaControllerEngine(
     }
 
     override fun setRepeatMode(repeatAll: Boolean, repeatOne: Boolean) {
+        // 静默守卫：模式是「意图状态」，断连时丢掉不会造成界面与实际不一致
+        // （重连后 syncEngineModes 会按 AppState 的字段重新下发一次）。
+        if (!connectedSilently()) return
         controller.repeatMode = when {
             repeatOne -> Player.REPEAT_MODE_ONE
             repeatAll -> Player.REPEAT_MODE_ALL
@@ -424,6 +448,7 @@ class MediaControllerEngine(
     }
 
     override fun setShuffleMode(enabled: Boolean) {
+        if (!connectedSilently()) return
         controller.shuffleModeEnabled = enabled
     }
 
@@ -540,9 +565,13 @@ class MediaControllerEngine(
         if (checkConnected()) controller.seekToPreviousMediaItem()
     }
 
-    override fun hasNextMediaItem(): Boolean = controller.hasNextMediaItem()
+    override fun hasNextMediaItem(): Boolean =
+        // 断连返回 false：调用方（AppState.next 的队尾兜底、onPlayerError 的 canSkip）
+        // 把 false 读成「没有下一首」是安全降级，不会抛。
+        connectedSilently() && controller.hasNextMediaItem()
 
-    override fun hasPreviousMediaItem(): Boolean = controller.hasPreviousMediaItem()
+    override fun hasPreviousMediaItem(): Boolean =
+        connectedSilently() && controller.hasPreviousMediaItem()
 
     // 增量队列编辑：MediaController 原生 API 即可原地改队列，当前曲不受影响；
     // move 语义（toIndex 以移除后的列表坐标计）与 AppState 侧 Kotlin removeAt/add 一致。
@@ -551,8 +580,13 @@ class MediaControllerEngine(
     // pinLast 由调用方显式传入意图——不再用 index >= mediaItemCount 猜位置，
     // 当前曲在队尾时「下一首播放」曾被误判成「最后播放」）
     override fun addQueueItems(index: Int, specs: List<SongSpec>, pinLast: Boolean) {
+        if (!checkConnected()) return
         if (controller.shuffleModeEnabled && specs.isNotEmpty()) {
-            runCatching {
+            // shuffle 修正命令下发失败时退回原生插入 —— 但**必须留痕**：
+            // 退回后新项会被 DefaultShuffleOrder 随机放置，「下一首播放」变成「随机某处播放」，
+            // 属于用户可见的行为偏差。旧实现把它完全吞掉（无日志），
+            // 一旦 onConnect 漏声明命令或服务端旧版本不认该命令，就再也查不出原因。
+            val sent = runCatching {
                 controller.sendCustomCommand(
                     SessionCommand(MusicPlaybackService.CMD_INSERT_SHUFFLE_FIX, Bundle.EMPTY),
                     Bundle().apply {
@@ -564,38 +598,66 @@ class MediaControllerEngine(
                         )
                     },
                 )
-            }.onFailure { controller.addMediaItems(index, specs.map { it.toMediaItem() }.withArtwork(specs, 0)) }
+            }
+            if (sent.isFailure) {
+                android.util.Log.w(
+                    "MediaControllerEngine",
+                    "shuffle 插入修正命令下发失败，退回原生插入（新项位置将不受 pinLast 意图约束）",
+                    sent.exceptionOrNull(),
+                )
+                controller.addMediaItems(index, specs.map { it.toMediaItem() }.withArtwork(specs, 0))
+            }
         } else {
             // 追加插入：新项就是「下一首播放」的目标，自然可以带封面；预算取当前曲之后一段
             controller.addMediaItems(index, specs.map { it.toMediaItem() }.withArtwork(specs, 0))
         }
     }
 
-    override fun moveQueueItem(fromIndex: Int, toIndex: Int) = controller.moveMediaItem(fromIndex, toIndex)
+    override fun moveQueueItem(fromIndex: Int, toIndex: Int) {
+        // 断连守卫：moveMediaItem 在未连接时抛 IllegalStateException，
+        // 而它由 ReorderableList 松手回调在 UI 线程调（队列面板拖拽）。
+        if (!checkConnected()) return
+        controller.moveMediaItem(fromIndex, toIndex)
+    }
 
     override fun removeQueueItems(fromIndex: Int, toIndex: Int) {
+        if (!checkConnected()) return
         controller.removeMediaItems(fromIndex, toIndex)
     }
 
-    override fun currentMediaId(): String? = controller.currentMediaItem?.mediaId
+    override fun currentMediaId(): String? =
+        // 读侧：断连时返回 null（不查 isConnected 会抛）。AppState 对 null 已有多处兜底
+        // （attachPlayer 保持服务现状 / loadLibrary 的 playingSong 分支）。
+        if (connectedSilently()) controller.currentMediaItem?.mediaId else null
 
     override fun mediaIds(): List<String> =
-        (0 until controller.mediaItemCount).map { controller.getMediaItemAt(it).mediaId }
+        if (!connectedSilently()) {
+            // 断连返回空表：调用方（AppState.mediaIds 消费者）用 `mapNotNull{songById(it)}`
+            // 处理空表的结果是空队列 → 走 `ifEmpty { songs }` 退回整库，语义安全。
+            emptyList()
+        } else {
+            (0 until controller.mediaItemCount).map { controller.getMediaItemAt(it).mediaId }
+        }
 
-    override fun isEnginePlaying(): Boolean = controller.isPlaying
+    override fun isEnginePlaying(): Boolean = connectedSilently() && controller.isPlaying
 
     override fun positionSec(): Float {
-        checkConnected() // 心跳入口：断连在此上报；返回值仍取 controller 缓存的当前进度
+        if (!checkConnected()) return 0f // 心跳入口：断连在此上报
         return (controller.currentPosition.coerceAtLeast(0)) / 1000f
     }
 
     override fun durationSec(): Float {
+        if (!connectedSilently()) return 0f
         val d = controller.duration
         return if (d > 0) d / 1000f else 0f
     }
 
     /** 停止并清空装载（切到演示曲目 / 服务残留失效曲目时用） */
     override fun stopAndClear() {
+        // 静默守卫：本方法的调用点几乎全在 teardown 路径（loadLibrary 空库、
+        // startCurrent 切演示曲目、togglePlayPause 清残留、applyRestoredPlayback），
+        // 断连正是这些场景的预期状态，不该弹错误横幅。
+        if (!connectedSilently()) return
         controller.pause()
         controller.clearMediaItems()
     }
