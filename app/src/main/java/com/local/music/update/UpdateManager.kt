@@ -58,6 +58,15 @@ class UpdateManager(
      */
     private val checkInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /**
+     * 下载在飞标记：与 [checkInFlight] 同型，但守的是**下载**这条链。
+     *
+     * 为什么不能用 `state.status == Downloading` 代替：状态置位发生在协程体里，
+     * 而 `scope.launch` 只是排队 —— 两次点击都能落在「已排队、未执行」的窗口内。
+     * AtomicBoolean 是同步置位，跨线程立即可见，窗口不存在（详见 [startUpdate]）。
+     */
+    private val downloadInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
     // 下载进度节流基准：上一次真正写进 Compose state 的整数百分比与时刻（见 updateProgress）。
     // @Volatile：写入发生在 downloadTo 的 IO 线程，读也只在同一线程，但重置点在主线程的
     // startUpdate 里——加 volatile 保证主线程的复位对下载线程可见，不必再上锁
@@ -71,6 +80,16 @@ class UpdateManager(
     fun check() {
         // 并发防护：检查中忽略重复点击（含静默检查在飞）
         if (!checkInFlight.compareAndSet(false, true)) return
+        // **下载中 / 已下载待安装时不接管**（本轮修复）：本函数会把 state 整体覆盖成
+        // Checking → Available/UpToDate，正在进行的那条下载链的进度与安装入口就此丢失
+        // （下载协程随后还会 `state.copy(ReadyToInstall)` 把它盖回来 → UI 两态来回抖）。
+        // checkSilently() 早就排除了这两种状态，两处防护口径现在一致。
+        if (state.status == UpdateUiState.Status.Downloading ||
+            state.status == UpdateUiState.Status.ReadyToInstall
+        ) {
+            checkInFlight.set(false)
+            return
+        }
         // 状态先行、同步置位：UI 立即进入「检查中」并把按钮禁用，
         // 不能等协程调度到才有反馈（否则连点两下的第二下会看到旧状态）
         state = UpdateUiState(status = UpdateUiState.Status.Checking)
@@ -147,7 +166,14 @@ class UpdateManager(
     /** 一键更新：下载 → 校验 → 自动拉起安装器 */
     fun startUpdate() {
         val info = pendingInfo ?: return
-        if (state.status == UpdateUiState.Status.Downloading) return // 并发防护：下载中忽略重复点击
+        // 并发防护（本轮修复）：不能只看 state.status。
+        //
+        // 旧写法 `if (state.status == Downloading) return` 有窗口：状态置位发生在
+        // `scope.launch` 的协程体首句，而 launch 只是排队 —— 从「判断状态」到
+        // 「协程真正跑起来置位」之间，两次点击都能通过检查，各起一路下载协程，
+        // 共用同一个 TMP_NAME 互相截断 → sha256 必然失败 → 误报「网络异常」。
+        // 这与 check() 用 AtomicBoolean 解决的「launch 排队窗口」是同一类竞态。
+        if (!downloadInFlight.compareAndSet(false, true)) return
         // P3-51：清掉上次进程被杀残留的半截 tmp（downloadApk 的成败路径都会删 tmp，
         // 唯独进程中途死亡没人兜底；不清理的话旧半截会一直占着私有目录空间）
         runCatching { File(apkFile.parentFile, TMP_NAME).delete() }
@@ -155,28 +181,35 @@ class UpdateManager(
         lastProgressPercent = -1
         lastProgressAtMs = 0L
         lastIndeterminateReadMb = -1 // P3-50：不定长基准一并重置
+        // **状态同步置位**（本轮修复）：与 check() 的做法对齐 —— UI 立即进入下载态并
+        // 禁用入口，不要等协程调度到才有反馈。
+        state = UpdateUiState(
+            status = UpdateUiState.Status.Downloading,
+            versionName = info.versionName,
+            changelog = info.changelog,
+            progress = 0f,
+            // P3-50：先按「不定长」显示；首次回调拿到有效 Content-Length 再转百分比
+            // （经代理转发常丢 Content-Length，旧实现这种场景全程恒 0%）
+            indeterminate = true,
+        )
         scope.launch {
-            state = UpdateUiState(
-                status = UpdateUiState.Status.Downloading,
-                versionName = info.versionName,
-                changelog = info.changelog,
-                progress = 0f,
-                // P3-50：先按「不定长」显示；首次回调拿到有效 Content-Length 再转百分比
-                // （经代理转发常丢 Content-Length，旧实现这种场景全程恒 0%）
-                indeterminate = true,
-            )
-            val downloaded = withContext(Dispatchers.IO) { downloadApk(info) }
-            when {
-                downloaded != null -> {
-                    state = state.copy(status = UpdateUiState.Status.ReadyToInstall, indeterminate = false)
-                    install()
+            try {
+                val downloaded = withContext(Dispatchers.IO) { downloadApk(info) }
+                when {
+                    downloaded != null -> {
+                        state = state.copy(status = UpdateUiState.Status.ReadyToInstall, indeterminate = false)
+                        install()
+                    }
+                    else -> state = state.copy(
+                        status = UpdateUiState.Status.Failed,
+                        message = "网络异常或下载中断",
+                        failStage = UpdateUiState.FailStage.Download, // P2-25：真·下载失败
+                        indeterminate = false,
+                    )
                 }
-                else -> state = state.copy(
-                    status = UpdateUiState.Status.Failed,
-                    message = "网络异常或下载中断",
-                    failStage = UpdateUiState.FailStage.Download, // P2-25：真·下载失败
-                    indeterminate = false,
-                )
+            } finally {
+                // 必须无条件复位：异常/取消路径漏放会让本次进程内再也无法重新下载
+                downloadInFlight.set(false)
             }
         }
     }
@@ -382,7 +415,13 @@ class UpdateManager(
      */
     private fun updateProgress(read: Long, total: Long) {
         if (total <= 0) {
-            // 不定长模式：无法计算百分比，用「已读字节数」做节流基准
+            // 不定长模式：无法计算百分比，用「已读字节数」做节流基准。
+            //
+            // **progress 字段不能被写成字节数**（本轮修复）：它的语义是 0..1 的归一化进度，
+            // 而 UI 侧 ProgressTrack 会对该值 coerceIn(0f, 1f) —— 写 read.toFloat()
+            // （已读字节数，动辄上百万）会被钳成 1f，进度条**恒满格**。这比「恒 0%」
+            // 更糟：用户以为下完了。正确做法是保持 progress 不动（让它留在上次的 0 或
+            // 上次有效百分比），并把 indeterminate=true 交给 UI 去表达「总长未知、仍在动」。
             if (state.status == UpdateUiState.Status.Downloading) {
                 if (!state.indeterminate) state = state.copy(indeterminate = true)
                 val now = android.os.SystemClock.elapsedRealtime()
@@ -393,7 +432,8 @@ class UpdateManager(
                 if (mbChanged || intervalElapsed) {
                     lastIndeterminateReadMb = mb.toInt()
                     lastProgressAtMs = now
-                    state = state.copy(progress = read.toFloat())
+                    // 只写 indeterminate 的「心跳」，不改 progress（见上）
+                    state = state.copy(indeterminate = true)
                 }
             }
             return

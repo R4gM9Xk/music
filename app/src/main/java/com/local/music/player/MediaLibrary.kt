@@ -57,7 +57,29 @@ object MediaLibrary {
         context: Context,
         filterShort: Boolean = true,
         isCancelled: () -> Boolean = { false },
-    ): List<DemoSong> {
+    ): List<DemoSong> = loadWithResult(context, filterShort, isCancelled)?.songs.orEmpty()
+
+    /**
+     * 与 [load] 完全同一条路径，但**把本次扫描的指纹一并返回**（P3-32 防线的接线点）。
+     *
+     * 为什么必须有它：`writeCache` 的 `fingerprints` 参数注释一直说「GlassApp 拿到
+     * load() 返回的 ScanResult 后可传 result.fingerprints」——而 [load] 的返回类型是
+     * `List<DemoSong>`，**根本拿不到指纹**，于是那个防错位参数在生产链上永远传 null，
+     * 只能回落到单例 `lastScan`。并发重扫（启动扫描 + 设置页连点）时，先完成的扫描会
+     * 覆盖 `lastScan`，后执行的那次 `writeCache` 就可能拿**另一轮**的指纹配这一轮的
+     * songs —— 指纹错位后下次增量永远 miss，退化成每次冷启动全量重扫。
+     *
+     * 返回值：
+     * - `null` = 重入且拿不到可用结果（上一次扫描被 cancel 中止）→ 调用方**不应写缓存**；
+     * - 非 null = 本次（或最近一次完整）扫描结果，`fingerprints` 与 `songs` **同源**。
+     *
+     * `songs` 已按 [filterShort] 做过输出层过滤；`aborted` 透传 `loadInternal` 的中止标记。
+     */
+    fun loadWithResult(
+        context: Context,
+        filterShort: Boolean = true,
+        isCancelled: () -> Boolean = { false },
+    ): ScanResult? {
         // 互斥：已有扫描在跑就等它，拿它的结果（避免两路并发写同一缓存文件）
         if (!scanning.compareAndSet(false, true)) {
             synchronized(scanLock) {
@@ -72,19 +94,19 @@ object MediaLibrary {
             // 而 aborted 标志只存在于 ScanResult 里、旧实现的重入路径完全看不见它。
             // 后果与 writeCache 的 P2-19 防线同型：重入方把半截曲库当成完整结果返回，
             // 调用方（loadRealLibrary）随后会把它写进缓存、覆盖好数据。
-            // 这里返回空表让调用方走「失败/无结果」分支（不写缓存），
+            // 这里返回 null 让调用方走「失败/无结果」分支（不写缓存），
             // 比返回半截列表安全 —— 反正紧接着的一次重扫会拿到完整结果。
-            val last = lastScan ?: return emptyList()
+            val last = lastScan ?: return null
             if (last.aborted) {
                 Log.w(TAG, "reentrant load: in-flight scan aborted; returning empty (not half result)")
-                return emptyList()
+                return null
             }
-            return outputFiltered(last.songs, filterShort)
+            return last.copy(songs = outputFiltered(last.songs, filterShort))
         }
         try {
             val result = loadInternal(context, isCancelled)
             lastScan = result
-            return outputFiltered(result.songs, filterShort)
+            return result.copy(songs = outputFiltered(result.songs, filterShort))
         } finally {
             scanning.set(false)
             synchronized(scanLock) { scanLock.notifyAll() }
@@ -195,6 +217,19 @@ object MediaLibrary {
             /** 负索引（该 provider 没有此列）安全取串：列缺失 = 未知，统一空串 */
             fun str(col: Int): String? = if (col >= 0) cursor.getString(col) else null
             fun num(col: Int): Int = if (col >= 0) cursor.getInt(col) else 0
+            /**
+             * 「可能是 "1" / "1/2" 形态的整数列」安全取值。
+             *
+             * **为什么不直接用 [num]**（本轮修复）：`MediaStore.Audio.Media.DISC_NUMBER`
+             * 是 **TEXT** 列，MediaProvider 原样透传标签里的 TPOS（"1" 或 "1/2" 都可能）。
+             * `cursor.getInt()` 对 "1/2" 会抛 NumberFormatException —— 而它在
+             * `loadInternal` 的游标循环里，异常会一路冒到 `load()` 外层被吞成「扫描失败」，
+             * 表现为**整库突然变空**；即便某些实现不抛而返回 0，多碟专辑的碟号也恒为 0，
+             * `sortAlbumTracks` 的碟号优先排序随之失效。
+             * 这里先按字符串取，再用与音轨号同一套「取斜杠前的整数」口径解析。
+             */
+            fun discNum(col: Int): Int =
+                if (col >= 0) cursor.getString(col)?.let { parseLeadingInt(it) } ?: 0 else 0
 
             while (cursor.moveToNext()) {
                 // P2-19 取消检查：命中即 break（不抛异常），保证下面的 use{} 正常关 cursor。
@@ -269,7 +304,7 @@ object MediaLibrary {
                                 ?.trim()
                                 ?.takeIf { it.isNotEmpty() && it != "<unknown>" }
                                 .orEmpty(),
-                            discNo = num(colDiscNo),
+                            discNo = discNum(colDiscNo),
                             year = num(colYear).takeIf { it in 1..9999 } ?: c.year,
                             // 能否播放沿用旧记录：它取决于 codec，而 codec 不在 cursor 里，
                             // 复用路径拿不到 MIME（拿它就要重跑 MediaExtractor，等于放弃增量）。
@@ -303,8 +338,10 @@ object MediaLibrary {
                     ?.trim()
                     ?.takeIf { it.isNotEmpty() && it != "<unknown>" }
                     .orEmpty()
-                // 碟号：MediaStore 存的是字符串（可能为 "1" 或 "1/2"），取不出来按 0 = 未知
-                val discNo = num(colDiscNo)
+                // 碟号：MediaStore 的 DISC_NUMBER 是 **TEXT** 列（可能为 "1" 或 "1/2"），
+                // 必须走 discNum 的字符串解析 —— 用 getInt 对 "1/2" 会抛 NumberFormatException
+                // 让整次扫描失败，或静默退化成 0（多碟专辑排序失效）。取不出来按 0 = 未知
+                val discNo = discNum(colDiscNo)
                 // 年份：优先用 MediaStore 的 YEAR 列，取不到（0）再回退标签里的年份。
                 // 两条路都有值但不同时以 MediaStore 为准——它是文件系统侧的权威声明
                 val year = num(colYear).takeIf { it in 1..9999 } ?: meta.tags.year
@@ -780,8 +817,9 @@ object MediaLibrary {
                     ?.trim()?.let { normalizeGenre(it) }.orEmpty(),
                 year = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_YEAR)
                     ?.trim()?.toIntOrNull()?.takeIf { it in 1..9999 } ?: 0,
+                // 音轨号：标签常见 "3" / "3/12" / "03"，与碟号共用同一个解析口径
                 trackNo = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER)
-                    ?.let { parseTrackNo(it) } ?: 0,
+                    ?.let { parseLeadingInt(it) } ?: 0,
             )
         } catch (e: Exception) {
             // 标签读取失败不影响封面/时长/格式：各自已有降级。留痕是为了区分
@@ -860,8 +898,16 @@ object MediaLibrary {
         return text
     }
 
-    /** 音轨号：标签常见 "3" / "3/12" / "03"，取斜杠前的整数 */
-    private fun parseTrackNo(raw: String): Int =
+    /**
+     * 「可能带 "/总数" 后缀的整数文本」归一：取斜杠前的整数，非正数或解析失败一律 0（= 未知）。
+     *
+     * 覆盖两条完全不同的来路，所以抽成一个口径：
+     * - 音轨号来自 MediaMetadataRetriever 的 `METADATA_KEY_CD_TRACK_NUMBER`（"3" / "3/12"）；
+     * - 碟号来自 **cursor 的 TEXT 列** `DISC_NUMBER`（同样是 "1" / "1/2"）。
+     * 两处输入形态一致、语义一致（0 = 未知，见 DemoSong.discNo 的「0 排末尾」约定），
+     * 各写一份只会在调整规则时改一处漏一处。
+     */
+    private fun parseLeadingInt(raw: String): Int =
         raw.trim().substringBefore('/').trim().toIntOrNull()?.takeIf { it > 0 } ?: 0
 
     /** 标准 ID3v1 流派表（0..79；后续 Winamp 扩展略去——超出范围回退空串，UI 归一「未知流派」） */

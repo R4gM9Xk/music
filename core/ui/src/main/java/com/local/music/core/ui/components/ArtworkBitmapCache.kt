@@ -63,7 +63,14 @@ object ArtworkBitmapCache {
             size > MAX_FAILED
     }
 
-    /** 只查缓存，不解码（供需要「已经就绪就别抖」的场景）。失败过的 uri 也返回 null。 */
+    /**
+     * 只查缓存、**不解码**：供需要「已经就绪就别抖」的场景（例如先画占位、下一帧才有图）。
+     * 失败过的 uri 也返回 null。
+     *
+     * **当前全仓零调用**（唯一消费方 ArtThumb 走的是 [getOrDecode]，它本身就包含查表）。
+     * 保留它是刻意的：这是一个**纯查表、零副作用**的读取入口，将来做「预解码/预热」
+     * 或「避免同一帧内重复触发解码」时正需要它。不要因为它暂时没人用就删掉再重新发明。
+     */
     fun get(uri: String?): ImageBitmap? {
         if (uri.isNullOrEmpty()) return null
         return lru[uri]
@@ -91,7 +98,14 @@ object ArtworkBitmapCache {
         return bitmap
     }
 
-    /** 让某个 uri 的失败记录失效（重扫后封面可能已恢复，由调用方在曲库刷新时清） */
+    /**
+     * 让某个 uri 的失败记录失效（重扫后封面可能已恢复，由调用方在曲库刷新时清）。
+     *
+     * **当前全仓零调用**：曲库刷新走的是 [clearFailures]（整批失效，语义更贴合「一次
+     * 重扫会让全部封面都可能变」的真实场景）。保留本函数是因为它表达的是**更细的粒度**
+     * —— 将来若出现「只重建了某一首歌的封面」（例如单曲封面替换入口），
+     * 那时该用它而不是清空整批。调用前请确认没有更粗的批处理路径可用。
+     */
     fun clearFailure(uri: String) {
         failed.remove(uri)
     }
@@ -101,8 +115,15 @@ object ArtworkBitmapCache {
         failed.clear()
     }
 
-    /** 显式放入（扫描期已解出、不想再解一次时用） */
-    fun put(uri: String, bitmap: ImageBitmap) {
+    /**
+     * 放入一张已解好的位图（**内部使用**：只由 [getOrDecode] 在解码成功后调用）。
+     *
+     * 曾是 public，KDoc 写「扫描期已解出、不想再解一次时用」—— 那个用途**已经不存在**：
+     * 扫描不再预解码全库封面（正是本对象存在的理由），全仓也没有第二个写入点。
+     * 保留 public 会让「绕过 LRU 预算直接塞位图」变成一件随手可做的事，
+     * 而那样做的人不会知道它同时维护 [sizeBytes] —— 预算一旦失真，OOM 防线就失效了。
+     */
+    private fun put(uri: String, bitmap: ImageBitmap) {
         lru.put(uri, bitmap)?.let { sizeBytes -= it.byteSize() }
         sizeBytes += bitmap.byteSize()
         // 手动收紧：LinkedHashMap 的 removeEldestEntry 只在 put 内部被调用一次，
@@ -115,7 +136,15 @@ object ArtworkBitmapCache {
         }
     }
 
-    /** 清空位图缓存与失败记录（换库 / 重扫完成后调用，见 AppState.loadLibrary 的接线） */
+    /**
+     * 清空位图缓存与失败记录（换库 / 重扫完成后调用，见 AppState.loadLibrary 的接线）。
+     *
+     * **两者必须一起清**：
+     * - 位图：重扫后磁盘上的 PNG 可能已被重建，旧 uri 指向的字节已不是同一张图，
+     *   不清则 LRU 命中旧位图 → 「换了封面但界面还是老图」；
+     * - 失败记录：新封面应被重新尝试，否则「记住它解不出来」会永久挡住。
+     * AppState.loadLibrary 已按此语义接线（此前只调了 clearFailures，位图从未清过）。
+     */
     fun clear() {
         lru.clear()
         sizeBytes = 0L

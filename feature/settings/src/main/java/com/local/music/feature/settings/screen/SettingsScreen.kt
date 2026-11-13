@@ -91,8 +91,7 @@ fun SettingsScreen(
     audioDenied: Boolean = false,
     onRequestAudioPermission: () -> Unit = {},
     // D2/D3：文件 IO 入口（SAF 选择器在 app 层持有，屏内只发起）
-    onImportM3u: () -> Unit = {},
-    onExportBackup: () -> Unit = {},
+    onImportM3u: () -> Unit = {},    onExportBackup: () -> Unit = {},
     onImportBackup: () -> Unit = {},
     /**
      * 崩溃日志入口（04 报告 #3 的最后一环）。
@@ -820,7 +819,19 @@ fun SettingsScreen(
                                     }
                                     Spacer(Modifier.height(6.dp))
                                     if (current.status == UpdateUiState.Status.Downloading) {
-                                        ProgressTrack(progress = current.progress, onSeek = {})
+                                        // P3-58：进度由外部（下载协程）驱动、onSeek 是空实现 →
+                                        // **必须传 enabled = false**，否则用户拖动会立刻被真实进度弹回，
+                                        // 看起来像 bug。旧实现漏传，取了默认 true。
+                                        // P3-50：不定长（代理丢 Content-Length）时 progress 恒 0，
+                                        // 画一条空轨道会被读成「卡住不动」；此时整条隐藏，
+                                        // 只留下面那句「总大小未知，完成后自动打开安装程序」表达仍在进行。
+                                        if (!current.indeterminate) {
+                                            ProgressTrack(
+                                                progress = current.progress,
+                                                onSeek = {},
+                                                enabled = false,
+                                            )
+                                        }
                                         Text(
                                             if (current.indeterminate) {
                                                 "下载中，总大小未知，完成后自动打开安装程序"

@@ -314,6 +314,21 @@ class SettingsStore(context: Context) : SnapshotStore {
     companion object {
         private const val TAG = "SettingsStore"
         private val KEY_STATE = stringPreferencesKey("app_state_snapshot")
+
+        /**
+         * 扫描过滤开关的**独立** Preferences 键（与快照原子同写，见 [write]）。
+         *
+         * **当前没有任何调用点读取它**（本轮核对；旧 KDoc 声称「MediaLibrary.load 扫描线程
+         * 专用」已不成立）：P2-④ 之后扫描恒定全量（`GlassApp.loadRealLibrary` 写死
+         * `filterShort = false`），过滤只发生在 `AppState.visibleLibrary()` 的输出层，
+         * 而那一层读的是内存里的 `state.scanFilterShort`。
+         *
+         * **保留写入、不提供读取 API**（原 `fun readScanFilterShort(context)` 已删除）：
+         * 1) 磁盘上已有这个键，贸然停写会让「从旧版本升级回来的用户」看到一次分叉；
+         * 2) 将来若确实需要「不经 AppState 就知道当前开关」的入口（例如把扫描挪到
+         *    WorkManager 进程），这个键是现成的单一事实源。
+         * 但**不要**再写一个 readScanFilterShort 然后忘记接线 —— 那正是它变成死代码的方式。
+         */
         private val KEY_SCAN_FILTER_SHORT = booleanPreferencesKey("scan_filter_short")
         /** All-Files 引导一次性标记（见 [allFilesPrompted]）：与快照无关，故独立键 */
         private val KEY_ALL_FILES_PROMPTED = booleanPreferencesKey("all_files_prompted")
@@ -351,20 +366,6 @@ class SettingsStore(context: Context) : SnapshotStore {
         /** [flushBlocking] 的阻塞上限：只是兜底，正常 DataStore edit 是个位数毫秒 */
         private const val FLUSH_BLOCKING_TIMEOUT_MS = 400L
 
-        /**
-         * 扫描过滤开关的**独立** Preferences 键（与快照原子同写，见 write()）。
-         *
-         * **当前没有任何调用点读取它**（本轮核对，原 KDoc 声称「MediaLibrary.load 扫描线程
-         * 专用」已不成立）：P2-④ 之后扫描恒定全量（`GlassApp.loadRealLibrary` 写死
-         * `filterShort = false`），过滤只发生在 `AppState.visibleLibrary()` 的输出层，
-         * 而那一层读的是内存里的 `state.scanFilterShort`。
-         * 键仍然被 `write()` 写入 —— **保留写入、删除读取 API**：
-         * 1) 磁盘上已有这个键，贸然停写会让「从旧版本升级回来的用户」看到一次分叉；
-         * 2) 将来若确实需要「不经 AppState 就知道当前开关」的入口（例如把扫描挪到
-         *    WorkManager 进程），这个键是现成的单一事实源。
-         * 但**不要**再写一个 readScanFilterShort 然后忘记接线 —— 那正是它变成死代码的方式。
-         * （原 `fun readScanFilterShort(context)` 已删除。）
-         */
         private fun JSONArray.strings(): List<String> = List(length()) { getString(it) }
 
         private fun JSONObject.stringSet(key: String): Set<String> =

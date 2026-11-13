@@ -115,11 +115,14 @@ object ShareActions {
      *
      * ### 清理
      *
-     * 每次分享前把 `files/share/` 目录清空再写（见 [pruneShareDir]）。不清理的话，
-     * 用户每分享一次歌单就在私有目录里多留一个文件——纯本地播放器的用户很可能
-     * 反复分享同一批歌单，几个月后就是一个几百 MB 的垃圾目录。
-     * 用「分享前清空」而不是「分享后删除」：分享出去后接收方可能延迟读取（系统分享
-     * 面板/聊天软件会异步拉取），立刻删除会让对方拿到空文件或读失败。
+     * 每次分享前由 [pruneShareDir] 淘汰**过期的旧文件**（保留窗口 [SHARE_KEEP_MS]）再写。
+     * 不清理的话，用户每分享一次歌单就在私有目录里多留一个文件——纯本地播放器的用户
+     * 很可能反复分享同一批歌单，几个月后就是一个可观的垃圾目录。
+     *
+     * 为什么是「按时间淘汰」而不是「无条件清空」：分享出去后接收方可能**延迟读取**
+     * （系统分享面板 / 聊天软件异步拉取）。无条件清空会把**上一次**刚分享出去、
+     * 对方还没拉走的文件删掉，导致对端拿到空文件；而完全不在分享前清理又会让目录无界增长。
+     * 保留一个覆盖典型拉取延迟的窗口（10 分钟）是这两者之间唯一同时成立的解。
      */
     fun sharePlaylist(context: Context, title: String, tracks: List<DemoSong>): Outcome {
         if (tracks.isEmpty()) {
@@ -129,8 +132,25 @@ object ShareActions {
             val dir = File(context.filesDir, SHARE_DIR).apply { mkdirs() }
             pruneShareDir(dir)
             // 文件名复用 M3uPlaylistIO 的清洗逻辑（非法字符 / 长度 / Windows 保留名），
-            // 那条逻辑已经为「跨设备打开」打磨过（P3-73），这里不再重复实现一遍
-            val file = File(dir, M3uPlaylistIO.suggestedFileName(title))
+            // 那条逻辑已经为「跨设备打开」打磨过（P3-73），这里不再重复实现一遍。
+            //
+            // **必须加唯一后缀**（本轮修复）：清洗后的名字只由歌单标题决定，同名歌单
+            // 两次分享会落到**同一个路径**，而 export 是覆盖写。于是「上一个接收方还在
+            // 异步拉取、用户又分享了一次同名歌单」时，对端读到的就是被改写/半写的内容
+            // —— 与 KDoc「清理」段论证要避免的后果完全相同，只是从「被删掉」变成
+            // 「被覆盖」。时间戳后缀让每次分享都是独立文件，prune 的时间淘汰才真正无冲突。
+            //
+            // 用 `System.currentTimeMillis()` 而不是 UUID：同一个进程内两次分享的间隔
+            // 不可能小于 1ms（都要走一遍写盘 + FileProvider + chooser），毫秒足够；
+            // 且时间戳可读，出问题时能在文件管理器里一眼看出先后。
+            val uniqueName = M3uPlaylistIO.suggestedFileName(title)
+                .let { name ->
+                    val dot = name.lastIndexOf('.')
+                    val stem = if (dot > 0) name.substring(0, dot) else name
+                    val ext = if (dot > 0) name.substring(dot) else ""
+                    "$stem-${System.currentTimeMillis()}$ext"
+                }
+            val file = File(dir, uniqueName)
             val playlist = DemoPlaylist(
                 id = "share-${System.currentTimeMillis()}",
                 title = title,
@@ -167,10 +187,27 @@ object ShareActions {
     /** 分享目录名：`filesDir/share/`，必须与 file_paths.xml 里的 `<files-path path="share/">` 一致 */
     private const val SHARE_DIR = "share"
 
-    /** 分享前清空目录（理由见 [sharePlaylist] 的 KDoc「清理」段） */
+    /**
+     * 分享前淘汰**过期残留**（理由见 [sharePlaylist] 的 KDoc「清理」段）。
+     *
+     * **只删「上次分享至今已经过了安全窗口」的文件**（本轮修复）：旧实现无条件删光，
+     * 于是连续分享两个歌单时，第一个接收方若还没拉取（系统分享面板/聊天软件是异步拉取的），
+     * 文件已被第二次分享删除 —— 而 KDoc 里论证「分享后删除会让对方拿到空文件」的同一条
+     * 理由，对「下一次分享」同样成立。现在保留最近 [SHARE_KEEP_MS] 内的文件，
+     * 只清掉更早的残留：既不会让接收方拿到空文件，也不会让目录无限增长
+     * （用户反复分享同一批歌单，几个月后也就是几个文件）。
+     */
     private fun pruneShareDir(dir: File) {
-        runCatching { dir.listFiles()?.forEach { f -> if (f.isFile) f.delete() } }
+        runCatching {
+            val cutoff = System.currentTimeMillis() - SHARE_KEEP_MS
+            dir.listFiles()?.forEach { f ->
+                if (f.isFile && f.lastModified() < cutoff) f.delete()
+            }
+        }
     }
+
+    /** 分享临时文件的保留窗口：覆盖"接收方异步拉取"的典型延迟，逾期视为残留可清 */
+    private const val SHARE_KEEP_MS = 10 * 60 * 1000L
 
     /**
      * FileProvider authority：必须与 AndroidManifest 里的 `${applicationId}.fileprovider` 一致。

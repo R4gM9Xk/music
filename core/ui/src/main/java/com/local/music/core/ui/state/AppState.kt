@@ -167,7 +167,8 @@ data class SongFormat(
     val bitrateKbps: Int,
 )
 
-/** 歌曲格式展示串（无损显位深、有损显码率）；live 非空时优先播放中实时参数（AppState.currentFormatText / 歌曲信息面板共用） */
+/** 歌曲格式展示串（无损显位深、有损显码率）；live 非空时优先播放中实时参数
+ *  （歌曲信息面板 ActionsSheet.SongInfoSheet 与单曲菜单副标题共用） */
 fun songFormatText(song: DemoSong, live: SongFormat? = null): String {
     val codec = (live?.codec ?: song.codec).uppercase().ifEmpty { "音频" }
     val sampleRate = live?.sampleRateHz ?: song.sampleRateHz
@@ -982,7 +983,21 @@ class AppState(
 
     private fun shouldWriteQueueState(index: Int): Boolean {
         if (queueStateWriter == null) return false
-        if (!hasSongs) return false // 空队列终态：不写（占位曲的现场没有恢复价值）
+        // **空队列必须写一次「空现场」**（本轮修复）：旧实现 `if (!hasSongs) return false`
+        // 让删光音乐后的 scheduleSave 完全不碰 queue_state.json，磁盘上仍留着**删歌之前**
+        // 的完整队列。进程被杀后，用户从通知栏/蓝牙/车机点播放 → 服务端
+        // buildResumptionState 无条件读该文件 → 整队已删除曲目被「恢复」，
+        // 每一次播放都报「文件已丢失」。这不是内存态问题，是磁盘上有一份幽灵现场。
+        //
+        // 现在：队列变空时照常写一次（specs 为空），读侧解析不出曲目就按「无现场」处理。
+        // 但要避免空转——tick 每 5s 调一次，不能每次都写一个空文件。
+        // 判据用 `lastQueueStateQueue`（上次真正写出去的那份队列）：
+        // 它还是非空 ⇒ 说明磁盘上留着旧现场，必须写一次空的把它盖掉；
+        // 它已经是空（或从没写过但上次写的就是空）⇒ 磁盘本来就是干净的，跳过。
+        if (!hasSongs) {
+            val last = lastQueueStateQueue
+            return last != null && last.isNotEmpty()
+        }
         // 队列换了（整库重扫/切换语境）或索引变了：立即写
         if (queue !== lastQueueStateQueue || index != lastQueueStateIndex) return true
         // 暂停/未播放：位置不再漂移，写一次是廉价的且能保住精确续播点
@@ -1076,7 +1091,10 @@ class AppState(
         val lib = library
         val libIds = songIndex() // 内部按 library 引用缓存，这里刚换过 library，必然重建一次
         val refs = pendingTrackRefs
-        rematchPending = false
+        // **闸门不在入口关闭**（本轮修复）：入口就 `rematchPending = false` 会让后面所有
+        // 早退分支（尤其是「空曲库」那条）把「待匹配」状态一并吃掉，而它们一次匹配都没做。
+        // 现在只在**确实完成了一次匹配**的三处关闭：全部命中的尾部、空曲库分支之外的真实
+        // 匹配之后。空曲库分支显式 return 且不碰闸门，等曲库真正到位再来一次。
 
         // 收集全部「当前曲库解析不到」的引用（去重：同一 id 可能同时在收藏与歌单里）
         val allIds = LinkedHashSet<String>(favorites.size + playedIds.size + playCounts.size + 64)
@@ -1096,6 +1114,42 @@ class AppState(
             if (restoreFromBackupFile) restoreReport = RestoreReport(reused, 0, 0, fromBackup = true)
             restoreFromBackupFile = false
             pendingTrackRefs = emptyMap()
+            rematchPending = false // 一次真实匹配已完成（全部命中），闸门可以关
+            return
+        }
+
+        // **空曲库不是「匹配失败」，是「还没有可匹配的对象」**（本轮修复）。
+        //
+        // 旧实现直接往下走 SongRematch.rematch(missing, emptyList())，它会因
+        // `library.isEmpty()` 短路返回空 mapping、把所有引用计成 unresolved，然后
+        // 在函数末尾把 rematchPending / pendingTrackRefs / restoreFromBackupFile
+        // 三道闸门一并关掉。于是「备份恢复到一台还没有音乐的手机」这个最需要
+        // 四级匹配的场景变成：先弹一条「一首都没找到」（结论是错的，音乐只是还没进来），
+        // 随后用户拷入音乐、重扫成功，loadLibrary 尾部的 rematchMissingRefs() 因闸门已关
+        // 直接 return —— **重绑定永不执行**，歌单/收藏全空且再无任何提示。
+        //
+        // 正确语义：
+        // - 生成一份报告让用户知道「备份里的引用目前一个都对不上」（如实告知，不静默）；
+        // - 但**不消耗**任何闸门与引用表——曲库真正到位时它们还要再用一次。
+        // 报告会被下一次真实匹配整体覆盖（restoreReport 是单值），不会叠成两条横幅。
+        if (lib.isEmpty()) {
+            restoreReport = RestoreReport(
+                reused = reused,
+                resolved = 0,
+                missing = missing.size,
+                missingSamples = missing.asSequence()
+                    .map { miss ->
+                        refs[miss.oldId]?.title?.takeIf { it.isNotBlank() }
+                            ?: SongRematch.basenameOf(miss.oldId).ifBlank { miss.oldId }
+                    }
+                    .distinct()
+                    .take(RESTORE_REPORT_SAMPLE_LIMIT)
+                    .toList(),
+                fromBackup = restoreFromBackupFile,
+            )
+            // 闸门保持开启：rematchPending / pendingTrackRefs / restoreFromBackupFile 一律不动。
+            // 注意 **不能**在这里把 rematchPending 置 false —— 那是本函数入口刚检查过的
+            // 「待匹配」标志，关掉就等于宣告「这件事做完了」，而实际一次匹配都没做。
             return
         }
 
@@ -1130,6 +1184,7 @@ class AppState(
         )
         restoreFromBackupFile = false
         pendingTrackRefs = emptyMap()
+        rematchPending = false // 一次真实匹配已完成（含未匹配项），闸门可以关
     }
 
     /**
@@ -1513,10 +1568,15 @@ class AppState(
         library = songs
         realLibraryLoaded = true
         librarySettled = true
-        // 封面失败负缓存必须随曲库刷新一起失效：扫描/缓存到达意味着磁盘上的 covers/*.png
-        // 可能已经被重建（coverLost → 全量重提取 → 按新名落盘），旧 uri 的失败记录
-        // 若留着，新封面会被「记住它解不出来」永久挡掉（见 ArtworkBitmapCache.failed）。
-        ArtworkBitmapCache.clearFailures()
+        // 封面位图缓存必须随曲库刷新整体作废（**本轮修复**）：
+        // 1) 失败负缓存：重扫意味着磁盘上的 covers/*.png 可能已被重建（coverLost →
+        //    全量重提取 → 按新名落盘），旧 uri 的失败记录若留着，新封面会被
+        //    「记住它解不出来」永久挡掉（见 ArtworkBitmapCache.failed）。
+        // 2) **位图 LRU 同样要清**：旧实现只调 clearFailures() 而 KDoc 声称
+        //    「见 AppState.loadLibrary 的接线」—— 接线从未存在，于是重扫后
+        //    同一个 artworkUri 即使内容换了图，LRU 里那张旧位图仍然直接命中，
+        //    「换了封面但界面还是老图」。clear() 同时清两者，正是这里要的语义。
+        ArtworkBitmapCache.clear()
         // 空库终态（删光音乐 / 全部被过滤 / 首次扫描无结果）：队列与播放态一并归零，
         // 否则 currentSong 会落到占位曲而 playing 仍为 true（假播放 + 脏计数）。
         // 这里必须早于下面所有分支——空库时那些分支只会把 queue 设成空列表。
@@ -1531,6 +1591,12 @@ class AppState(
             currentSongIdPending = null
             // 服务里可能还挂着已删除文件的队列：停掉，避免通知栏继续显示幽灵曲目
             engine?.stopAndClear()
+            // **空库同样要跑一次 re-match**（本轮修复）：旧实现在这里直接 return，
+            // 而 rematchMissingRefs() 的调用点在函数末尾 —— 于是「恢复备份到一台还没有
+            // 任何音乐的手机」这个最需要提示的场景，rematchPending / restoreFromBackupFile
+            // 会一直悬挂，restoreReport 永不生成，用户看不到任何「N 首未找到」的说明，
+            // 只看到一片空曲库。所有引用都会计为 missing，这正是要告诉他的事实。
+            rematchMissingRefs()
             scheduleSave()
             return
         }
@@ -1887,9 +1953,9 @@ class AppState(
         eng.loadQueue(specs, startIndex, startSec, autoPlay)
     }
 
-    /** 当前曲格式展示串：优先播放中实时参数，回退扫描值（格式化逻辑统一在 songFormatText） */
-    val currentFormatText: String
-        get() = songFormatText(currentSong, liveFormat)
+    // 已删除：`val currentFormatText`（本轮清理）。全仓零调用 —— 歌曲信息面板与
+    // ActionsSheet 都是直接调 songFormatText(song, live)，这条只是同一件事的第二份包装。
+    // 两处入口并存会让「格式串怎么拼」出现改一处漏一处的风险，而它没有任何额外价值。
 
     fun toggleShuffle() {
         shuffleOn = !shuffleOn

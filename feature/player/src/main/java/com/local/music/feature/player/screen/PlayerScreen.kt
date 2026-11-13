@@ -194,8 +194,13 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
     }
 
     // 左右滑动切模式：左滑 → 封面模式，右滑 → 歌词模式
+    //
+    // **无歌词时整条手势不生效**（本轮修复，与 onCoverClick 的 P3-66 同口径）：
+    // 旧实现只给封面点击加了 `lyrics != null` 守卫，滑动分支仍无条件写 lyricEnabled —
+    // 于是纯音乐/占位曲上滑一下，偏好被静默改掉，用户回到有歌词的歌才发现「歌词开关自己变了」。
+    // 同一状态的另一个入口（onCoverClick）已经修好，两处判定必须一致。
     val swipeThreshold = with(LocalDensity.current) { 48.dp.toPx() }
-    fun Modifier.modeSwipe() = pointerInput(Unit) {
+    fun Modifier.modeSwipe() = pointerInput(lyrics != null) {
         var total = 0f
         detectHorizontalDragGestures(
             onDragStart = { total = 0f },
@@ -204,6 +209,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                 total += amount
             },
             onDragEnd = {
+                if (lyrics == null) return@detectHorizontalDragGestures
                 when {
                     total <= -swipeThreshold -> {
                         flight?.entryShowCover = false

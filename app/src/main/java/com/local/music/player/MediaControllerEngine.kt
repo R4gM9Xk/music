@@ -586,7 +586,39 @@ class MediaControllerEngine(
             // 退回后新项会被 DefaultShuffleOrder 随机放置，「下一首播放」变成「随机某处播放」，
             // 属于用户可见的行为偏差。旧实现把它完全吞掉（无日志），
             // 一旦 onConnect 漏声明命令或服务端旧版本不认该命令，就再也查不出原因。
-            val sent = runCatching {
+            //
+            // **必须读 future 的 resultCode**（本轮修复）：sendCustomCommand 的失败有两种形态 ——
+            // 同步抛（本地参数校验失败）与**异步返回 RESULT_ERROR_***（binder 侧 RemoteException /
+            // TransactionTooLargeException 会被 media3 吞成结果码，future 正常完成）。
+            // 只判 runCatching 的 isFailure 只能看见前一种，于是「命令未被服务端接受」时
+            // 既不记日志也不退回原生插入：UI 队列已 addAll、服务端队列没变，两边分叉且无痕迹。
+            // 另外三条同类命令（setEqPreset / setAudioFx / setSleepTimer）都是读 resultCode 的。
+            //
+            // 同步抛 = 直接失败；成功下发则**异步**等结果码。
+            //
+            // **为什么不在 UI 线程阻塞等（f.get）**：本方法由队列编辑（UI 线程）调用，
+            // `f.get()` 等的是 binder 往返 + 服务端处理；服务端此时若在解码/切歌，
+            // 等待可达数百毫秒，直接卡 UI 甚至 ANR。这里改用 addListener 异步判结果，
+            // 失败才退回原生插入 —— 代价是「退回」发生在稍后（用户已看到队列变化），
+            // 但这是两种坏结果里明显较轻的一种。
+            //
+            // **为什么失败时不在回调里补一次原生插入**：本方法的语义是「把插入意图交给
+            // 服务端」，而命令是否真的生效在失败回调到达时已无法确定（media3 在 binder
+            // 超时/事务过大等情况下本身就存在「命令其实到了、结果没回来」的可能）。
+            // 此刻补插会与已生效的命令叠加 —— 队列里出现两份相同的歌，比位置不理想严重得多。
+            // 因此只留痕，让 AppState 下一次 alignQueueWithEngine()/syncFromEngine 按
+            // 「服务队列权威」把 UI 拉回来（本仓既有原则，见 AppState 队列编辑段的注释）。
+            //
+            // 真正需要「退回原生插入」的是**同步抛**那条路径：那时命令确定没发出去。
+            fun reportCommandFailure(reason: String, cause: Throwable? = null) {
+                android.util.Log.w(
+                    "MediaControllerEngine",
+                    "shuffle 插入修正命令未生效（$reason）；队列以服务端为准，" +
+                        "下一次同步时收敛（新项位置可能不受 pinLast 意图约束）",
+                    cause,
+                )
+            }
+            val sentFuture = runCatching {
                 controller.sendCustomCommand(
                     SessionCommand(MusicPlaybackService.CMD_INSERT_SHUFFLE_FIX, Bundle.EMPTY),
                     Bundle().apply {
@@ -599,13 +631,26 @@ class MediaControllerEngine(
                     },
                 )
             }
-            if (sent.isFailure) {
-                android.util.Log.w(
-                    "MediaControllerEngine",
-                    "shuffle 插入修正命令下发失败，退回原生插入（新项位置将不受 pinLast 意图约束）",
-                    sent.exceptionOrNull(),
+            sentFuture.onSuccess { f ->
+                f.addListener(
+                    {
+                        val result = runCatching { f.get() }.getOrNull()
+                        if (result == null || result.resultCode != SessionResult.RESULT_SUCCESS) {
+                            reportCommandFailure("resultCode=${result?.resultCode}")
+                        }
+                    },
+                    // 直接执行器：只做一次 get() 与一次日志，无需另开线程
+                    Runnable::run,
                 )
-                controller.addMediaItems(index, specs.map { it.toMediaItem() }.withArtwork(specs, 0))
+            }.onFailure { e ->
+                // 同步抛 = 命令确定没发出去 → 这时补原生插入是安全的，也是唯一能保住
+                // 「下一首播放」语义的时机（否则用户点了没反应）
+                reportCommandFailure("sendCustomCommand threw", e)
+                if (checkConnected()) {
+                    runCatching {
+                        controller.addMediaItems(index, specs.map { it.toMediaItem() }.withArtwork(specs, 0))
+                    }.onFailure { Log.w("MediaControllerEngine", "native insert fallback failed", it) }
+                }
             }
         } else {
             // 追加插入：新项就是「下一首播放」的目标，自然可以带封面；预算取当前曲之后一段

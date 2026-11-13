@@ -48,21 +48,32 @@ internal object DesktopLyricsLoader {
             java.io.File(sibling),
             context.getExternalFilesDir(null)?.let { java.io.File(it, "lrc/$fileName.lrc") },
         )
-        // 逐候选读文本：损坏/读失败当该候选不存在；不在此处解析——统一读到一个后一次解析
-        val text = candidates.asSequence()
+        // **逐候选「读取+解析」，一个候选读不出有效歌词就继续试下一个**（本轮修复）。
+        // 旧实现只做 firstNotNullOfOrNull { readText() }、解析放在循环外：于是同目录
+        // sibling 存在但是**坏文件/空文件**时，它把文本一取走就 return 了，永远不会回退到
+        // files/lrc/ 兜底候选 —— 与 MediaLibrary.readLrc 的语义分叉，
+        // 而本文件头部「同步清单」明确要求两处候选与优先级行为一致。
+        val parsed = candidates.asSequence()
             .filter { it.isFile }
             .filter { it.length() <= LRC_MAX_BYTES }
-            .firstNotNullOfOrNull { file -> runCatching { file.readText() }.getOrNull() }
-            ?: return emptyList()
-        // 解析全程 runCatching：坏歌词文件绝不能把调用线程搞崩（控制器在读盘线程调它）
-        val parsed = runCatching { MediaLibrary.parseLrc(text) }
-            .onFailure { Log.w(TAG, "lrc parse failed: $audioPath", it) }
-            .getOrNull()
-            .orEmpty()
-        if (parsed.isNotEmpty()) return parsed
-        // 无时间戳的纯文本 .lrc：与 MediaLibrary.parseLrcOrPlainText 同语义——
-        // 至少显示这首歌自己的文字，而不是「暂无歌词」；单行截断 2000 字符防撑爆
-        val plain = text.trim()
-        return if (plain.isEmpty()) emptyList() else listOf(LyricLine(plain.take(2000), 0f))
+            .firstNotNullOfOrNull { file ->
+                // 解析全程 runCatching：坏歌词文件绝不能把调用线程搞崩（控制器在读盘线程调它）
+                runCatching {
+                    val text = file.readText()
+                    val lines = MediaLibrary.parseLrc(text)
+                    if (lines.isNotEmpty()) {
+                        lines
+                    } else {
+                        // 无时间戳的纯文本 .lrc：与 MediaLibrary.parseLrcOrPlainText 同语义——
+                        // 至少显示这首歌自己的文字，而不是「暂无歌词」；单行截断 2000 字符防撑爆。
+                        // 两个候选都为空/全空行时返回 null，让序列继续找下一个候选。
+                        text.trim().takeIf { it.isNotEmpty() }
+                            ?.let { listOf(LyricLine(it.take(2000), 0f)) }
+                    }
+                }
+                    .onFailure { Log.w(TAG, "lrc read failed: ${file.absolutePath}", it) }
+                    .getOrNull()
+            }
+        return parsed.orEmpty()
     }
 }

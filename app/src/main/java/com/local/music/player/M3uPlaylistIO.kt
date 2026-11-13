@@ -31,8 +31,12 @@ object M3uPlaylistIO {
         sb.append("#EXTM3U\n")
         sb.append("#PLAYLIST:").append(oneLine(playlist.title)).append('\n')
         songs.forEach { s ->
-            // #EXTINF:<duration>,<title>；艺术家信息放进标题便于其他播放器展示。
-            // 显示文本/路径含换行会破坏 M3U 行结构：写出前压成空格并 trim（标题中的逗号无碍——导入按首个逗号取显示文本）
+            // #EXTINF:<时长>,<显示文本>；艺术家拼进显示文本便于其他播放器展示。
+            // 显示文本/路径含换行会破坏 M3U 行结构：写出前压成空格并 trim。
+            // **注意：本工程的导入完全不读这段显示文本**（见 parse 的 #EXTINF 分支 ——
+            // 匹配只靠下一行路径，显示文本纯属给**第三方播放器**看的）。
+            // 所以标题里的逗号对本工程无害，但若将来要解析它，必须按「首个逗号」切分
+            // （其后全部归显示文本），否则含逗号的标题会被截断。
             sb.append("#EXTINF:").append(s.durationSec).append(',')
                 .append(oneLine(s.artist)).append(" - ").append(oneLine(s.title)).append('\n')
             sb.append(oneLine(pathOf(s))).append('\n')

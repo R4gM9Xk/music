@@ -163,10 +163,20 @@ class WidgetActionReceiver : BroadcastReceiver() {
             Log.w(TAG, "controller timeout for action=$action")
         } catch (e: ExecutionException) {
             // 服务没启动/被disable：静默。用户点桌面按钮不该看到任何错误提示。
+            // **但必须释放 future**（本轮修复）：这是最常见的失败分支，不释放等于
+            // 每次点击泄漏一个 controller 槽位，连满后小部件永久失效。
+            // 注意这行以前是漏的，而 MusicWidgetViews 的注释曾断言「这里每个 catch 都释放了」——
+            // 那句断言是错的，同一轮修复只改了 MusicWidgetViews 那一处。
+            MediaController.releaseFuture(future)
             Log.w(TAG, "controller build failed for action=$action", e)
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
             MediaController.releaseFuture(future)
+        } catch (e: Exception) {
+            // 兜底（本轮新增）：SecurityException / IllegalArgumentException 等运行时异常
+            // 不该冒到 Thread 的 catch(Throwable) —— 那里虽然不会崩进程，但 future 同样会漏。
+            MediaController.releaseFuture(future)
+            Log.w(TAG, "controller build threw for action=$action", e)
         }
     }
 

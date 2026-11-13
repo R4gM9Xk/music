@@ -176,7 +176,8 @@ object GlassPalettes {
      *
      * ## 为什么保留而不是删掉
      * 这四个五元组是品牌观感的锚点（尤其 Purple #7F77DD 是用户预期中的靛紫），
-     * 而且 [All] 被 ArtStyle 演示封面直接引用。删掉它们能「消灭三套公式」，
+     * 而且这四个成员被 ArtStyle 演示封面逐个引用（Purple/Teal/Coral/Blue）。
+     * 删掉它们能「消灭三套公式」，
      * 但会同时丢掉「手调值应该长什么样」这条唯一的验收依据。
      *
      * ## 为什么不再作为运行时派生路径
@@ -207,7 +208,12 @@ object GlassPalettes {
         seed = Color(0xFF378ADD), seed2 = Color(0xFF85B7EB), seed3 = Color(0xFFB5D4F4),
         deep = Color(0xFF0A2540), deep2 = Color(0xFF04121F),
     )
-    val All = listOf(Purple, Teal, Coral, Blue)
+
+    // 已删除：`val All = listOf(Purple, Teal, Coral, Blue)`（本轮清理）。
+    // 全仓零引用 —— 上面的 KDoc 曾声称它「被 ArtStyle 演示封面直接引用」，
+    // 而 ArtStyle 实际只逐个引用 Purple / Teal / Coral / Blue 四个成员。
+    // 这个列表唯一可能的新用途是「遍历全部预设」，而本 App 的预设来源是
+    // AuroraPalette.PresetSeeds（10 色，主题色面板在用它），不是这四个手调基准值。
 }
 
 // ── 字体 token（UI 审计第 2 轮确立）───────────────────────
@@ -394,20 +400,16 @@ object R {
     const val Player28 = 28     // 播放页大面板 / GlassSurface 默认
     const val Full = 50         // 胶囊（搜索框 44dp 高 → 22dp = 半高）
 
-    /**
-     * 嵌套圆角的**共心推导**（视觉审计 C4）：外容器圆角 Rout、内边距 pad 时，
-     * 内侧子元素要用的圆角 = Rout − pad。
-     *
-     * 为什么这条几何律值得单独成 token：圆角不是「每块各自好看」的装饰，而是一条
-     * **等距曲线**。外圆角 28 + 内边距 12 而内圆角仍写 10 时，内外两条弧线在四角
-     * 平行关系断掉——肉眼说不出哪里错，但会觉得「这角有点脏」。Apple 系控件的
-     * 高级感很大一部分就来自这条不写在任何设计稿上的规律。
-     *
-     * 已知历史点：迷你条外圆角 28、内边距 12、封面圆角 10（应为 16）。
-     * 注意推导结果可能落到刻度外（如 16 不在 R 刻度上）——**此处以几何正确优先**，
-     * 刻度服务于一致性，而一致性本身包含嵌套关系。结果下限 4dp 防退化。
-     */
-    fun nested(outer: Int, padding: Int): Int = (outer - padding).coerceAtLeast(4)
+    // 已删除：`fun nested(outer: Int, padding: Int)`（本轮清理）。
+    //
+    // 它是「嵌套圆角共心推导」Rout − pad 的实现，但**全仓零调用**。原因很硬：
+    // 本仓曾因运行时引用 `object R` 触发过一次 P0 —— R 的字段全是 const val（编译期内联），
+    // 改造前没有任何代码在运行时引用 R 类本体，AGP 的 dex 处理便把它剔出 APK
+    // （debug 与 release 均复现 NoClassDefFoundError，详见
+    // docs/2026-11-08-visual-design-audit.md §10.7③）。所以嵌套圆角的调用点
+    // （例如迷你条封面 R28 − 12dp = 16）**必须写字面量**，见 Chrome.kt 的注释。
+    // 留一个永远不能安全调用的函数只会让人误以为它可以调。
+    // 将来若要恢复，先解决「R 类被 dex 剔除」的问题（keep 规则或改成顶层 @JvmStatic 并验证 dex）。
 }
 
 // ── 间距 token（UI 审计第 6 轮确立，第 7 轮接线）────────────────
@@ -703,7 +705,7 @@ data class GlassColors(
      *
      * chrome 自身文字画在遮罩**之上**，不受衰减（深色下白字对比反而略升，实测 6.3:1）。
      *
-     * 已知取舍：本字段**不随「玻璃强度」设置变化**（[GlassIntensity.derive] 有意不缩放它）。
+     * 已知取舍：本字段**不随「玻璃强度」设置变化**（[GlassColors.deriveBy] 有意不缩放它）。
      * 它是可读性保障而非装饰强度，不该被用户的观感偏好削弱 —— 副作用是迷你条/导航栏上
      * 三档强度差异变得很微弱，属有意为之，不要当成 bug。
      *
@@ -875,45 +877,45 @@ object GlassMotion {
  * 从当前位置自然重定向，这是 iOS/ColorOS 原生手感的来源。全仓此前 0 个 spring
  * （动效审计 P1-2）。
  *
- * 三档语义（不要按数值记忆，按**用途**选）：
- * - [springSnap]：落位/归位（拖拽松手、重排落点）。低阻尼、带一点点回弹，
- *   让「吸附」有物理感而不是滑到位就停。
- * - [springGentle]：按压回弹、开关滑块。阻尼接近临界，**不振荡**——按钮回弹过头
+ * 语义（不要按数值记忆，按**用途**选）：
+ * - [gentle]：按压回弹、开关滑块。阻尼接近临界，**不振荡**——按钮回弹过头
  *   会显得廉价，这里要的是「柔和地恢复」。
- * - [springPanel]：面板/覆盖层升降。大位移用低刚度，收尾才不显得急。
  *
  * 注意：弹簧的 [spring] 不带时长，`GlassMotion.scale`（动效强度）无法直接乘——
- * 用 stiffness/dampingRatio 的倒数近似缩放，见各函数实现。这是**有意的不完美**：
+ * 用 stiffness/dampingRatio 调整收束速度。这是**有意的不完美**：
  * 弹簧的语义就是「按物理收束」，强行改成定时反而丢掉它的全部好处。
  */
 object GlassSpring {
-    /** 落位/归位：略带回弹 */
-    fun <T> snap() = spring<T>(dampingRatio = 0.72f, stiffness = 520f)
-
-    /** 按压/开关：近似临界阻尼，不回弹 */
+    /**
+     * 按压/开关：近似临界阻尼，不回弹。
+     *
+     * **这是本对象当前唯一被使用的成员**（Lists.kt 的 rowPressFeedback）。
+     * 曾经并列的 `snap()`（落位/归位）与 `panel()`（面板升降）**已删除**：
+     * 全仓零调用——ReordableColumn 的落位补间是手写帧循环（需要与邻居让位同曲线、
+     * 且要能从任意初值起步），Flight 的进退是 tweenFlight 定时动画，
+     * 面板进出场是 tweenPage。留着它们只会诱使下一个改动「顺手用一下」，
+     * 从而在同一个动效语言里混进第三条曲线（本文件 KDoc 明令「全 App 唯一缓动曲线」）。
+     * 将来若真的需要弹簧版本的落位/面板，先确认它替代的是现有哪一条 tween，再加回来。
+     */
     fun <T> gentle() = spring<T>(dampingRatio = 0.9f, stiffness = 700f)
-
-    /** 面板/覆盖层：大位移低刚度 */
-    fun <T> panel() = spring<T>(dampingRatio = 0.85f, stiffness = 340f)
 }
 
-/** 玻璃强度（设置页三档）：按系数派生填充与描边透明度 */
+/**
+ * 玻璃强度（设置页三档）：按系数派生填充与描边透明度。
+ *
+ * 派生**只由 [GlassColors.deriveBy] 一处实现**（下面的私有扩展）。
+ * 本枚举曾有一个 `derive(base)` 成员，与 deriveBy 是同一公式的第二份拷贝，
+ * 且全仓零调用 —— 已删除。为什么必须只留一份：[GlassTheme] 里 glassLevel 切换是
+ * **动画值**（fillScale/strokeScale 走 tweenPalette），枚举成员的瞬时派生根本用不上；
+ * 两份公式并存只会在将来调系数时改一处漏一处，让「设置页档位」与「实际玻璃」分叉。
+ */
 enum class GlassIntensity(val label: String, val fillScale: Float, val strokeScale: Float) {
     Transparent("通透", 0.6f, 0.7f),
     Standard("标准", 1f, 1f),
     Rich("浓郁", 1.5f, 1.2f),
-    ;
-
-    fun derive(base: GlassColors): GlassColors = base.copy(
-        hi = base.hi.copy(alpha = (base.hi.alpha * fillScale).coerceAtMost(1f)),
-        md = base.md.copy(alpha = (base.md.alpha * fillScale).coerceAtMost(1f)),
-        lo = base.lo.copy(alpha = (base.lo.alpha * fillScale).coerceAtMost(1f)),
-        stroke = base.stroke.copy(alpha = (base.stroke.alpha * strokeScale).coerceAtMost(1f)),
-        strokeSoft = base.strokeSoft.copy(alpha = (base.strokeSoft.alpha * strokeScale).coerceAtMost(1f)),
-    )
 }
 
-/** 按两档缩放派生（A2-02：glassLevel 切换走 400ms 过渡，缩放是动画值而非枚举常量），与 [GlassIntensity.derive] 同式 */
+/** 按两档缩放派生填充与描边（A2-02：glassLevel 切换走 400ms 过渡，缩放是**动画值**而非枚举常量） */
 private fun GlassColors.deriveBy(fillScale: Float, strokeScale: Float): GlassColors = copy(
     hi = hi.copy(alpha = (hi.alpha * fillScale).coerceAtMost(1f)),
     md = md.copy(alpha = (md.alpha * fillScale).coerceAtMost(1f)),

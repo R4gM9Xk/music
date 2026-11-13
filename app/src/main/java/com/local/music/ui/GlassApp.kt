@@ -301,7 +301,11 @@ fun GlassApp() {
                     // 开关两个方向都即时生效、零重扫，library_cache.json 也自然是全量的
                     // （writeCache 里原先要靠 lastScan 兜底并入短音频的那段因此变成纯冗余）。
                     // 同时传取消探针（见上）：Activity 重建/离开后阻塞式扫描能提前 break。
-                    MediaLibrary.load(
+                    // 用 loadWithResult 而不是 load：要把**本次扫描的指纹**一并拿到手，
+                    // 写缓存时显式传下去（P3-32 防错位）。load 的返回类型是 List<DemoSong>，
+                    // 拿不到指纹 → writeCache 只能回落到单例 lastScan，
+                    // 并发重扫时会把另一轮的指纹配到这一轮的 songs 上。
+                    MediaLibrary.loadWithResult(
                         context,
                         filterShort = false,
                         isCancelled = { probeJob?.isActive != true },
@@ -312,40 +316,85 @@ fun GlassApp() {
                 android.util.Log.e("MediaLibrary", "scan failed", it)
                 state.reportEngineFailure("读取媒体库失败，请检查存储权限")
             }
-            val songs = result.getOrDefault(emptyList())
-            // **只在扫描成功时装载曲库**（修复：失败分支被下面的 loadLibrary 抢先短路）。
-            // 旧写法无条件 `loadLibrary(songs)`，而失败时 songs 是 emptyList →
-            // loadLibrary 走「空库终态」分支：把 library 置空、librarySettled 置 true、
-            // **并 abandonPendingPlayback 清掉 pending**。于是下面那个精心写的
-            // `else if (!state.librarySettled) settleLibraryKeepingPending()` 永远不执行
-            // （librarySettled 已被置 true），一次 MediaStore 瞬时错误就把用户的恢复队列
-            // 永久丢掉 —— 正是那段注释（302-307 行）声称已修好的问题，实际从未生效。
-            if (result.isSuccess) state.loadLibrary(songs)
-            // 缓存写回策略按「扫描是否成功」分流，而不是按「有没有歌」——
-            // 旧写法把「扫到 0 首」和「扫描失败」混在同一个 else 里，两种情况都不写缓存，
-            // 于是用户删空曲库后旧 library_cache.json 仍保留全部已删曲目：冷启动读回幽灵曲库，
-            // 而 librarySettled 已被置 true 使后续纠正分支永不触发，只能清应用数据才好。
-            // - 成功：无论空不空都写（空库写成空数组，覆盖掉陈旧缓存）
-            // - 失败：不写（一次权限异常不该把好缓存清空）
-            if (result.isSuccess) {
-                // P2-④ 起扫描恒为全量，songs 即完整曲库，缓存如实全量落盘
-                // （原先「并入 lastScan 以保留被滤掉的短音频」的兜底已成冗余，无需再依赖）。
-                withContext(Dispatchers.IO) { runCatching { MediaLibrary.writeCache(context, songs) } }
-                if (songs.isEmpty() && !state.librarySettled) {
-                    state.markLibrarySettled() // 扫描成功但确实没有曲目：确认无曲库终态
-                }
-            } else if (!state.librarySettled) {
-                // **扫描失败 ≠ 确认无曲库**：旧实现在这里也调 markLibrarySettled()，而该函数会
-                // abandonPendingPlayback()——一次 MediaStore 瞬时错误/权限竞态就把用户的恢复队列
-                // 永久丢掉（之后重扫成功曲库会回来，播放现场却回不来了）。
-                // 失败时只放行启动门面（让 UI 不再卡在「正在整理曲库…」），**不清 pending**：
-                // pending 在后续 loadLibrary 成功时仍会被消费，扫到空库时才由成功分支收终态。
-                state.settleLibraryKeepingPending()
+            // 扫描结果（ScanResult?）：null = 重入且上一次扫描被 cancel 中止，不可写缓存
+            val scan = result.getOrNull()
+            // 成功判据 = 「没抛异常」**且**「拿到了可用结果」**且**「这次扫描真的跑完了」。
+            //
+            // 三个条件缺一不可，各自的漏掉都是一条真实缺陷：
+            // 1) `result.isSuccess`：异常（权限被撤 / MediaStore 崩）不是「空曲库」；
+            // 2) `scan != null`：重入 + 上次被中止时 loadWithResult 返回 null，
+            //    按 isSuccess 当成功会拿空 songs 走 loadLibrary 的空库终态，把 library 清空；
+            // 3) **`!scan.aborted`（本轮修复）**：主扫描路径（非重入）被取消探针中止时
+            //    loadInternal 会 `break` 并返回**已组装的半截** ScanResult（aborted=true），
+            //    它不是 null、也没抛异常 —— 只判前两条时半截曲库会被当作完整结果：
+            //    loadLibrary 用它替换整库（未扫到的歌本会话消失），writeCache 把它写进
+            //    library_cache.json 覆盖好缓存（下次冷启动只能全量重扫，万首库分钟级）。
+            //
+            // 特别提醒：**不能指望 writeCache 兜住第 3 条**。它的防线是
+            // `if (fingerprints == null && scan?.aborted == true) return`，而本函数为了
+            // P3-32（指纹与 songs 同源）必须显式传 fingerprints —— 一传就绕过了那道闸
+            // （见 MediaLibrary.writeCache 的 KDoc「显式传指纹视为同源调用方已自查」）。
+            // 所以「有没有 aborted」只能在这里判，这是唯一的一道闸。
+            val scanOk = result.isSuccess && scan != null && !scan.aborted
+            // 中止半截结果：留痕便于把「曲库没刷新」与「扫到 0 首」区分开
+            if (scan?.aborted == true) {
+                android.util.Log.w(
+                    "GlassApp",
+                    "scan aborted by cancel probe (partial=${scan.songs.size}); " +
+                        "skip loadLibrary/writeCache and keep pending playback",
+                )
             }
-            // onDone 必须无条件执行：它是设置页「扫描中…」的唯一复位信号。
-            // 若上面任一步抛异常（loadLibrary 内部、写缓存等）而跳过它，按钮会永久停在
-            // 「扫描中…」直到离开该页。用 runCatching 包住整个尾部，最后 finally 语义地调 onDone。
-            onDone()
+            val songs = scan?.songs.orEmpty()
+            // 指纹表（与 songs 同源；scan 为 null 时不使用）。先取成局部 val，
+            // 避免在下面的 IO 闭包里用 `scan!!` —— 非空断言跨协程捕获很难读，
+            // 而且一旦日后有人挪动 scanOk 的定义就会立刻炸在运行期。
+            val fingerprints = scan?.fingerprints
+            // **尾部必须 try/finally**（本轮修复）：下面每一步都可能抛异常
+            // （loadLibrary 内部的派生、writeCache 的磁盘错误、settle 系列的快照写入），
+            // 而 onDone 是设置页「扫描中…」的**唯一**复位信号 —— 漏调一次，按钮就永久停在
+            // 「扫描中…」直到离开该页。旧注释写着「用 runCatching 包住整个尾部，最后 finally
+            // 语义地调 onDone」，实际代码只有一行裸 onDone()，承诺从未兑现。
+            try {
+                // **只在扫描成功时装载曲库**（修复：失败分支被下面的 loadLibrary 抢先短路）。
+                // 旧写法无条件 `loadLibrary(songs)`，而失败时 songs 是 emptyList →
+                // loadLibrary 走「空库终态」分支：把 library 置空、librarySettled 置 true、
+                // **并 abandonPendingPlayback 清掉 pending**。于是下面那个精心写的
+                // `else if (!state.librarySettled) settleLibraryKeepingPending()` 永远不执行
+                // （librarySettled 已被置 true），一次 MediaStore 瞬时错误就把用户的恢复队列
+                // 永久丢掉 —— 正是那段注释（302-307 行）声称已修好的问题，实际从未生效。
+                if (scanOk) state.loadLibrary(songs)
+                // 缓存写回策略按「扫描是否成功」分流，而不是按「有没有歌」——
+                // 旧写法把「扫到 0 首」和「扫描失败」混在同一个 else 里，两种情况都不写缓存，
+                // 于是用户删空曲库后旧 library_cache.json 仍保留全部已删曲目：冷启动读回幽灵曲库，
+                // 而 librarySettled 已被置 true 使后续纠正分支永不触发，只能清应用数据才好。
+                // - 成功：无论空不空都写（空库写成空数组，覆盖掉陈旧缓存）
+                // - 失败：不写（一次权限异常不该把好缓存清空）
+                if (scanOk) {
+                    // P2-④ 起扫描恒为全量，songs 即完整曲库，缓存如实全量落盘
+                    // （原先「并入 lastScan 以保留被滤掉的短音频」的兜底已成冗余，无需再依赖）。
+                    // **指纹与 songs 同源**（P3-32 接线）：显式传 fingerprints，
+                    // writeCache 就不再回落到单例 lastScan，并发重扫也不会错位。
+                    val fps = fingerprints
+                    withContext(Dispatchers.IO) {
+                        runCatching { MediaLibrary.writeCache(context, songs, fps) }
+                    }
+                    if (songs.isEmpty() && !state.librarySettled) {
+                        state.markLibrarySettled() // 扫描成功但确实没有曲目：确认无曲库终态
+                    }
+                } else if (!state.librarySettled) {
+                    // **扫描失败 / 被中止 ≠ 确认无曲库**：旧实现在这里也调 markLibrarySettled()，
+                    // 而该函数会 abandonPendingPlayback()——一次 MediaStore 瞬时错误/权限竞态
+                    // 就把用户的恢复队列永久丢掉（之后重扫成功曲库会回来，播放现场却回不来了）。
+                    // 中止（aborted）走同一个 else 是有意的：它同样**不是**「确认曲库为空」，
+                    // 处理方式与失败一致——只放行启动门面（让 UI 不再卡在「正在整理曲库…」），
+                    // **不清 pending**：pending 在后续 loadLibrary 成功时仍会被消费，
+                    // 扫到空库时才由成功分支收终态。
+                    state.settleLibraryKeepingPending()
+                }
+            } finally {
+                // 无条件执行：设置页「扫描中…」的复位只认这一处
+                onDone()
+            }
         }
     }
 
@@ -441,10 +490,17 @@ fun GlassApp() {
             .drop(1)
             .collect { state.scheduleSave() }
     }
-    // 导航态 → rememberSaveable（P2-26）。只在导航四项真的变化时重跑：
-    // 阅读这四个 state 就会建立快照订阅，其余状态（进度/播放态每 100ms 变）不会触发。
+    // 导航态 → rememberSaveable（P2-26）。只在导航四项 + **搜索词**真的变化时重跑：
+    // 阅读这些 state 才会建立快照订阅，其余状态（进度/播放态每 100ms 变）不会触发。
     // 写回自身这一份是纯值拷贝，不反写 AppState，因此不存在回环。
-    LaunchedEffect(state.screen, state.detail, state.detailReturn, state.playerOrigin) {
+    //
+    // **searchQuery 必须在 key 里**（本轮修复）：navigationState() 会把它作为第 6 项写出，
+    // 但 key 漏掉它时，用户在搜索页打字这四项全不变 → effect 不重跑 → savedNav 里永远是
+    // 「刚进搜索页那一刻」的空串。重建后 screen=Search 回来了、词还是空的，正是
+    // navigationState() 的 KDoc 点名「症状没修掉一半」的那个状态。
+    LaunchedEffect(
+        state.screen, state.detail, state.detailReturn, state.playerOrigin, state.searchQuery,
+    ) {
         val nav = state.navigationState()
         if (savedNav.value != nav) savedNav.value = nav
     }
@@ -771,9 +827,16 @@ fun GlassApp() {
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
+            // **快照必须在主线程取**（本轮修复）：state.snapshot() 会遍历 favorites /
+            // playCounts / userPlaylists / addedTracks 等 Compose SnapshotState 集合，
+            // 而它们由主线程的 tick（100ms）/ 播放回调持续写入。在 Dispatchers.IO 上
+            // 无 snapshot 上下文地读这些集合，轻则读到不一致的中间态（导出半截备份），
+            // 重则抛 IllegalStateException 让「导出备份失败」。
+            // 所以这里先在主线程把纯数据快照取出来，再把它传进 IO 块做 JSON 编码 + 落盘。
+            val snapshot = state.snapshot()
             val ok = withContext(Dispatchers.IO) {
                 runCatching {
-                    val json = SettingsStore.encodeForBackup(state.snapshot())
+                    val json = SettingsStore.encodeForBackup(snapshot)
                     context.contentResolver.openOutputStream(uri)?.use {
                         it.write(json.toByteArray(Charsets.UTF_8))
                     } ?: error("无法写入所选位置")
@@ -1410,7 +1473,18 @@ fun GlassApp() {
                         // 是「曲库稍后才装载完」的时序）。**停留时间比普通 IO 提示长**：
                         // 「已恢复 37 首，12 首未找到」是用户需要读完并据此行动的信息，
                         // 4s 一闪而过等于没提示。点击可提前关闭。
-                        state.restoreReport?.let { report ->
+                        //
+                        // **冷启动的「全部命中」不弹**（本轮修复，fromBackup 的原始设计意图）：
+                        // 同一台设备冷启动时用户可能只是删过几首歌，出现失效引用是日常行为，
+                        // 而旧实现无条件 `restoreReport?.let { ... }` 显示 9 秒 —— 于是每次
+                        // 冷启动都可能弹一条「N 首未找到」，把一次性的迁移报告变成噪音。
+                        // 显示条件 = 来自备份文件（用户明确做了迁移，必须告知结果）
+                        //         ∨ 真的发生了重绑定（路径变了，用户需要知道「不是丢了」）
+                        //         ∨ 有未找到项（坏消息，不能静默）。
+                        // `needsAttention` 恰好就是后两条的合取，见 SongRematch.RestoreReport。
+                        val visibleRestoreReport = state.restoreReport
+                            ?.takeIf { it.fromBackup || it.needsAttention }
+                        visibleRestoreReport?.let { report ->
                             if (ioMessage != null) Spacer(Modifier.height(6.dp))
                             LaunchedEffect(report) {
                                 delay(9000)

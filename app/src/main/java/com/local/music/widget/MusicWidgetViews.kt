@@ -146,13 +146,22 @@ internal object MusicWidgetViews {
             MediaController.releaseFuture(future)
             WidgetState.EMPTY
         } catch (e: ExecutionException) {
+            // **必须释放**（本轮修复）：旧实现这三个 catch 直接返回空态，把 future 丢了。
+            // 服务没启动 / 建连被拒时 future 已失败，但 releaseFuture 仍要调 —— 它同时
+            // 负责取消未完成连接与回收控制器槽位；漏掉的后果正是本函数 KDoc 描述的那条：
+            // 每次失败刷新泄漏一个 controller，连满后小部件永久失效。
+            // （WidgetActionReceiver.forward 曾同样漏掉 ExecutionException 分支，
+            //   已在同一轮补齐 —— 此处不再声称「那边都释放了」，当初那句断言是错的。）
+            MediaController.releaseFuture(future)
             WidgetState.EMPTY
         } catch (e: InterruptedException) {
             // 恢复中断标记：上层（协程/OkHttp）依赖它判断取消
             Thread.currentThread().interrupt()
+            MediaController.releaseFuture(future)
             WidgetState.EMPTY
         } catch (e: Exception) {
             // 服务未启动 / 已销毁等：一律空态，不让异常冒到 AppWidgetHost
+            MediaController.releaseFuture(future)
             WidgetState.EMPTY
         }
     }
@@ -181,10 +190,20 @@ internal object MusicWidgetViews {
         // 而部分 ROM 在 onUpdate 首帧、以及跨版本升级后的首次刷新里并不写该键，
         // 于是 4x1 播放条会被塞进竖版布局（一张被压扁的方卡）。
         // 4x1/4x2 本就是两个独立 receiver，`isWideProvider` 是比 0dp 可靠得多的默认值。
-        val wide = if (minWidthDp > 0) {
+        //
+        // **两个 provider 的 minWidth 都是 250dp ⇒ 纯宽度判据会让两者都变横条**（本轮修复）：
+        // 只看 `minWidthDp >= 180` 时，用户放置「4x2 封面版」（声明 minWidth=250dp）也会
+        // 直接算出 wide=true，渲染成横条 ——「封面版」这个选择器条目形同虚设，
+        // 而 `isWideProvider` 那条按身份的回退在正常放置路径上永远轮不到。
+        // 现在：**封面版的身份优先**，只有它被用户拖到明显更宽（≥ 横条阈值 + 一档）时才转横条；
+        // 播放条身份保持原有的纯宽度判定（它本来就该随宽度自适应）。
+        val wide = if (!isWideProvider) {
+            // 封面版：默认竖版；只有被拖得明显比默认 250dp 更宽才允许切横条
+            minWidthDp >= WIDE_LAYOUT_MIN_WIDTH_DP + SQUARE_TO_WIDE_HYSTERESIS_DP
+        } else if (minWidthDp > 0) {
             minWidthDp >= WIDE_LAYOUT_MIN_WIDTH_DP
         } else {
-            isWideProvider
+            true // 播放条身份：读不到 options 时按横条渲染（见上）
         }
         val views = RemoteViews(context.packageName, if (wide) LAYOUT_WIDE else LAYOUT_SQUARE)
         bindCommon(context, views, state)
@@ -341,4 +360,18 @@ internal object MusicWidgetViews {
 
     /** 竖版布局的宽度阈值（dp），低于它退化到封面竖版布局 */
     private const val WIDE_LAYOUT_MIN_WIDTH_DP = 180
+
+    /**
+     * 封面版转横条的滞回量（dp）。
+     *
+     * 两个 provider 声明的 `minWidth` 都是 250dp（这是 4 格的网格口径，不是布局意图），
+     * 所以单靠「≥180dp 就横条」会让封面版一放上去就变横条。给它 180+60=240dp…
+     * 仍然不够 —— 250dp 的默认值依然越线。因此封面版实际要求用户**主动拖宽到
+     * 250dp 以上**才切横条，而默认放置时永远保持竖版。
+     *
+     * 取 80 的理由：250（默认）→ 330dp 才切；主流 ROM 的 4 格约 250-290dp，
+     * 5 格约 320dp —— 即「用户真的把它拖成 5 格宽」才认为是想要横条，
+     * 不会因为 ROM 之间几十 dp 的口径差异而抖动。
+     */
+    private const val SQUARE_TO_WIDE_HYSTERESIS_DP = 80
 }
