@@ -40,6 +40,32 @@ data class SystemActions(
     val setRingtone: ((DemoSong) -> Unit)? = null,
     /** 分享歌单（导出 M3U8 后分享）；null = 同上 */
     val sharePlaylist: ((title: String, tracks: List<DemoSong>) -> Unit)? = null,
+
+    // ── C-1（本轮）：桌面歌词从设置页深处提到播放现场 ──
+    //
+    // ## 为什么走 SystemActions 而不是给 PlayerScreen 加参数
+    // 桌面歌词的整套实现（悬浮窗权限、WindowManager、独立 DataStore）全在 :app，
+    // 而播放选项面板在 :feature:player。加参数要改 GlassApp 的调用点 + feature 模块的
+    // 签名，且与既有分享/铃声那组「系统集成动作」是**同一类东西**（都靠 app 层能力）。
+    // 归到 SystemActions 后，面板侧只需读一个 CompositionLocal，零签名改动。
+    //
+    // ## 为什么这里给的是「开关 + 三个设置」而不是一个「打开设置页」的跳转
+    // 用户此刻正在听歌，让他离开播放页去找设置项，等于打断他正在做的事。
+    // 面板内直接可调才是这个功能该有的位置——这也是它此前「可发现性几乎为零」
+    // 的根因：不是入口隐藏了，是入口离使用现场太远。
+
+    /** 桌面歌词当前开关状态；null = 宿主未接线（面板不渲染这一组） */
+    val desktopLyricsOn: (() -> Boolean)? = null,
+    /** 切换桌面歌词开关（宿主内部处理权限引导） */
+    val toggleDesktopLyrics: (() -> Unit)? = null,
+    /** 桌面歌词当前字号档（null = 未接线）；见 [DesktopLyricsStyle] */
+    val desktopLyricsFontStep: (() -> Int)? = null,
+    /** 设置字号档 */
+    val setDesktopLyricsFontStep: ((Int) -> Unit)? = null,
+    /** 桌面歌词当前不透明度百分比（0-100；null = 未接线） */
+    val desktopLyricsOpacity: (() -> Int)? = null,
+    /** 设置不透明度百分比 */
+    val setDesktopLyricsOpacity: ((Int) -> Unit)? = null,
 )
 // 已删除：`val available: Boolean get() = shareSong != null || ...`（本轮清理）。
 // 它的 KDoc 写「面板不渲染分享分组时靠它判断」，但全仓**零调用** ——
@@ -74,3 +100,54 @@ fun SystemActions.songRingtoneAction(song: DemoSong): (() -> Unit)? =
 /** 是否展示「分享歌单」：宿主已接线且歌单非空（空歌单分享出去毫无意义） */
 fun SystemActions.playlistShareAction(title: String, tracks: List<DemoSong>): (() -> Unit)? =
     if (tracks.isEmpty()) null else sharePlaylist?.let { action -> { action(title, tracks) } }
+
+/**
+ * 桌面歌词的外观档位（本轮新增）。
+ *
+ * ## 为什么是「档位」而不是连续滑杆
+ * 桌面歌词是一条悬浮在别的内容上的窄条，它只有两个可调维度，而且都不是精细调参：
+ * - **字号**决定「一眼能否看清」，5 档足够覆盖「想小一点别挡内容」到「老花眼看不清」；
+ * - **不透明度**决定「读得清」与「别抢背景」之间的平衡，4 档（60/75/90/100）够用。
+ *
+ * 连续滑杆会带来一个具体的坏处：悬浮窗每次参数变化都要 `updateViewLayout`，
+ * 拖动滑杆会让它连续重排几十次，在低端机上表现为歌词条抖动。档位的离散特性
+ * 天然避免这个问题，同时用户也更容易「调回刚才那个值」。
+ *
+ * ## 为什么定义在 :core:ui 而不是 :app
+ * 档位标签是**UI 文案**（「标准」「特大」），要由面板渲染；而 :feature:player
+ * 不能依赖 :app。数值本身（sp / 百分比）属于实现细节，留在 :app 的控制器里
+ * 按档位索引取值即可——两边共享的只有「档位个数与标签」这一个契约。
+ */
+object DesktopLyricsStyle {
+
+    /**
+     * 字号档的展示标签（5 档，升序）。
+     *
+     * 索引即档位号，持久化也只存这个 int——标签文案改了不影响已存数据。
+     * 默认档位是索引 2（「标准」），见 [DEFAULT_FONT_STEP]。
+     */
+    val FontSteps: List<String> = listOf("小", "偏小", "标准", "偏大", "特大")
+
+    /** 默认字号档：中间档。选中间值是为了「往上往下都还有余地」——
+     *  默认值取端点会让一个方向的调节立刻失效。 */
+    const val DEFAULT_FONT_STEP = 2
+
+    /** 不透明度档的展示标签（4 档，升序） */
+    val OpacitySteps: List<String> = listOf("淡", "适中", "清晰", "不透明")
+
+    /** 对应的百分比：与标签一一对应，索引相同 */
+    val OpacityPercents: List<Int> = listOf(60, 75, 90, 100)
+
+    /** 默认不透明度档：索引 2（90%）。
+     *  选 90% 而不是 100%：桌面歌词要能看出「它浮在别的内容上」，
+     *  全不透明会让它像一块贴纸，而 60% 在白底桌面/浅色壁纸上几乎读不清。 */
+    const val DEFAULT_OPACITY_STEP = 2
+
+    /** 字号档 → sp 字号（14/16/18/21/24）。
+     *  基准 18sp：比系统正文（16sp）略大，因为桌面歌词是**远距离扫读**，
+     *  用户通常在手机放下时瞄一眼，而不是贴近看。 */
+    fun fontSp(step: Int): Float = listOf(14f, 16f, 18f, 21f, 24f)[step.coerceIn(0, 4)]
+
+    /** 不透明度档 → 0-255 alpha 值（与 0xE6 这类写法同口径） */
+    fun alphaOf(step: Int): Int = (OpacityPercents[step.coerceIn(0, OpacityPercents.lastIndex)] * 255) / 100
+}

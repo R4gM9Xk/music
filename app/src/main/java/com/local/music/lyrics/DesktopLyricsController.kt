@@ -79,6 +79,23 @@ class DesktopLyricsController(private val appContext: Context) {
     private var windowManager: WindowManager? = null
     private var lyricView: TextView? = null
 
+    /**
+     * 当前外观档位（本轮新增）：字号档 / 不透明度档 / 是否锁定。
+     *
+     * ## 为什么这三项由 UI 侧写入、而不是控制器自己读 DataStore
+     * 控制器跑在播放服务里，每次轮询（250ms）都去读 DataStore 是不可能的
+     * （磁盘 IO + Flow）。而这三项只在**用户改动的瞬间**变化，写入即可，
+     * 所以用「外部 set + 立即应用」的单向数据流：宿主（GlassApp）从 DataStore
+     * 读出真值 → 调 [applyStyle] → 控制器只负责把值落到 View/Params 上。
+     *
+     * ## 为什么变更要「立即应用」而不是等下次 show
+     * 用户改字号时悬浮窗**正在显示**（他就在盯着它看效果）。等下次 show 等于
+     * 「改了没反应」，那正是这一组设置最不该出现的表现。
+     */
+    private var fontStep: Int = com.local.music.core.ui.components.DesktopLyricsStyle.DEFAULT_FONT_STEP
+    private var opacityStep: Int = com.local.music.core.ui.components.DesktopLyricsStyle.DEFAULT_OPACITY_STEP
+    private var locked: Boolean = false
+
     /** 当前歌词行集。切歌由 [onTrackChanged] 重读；显示期间由轮询使用。 */
     private var lines: List<LyricLine> = emptyList()
 
@@ -142,6 +159,51 @@ class DesktopLyricsController(private val appContext: Context) {
         }
     }
 
+    /** 当前是否锁定（供宿主回显） */
+    fun isLocked(): Boolean = locked
+
+    /**
+     * 应用外观档位（本轮新增）。可重复调用：未显示时只记值，显示中则立即落到 View。
+     *
+     * @param font 字号档（见 [com.local.music.core.ui.components.DesktopLyricsStyle.FontSteps]）
+     * @param opacity 不透明度档
+     * @param lockPosition true = 触摸穿透（不可拖动），false = 可拖动
+     *
+     * 三个值都会先**钳制**再用：调用方（GlassApp）从 DataStore 读的是历史数据，
+     * 越界索引若直接进 `FontSteps[step]` 会在服务进程抛 IndexOutOfBounds —— 那是
+     * 播放服务的崩溃，不只是「字号不对」。钳制放在这里而不是调用方，是因为
+     * 控制器是所有外观变更的**唯一落点**，守在这一处就够了。
+     */
+    fun applyStyle(
+        font: Int,
+        opacity: Int,
+        lockPosition: Boolean,
+    ) {
+        val style = com.local.music.core.ui.components.DesktopLyricsStyle
+        fontStep = font.coerceIn(0, style.FontSteps.lastIndex)
+        opacityStep = opacity.coerceIn(0, style.OpacitySteps.lastIndex)
+        locked = lockPosition
+        val view = lyricView ?: return // 未显示：值已记下，show() 时会用
+        runCatching {
+            view.textSize = style.fontSp(fontStep)
+            // 不透明度：作用于**整个窗口**而不是文字颜色。
+            // 若只改文字 alpha，深色底胶囊仍然全不透明，「淡」档看起来会像
+            // 「底还那么实、只是字变灰了」——那不是用户想要的「整体更透」。
+            view.alpha = style.alphaOf(opacityStep) / 255f
+            // 锁定：FLAG_NOT_TOUCHABLE 让触摸穿透到下层应用。
+            // 注意它必须与 FLAG_NOT_FOCUSABLE 并存（后者在 show 里恒设）：
+            // 只加 NOT_TOUCHABLE 而不设 NOT_FOCUSABLE 会得到一个抢焦点但不响应
+            // 触摸的窗口——那是比「能拖动」更糟的状态。
+            val lp = view.layoutParams as? WindowManager.LayoutParams ?: return@runCatching
+            lp.flags = if (locked) {
+                lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            } else {
+                lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            }
+            windowManager?.updateViewLayout(view, lp)
+        }.onFailure { Log.w(TAG, "applyStyle failed", it) }
+    }
+
     /**
      * 显示悬浮窗。已在显示时幂等（只重读歌词）。无悬浮窗权限返回 false
      * （调用方据此引导授权），任何异常不外抛。
@@ -156,7 +218,9 @@ class DesktopLyricsController(private val appContext: Context) {
             val wm = appContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val view = TextView(appContext).apply {
                 text = "♪ 暂无歌词"
-                textSize = 16f
+                // 字号/不透明度从已记下的档位取（applied by applyStyle 于 show 之后，
+                // 这里给初值避免第一帧用默认值再跳变）
+                textSize = com.local.music.core.ui.components.DesktopLyricsStyle.fontSp(fontStep)
                 setTextColor(0xFFFFFFFF.toInt())
                 // ── 视觉一致性（视觉审计 F1）──
                 // 改前是裸 TextView：直角 + 0x66000000 纯黑底 + px 单位的 padding。
@@ -190,6 +254,8 @@ class DesktopLyricsController(private val appContext: Context) {
                         DesktopLyricsPrefs.savePosition(appContext, lp.x, lp.y)
                     },
                 )
+                // 不透明度初值：与字号同理，避免首帧全不透明再跳变到设定值
+                alpha = com.local.music.core.ui.components.DesktopLyricsStyle.alphaOf(opacityStep) / 255f
             }
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -198,7 +264,10 @@ class DesktopLyricsController(private val appContext: Context) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 // NOT_FOCUSABLE 必须有：否则抢焦点顶掉输入法；NOT_TOUCH_MODAL 让窗外触摸穿透
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    // 锁定态：直接以「不可触摸」创建窗口，避免先显示再切标志（那一瞬
+                    // 用户可能正好划过它把位置拖走）。解锁时由 applyStyle 摘掉这一位。
+                    (if (locked) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0),
                 PixelFormat.TRANSLUCENT,
             ).apply {
                 gravity = Gravity.TOP or Gravity.START

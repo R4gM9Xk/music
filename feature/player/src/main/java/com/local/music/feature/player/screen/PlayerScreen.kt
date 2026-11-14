@@ -53,15 +53,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -69,6 +72,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
@@ -76,6 +80,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -83,6 +88,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.constrainHeight
+import androidx.compose.ui.unit.constrainWidth
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.unit.sp
@@ -91,6 +98,7 @@ import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.ArtThumb
 import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoSong
+import com.local.music.core.ui.components.DesktopLyricsStyle
 import com.local.music.core.ui.components.FlightKeys
 import com.local.music.core.ui.components.GlassIconButton
 import com.local.music.core.ui.components.GlassLevel
@@ -99,6 +107,7 @@ import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.LyricLine
 import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.components.LocalModalState
+import com.local.music.core.ui.components.LocalSystemActions
 import com.local.music.core.ui.components.SongActionsSheet
 import com.local.music.core.ui.components.LocalPlayerFlight
 import com.local.music.core.ui.components.PlayerFlight
@@ -193,36 +202,134 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
         if (f.entryShowCover && f.songSnapshot?.id != song.id) f.entryShowCover = false
     }
 
-    // 左右滑动切模式：左滑 → 封面模式，右滑 → 歌词模式
+    // ── 舞台手势（B-1 本轮重构）──
     //
-    // **无歌词时整条手势不生效**（本轮修复，与 onCoverClick 的 P3-66 同口径）：
-    // 旧实现只给封面点击加了 `lyrics != null` 守卫，滑动分支仍无条件写 lyricEnabled —
-    // 于是纯音乐/占位曲上滑一下，偏好被静默改掉，用户回到有歌词的歌才发现「歌词开关自己变了」。
-    // 同一状态的另一个入口（onCoverClick）已经修好，两处判定必须一致。
-    val swipeThreshold = with(LocalDensity.current) { 48.dp.toPx() }
-    fun Modifier.modeSwipe() = pointerInput(lyrics != null) {
-        var total = 0f
-        detectHorizontalDragGestures(
-            onDragStart = { total = 0f },
-            onHorizontalDrag = { change, amount ->
-                change.consume()
-                total += amount
-            },
-            onDragEnd = {
-                if (lyrics == null) return@detectHorizontalDragGestures
-                when {
-                    total <= -swipeThreshold -> {
-                        flight?.entryShowCover = false
-                        state.lyricEnabled = false
+    // 改动前：**单指**左右滑切「封面 / 歌词」模式。
+    // 改动后：**单指左右滑 = ±10 秒 seek**，**双指左右滑 = 切模式**。
+    //
+    // ## 为什么要换掉单指切模式
+    // 听歌时最高频的操作不是「看封面还是看歌词」，而是「这句没听清，倒回去几秒」。
+    // 改动前这个需求只能去拖下方的进度条——而进度条在玻璃控制台里，从歌词区的中上部
+    // 伸手下去是一段很长的视线+手指转移，且进度条的目标很细（轨道 4dp 级），
+    // 边走路边拖基本不可能。左右滑一整片舞台区域是这类操作的标准解。
+    //
+    // ## 为什么用「双指」承接原来的模式切换
+    // 不能直接砍掉手势切模式（老用户已形成习惯，且点封面那个入口在歌词模式下
+    // 不方便——封面缩成左上角 64dp 小窗）。双指是**低频操作**，与「切模式」的
+    // 低频性质匹配；而 seek 是高频，交给单指。操作频率与触发难度的这种对应
+    // 关系本身就降低了误触。
+    //
+    // ## 冲突消解（这是本实现最容易写错的地方）
+    // `detectHorizontalDragGestures` 与多指检测不能各挂一个 pointerInput 到同一个
+    // Modifier 链上——两个手势检测器会**同时**收到事件并争抢消费，表现为
+    // 「双指滑动时既不 seek 也不切模式」。所以统一收在一个 awaitPointerEventScope 里，
+    // 先自己判断指针数，再分派：
+    //   - 手势期间出现过 >= 2 指 → 本次手势按「多指」处理，单指 seek 放弃；
+    //   - 全程只有 1 指 → 松手时按总位移方向 seek。
+    //
+    // ## 为什么阈值不同
+    // seek 阈值 24dp：它是高频、可反悔（再滑回来）的轻量操作，门槛应低。
+    // 切模式阈值 48dp：切换会改变整屏内容构成，误触代价高，门槛应高。
+    val seekThreshold = with(LocalDensity.current) { 24.dp.toPx() }
+    val modeThreshold = with(LocalDensity.current) { 48.dp.toPx() }
+
+    // seek 反馈（「-10s」/「+10s」胶囊）的可见内容与时间戳。
+    // 单独成 State 是因为它要在**手势结束后**驱动一个小浮层：若写进别的高频状态，
+    // 整片舞台会跟着每帧重组（本仓的既有红线，见 ProgressTrack 注释）。
+    var seekHint by remember { mutableStateOf<String?>(null) }
+    // 用自增 token 而不是 Boolean：连续两次同类 seek（连划两下）都必须重新计时，
+    // 而 `LaunchedEffect(hint)` 在文案相同时**不会重启** → 第二次的胶囊会提前消失。
+    var seekHintToken by remember { mutableIntStateOf(0) }
+    LaunchedEffect(seekHintToken) {
+        if (seekHint == null) return@LaunchedEffect
+        delay(600)
+        // 到点无条件清空：本 effect 的 key 就是 token，token 一变旧 effect 立刻被
+        // 取消（不会走到这里），所以能执行到这一行就说明「没有更新的 seek 接管」。
+        // （第一版写过 `if (seekHintToken == seekHintToken)` 这种恒真自比较，
+        //   纯属残留——真要判代次需要把旧 token 捕获成局部 val，而上面的取消语义
+        //   已经免费提供了同样的保证。）
+        seekHint = null
+    }
+
+    /**
+     * 舞台手势统一入口。
+     *
+     * @param lyricsPresent 是否有歌词：决定「切模式」手势是否可用。与 onCoverClick
+     *   的守卫同口径——纯音乐没有歌词端可切，让手势静默改偏好是既有 P3-66 缺陷。
+     *
+     * 注意 seek **不受** lyricsPresent 影响：纯音乐同样需要「倒回去几秒」，
+     * 而且纯音乐恰恰是最需要用滑动手势的场景（没有歌词行可点）。
+     */
+    fun Modifier.stageGestures(lyricsPresent: Boolean) = pointerInput(lyricsPresent) {
+        awaitPointerEventScope {
+            while (true) {
+                // 等一个手势开始
+                var event = awaitPointerEvent()
+                while (event.changes.none { it.pressed }) {
+                    event = awaitPointerEvent()
+                }
+                var totalDx = 0f
+                var sawMultiTouch = event.changes.count { it.pressed } > 1
+
+                // 追踪到全部松手为止
+                while (true) {
+                    event = awaitPointerEvent()
+                    val pressed = event.changes.filter { it.pressed }
+                    if (event.changes.count { it.pressed } > 1) sawMultiTouch = true
+                    // 位移累加规则：**始终**累加「当前按下的第一个指针」的帧间位移。
+                    //
+                    // 第一版写成 `if (!sawMultiTouch) totalDx += ...`（多指时就不累加），
+                    // 结果双指滑动时 totalDx 恒为 0 → 切模式的阈值判断永远不成立
+                    // → 「双指滑动切封面/歌词」完全失效，而单指 seek 看起来正常，
+                    // 属于**最难发现的那类 bug**（一半功能静默失效，没有任何报错）。
+                    // 现在的写法让两种手势共享同一份位移累计，分派时只看 sawMultiTouch。
+                    //
+                    // 只取「第一个仍按下的指针」而不是求和：双指时两指各有位移，
+                    // 求和会是单指的两倍，阈值判定就会与单指不一致（48dp 的双指
+                    // 实际上只要 24dp 就触发）。
+                    pressed.firstOrNull()?.let { active ->
+                        totalDx += active.position.x - active.previousPosition.x
                     }
-                    total >= swipeThreshold -> {
-                        flight?.entryShowCover = false
-                        state.lyricEnabled = true
+                    if (pressed.isEmpty()) break
+                }
+
+                // ── 分派 ──
+                if (sawMultiTouch) {
+                    // 多指：切「封面 / 歌词」模式（原单指行为平移过来）
+                    if (lyricsPresent) {
+                        when {
+                            totalDx <= -modeThreshold -> {
+                                flight?.entryShowCover = false
+                                state.lyricEnabled = false
+                            }
+                            totalDx >= modeThreshold -> {
+                                flight?.entryShowCover = false
+                                state.lyricEnabled = true
+                            }
+                        }
+                    }
+                } else {
+                    // 单指：±10 秒 seek。
+                    //
+                    // 方向语义：向右滑 = 前进（+10s），向左滑 = 后退（-10s）。
+                    // 这是媒体播放器的通用约定（时间轴从左到右推进，手指顺着它拖 = 往前走）。
+                    when {
+                        totalDx <= -seekThreshold -> {
+                            state.seekBy(-SEEK_STEP_SEC)
+                            seekHint = "-${SEEK_STEP_SEC.toInt()}s"
+                            seekHintToken++
+                        }
+                        totalDx >= seekThreshold -> {
+                            state.seekBy(SEEK_STEP_SEC)
+                            seekHint = "+${SEEK_STEP_SEC.toInt()}s"
+                            seekHintToken++
+                        }
                     }
                 }
-            },
-        )
+            }
+        }
     }
+
 
     // 封面点击：对当前视觉模式取反（entryShowCover 态下首次点击即回到正常切换语义）。
     // 无歌词（纯音乐）时不再静默写 lyricEnabled（P3-66）——点击没有任何视觉反馈，
@@ -232,9 +339,11 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
         if (lyrics != null) state.lyricEnabled = !showLyrics
     }
 
-    // 播放页自持采样状态：顶栏+舞台为 hazeSource，控制台为兄弟效果层
-    // （底部面板已挂 GlassApp 根层宿主，消费 app 级源，不在本屏子树内）
-    val playerHaze = rememberHazeState()
+    // 播放页自持采样状态：顶栏+舞台为 hazeSource，控制台为兄弟效果层。
+    // 状态由 GlassApp 上收创建并把覆盖层背景（极光/照片）也挂为源（见 GlassApp 播放页 Box），
+    // 这里优先消费上层提供的状态，控制台才模糊得到「它背后」的背景；无上层提供时（预览/单测）
+    // 回退自持，保持本屏可独立组合。
+    val playerHaze = LocalHazeState.current ?: rememberHazeState()
     CompositionLocalProvider(LocalHazeState provides playerHaze) {
         Column(
             modifier
@@ -299,14 +408,57 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         ) {
                             Icon(GlassIcons.Down, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
                         }
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                        // ── B-2：顶栏来源行可点回来源详情页 ──
+                        //
+                        // 改动前这两行纯展示：用户看到「来自「通勤」」却点不动，而想让
+                        // 它可点几乎是人人都有的第一反应（那行字天然在说「这是从那儿来的」）。
+                        //
+                        // ## 为什么整列可点而不是只给第二行加个箭头
+                        // 「正在播放」是标题，「来自「xx」」是它的注脚，两者是**一个信息块**。
+                        // 只让注脚可点会产生一个很窄的可点条（11sp 行高的文本），命中率低；
+                        // 整列可点则把命中区扩到 40dp × 整行中部，符合触控目标最小尺寸。
+                        //
+                        // ## 什么时候不可点
+                        // `queueSourceTarget == null` 且 `queueSource == null`——即「本地音乐」
+                        // （曲库整库播放 / 搜索直接播放）。此时没有可回去的详情页，
+                        // 点击只会收起播放页回到 playerOrigin，而那个动作顶栏左侧的「收起」
+                        // 按钮已经承担了，重复给一次可点会让用户以为有什么特别的东西。
+                        // 所以这种情况下**不加 clickable**，语义与视觉都保持现状。
+                        val sourceTarget = state.queueSourceTarget
+                        val sourceName = state.queueSource
+                        val canGoBackToSource = sourceTarget != null
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .weight(1f)
+                                .then(
+                                    if (canGoBackToSource) {
+                                        Modifier
+                                            .clip(RoundedCornerShape(R.Card14.dp))
+                                            .clickable(
+                                                interactionSource = remember { MutableInteractionSource() },
+                                                indication = null,
+                                                onClick = { state.backToSource() },
+                                            )
+                                            .semantics {
+                                                this.role = Role.Button
+                                                contentDescription = "返回来源：${sourceName ?: "本地音乐"}"
+                                            }
+                                            // 内边距在可点时才加：不可点时保持原来的紧凑顶栏高度，
+                                            // 避免「有没有来源」让顶栏高度跳变
+                                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                                    } else {
+                                        Modifier
+                                    },
+                                ),
+                        ) {
                             // A1 token 化：顶栏是**次要信息**，字重必须弱于下方歌名（Heading/SemiBold 16）。
                             // 旧值是 13sp + SemiBold——字号比歌名小但字重同级，在玻璃上两者争视觉焦点；
                             // BodyMedium（13 Medium）同时守住字号与字重的从属关系。
                             Text("正在播放", color = LocalGlassColors.current.textPrimary, style = GlassText.BodyMedium,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
                             // 「来自…」是来源注脚：Micro（11/14）与播放页时间戳同档，不参与信息层级竞争
-                            Text("来自「${state.queueSource ?: "本地音乐"}」", color = LocalGlassColors.current.textSecondary, style = GlassText.Micro)
+                            Text("来自「${sourceName ?: "本地音乐"}」", color = LocalGlassColors.current.textSecondary, style = GlassText.Micro)
                         }
                         GlassIconButton(
                             onClick = {
@@ -328,7 +480,11 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
 
 
                     // ── 统一舞台：modeT(0=封面端 1=歌词端) 插值，封面中心+尺寸同帧直线过渡 ──
-                    val modeT by updateTransition(showLyrics, label = "playerMode").animateFloat(
+                    // **刻意不用 `by` 解构**：模式切换的 500ms 内，封面几何/圆角/阴影
+                    // 全部要在布局期或绘制期读这个 State（见下方 coverRectAt / coverSideAt
+                    // 与 graphicsLayer / drawWithContent）。解构成 Float 会把读取带回组合期，
+                    // 让整个舞台逐帧重组——那正是 P3-15 只修了一半的根因（A4 审计 Major-4）。
+                    val modeT = updateTransition(showLyrics, label = "playerMode").animateFloat(
                         transitionSpec = { GlassMotion.tweenLyric() },
                         label = "modeT",
                     ) { if (it) 1f else 0f }
@@ -337,7 +493,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     BoxWithConstraints(
                         Modifier
                             .weight(1f)
-                            .modeSwipe()
+                            .stageGestures(lyricsPresent = lyrics != null)
                             .padding(top = 8.dp, bottom = 4.dp),
                     ) {
                         val density = LocalDensity.current
@@ -427,20 +583,27 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         )
                         // 边缘线性插值 = 中心走直线 + 尺寸线性增长（设计要求的直线平移）
                         // modeT: 0=封面端(大居中 R28 阴影18) 1=歌词端(左上64dp R18 阴影10)
-                        val coverRect = Rect(
-                            lerp(bigRect.left, smallRect.left, modeT),
-                            lerp(bigRect.top, smallRect.top, modeT),
-                            lerp(bigRect.right, smallRect.right, modeT),
-                            lerp(bigRect.bottom, smallRect.bottom, modeT),
-                        )
-                        // C4：圆角两端改读 R 刻度（R.Player28 大封面端 / R.Card18 歌词小窗端）。
-                        // 数值与旧裸值 28/18 完全相同——token 化的意义不在改观感，而是让
-                        // 「播放页封面两端圆角 = 两个既有刻度」这件事写进代码；日后调刻度时
-                        // 只需改 R，封面不会成为全仓唯一还在用裸 28/18 的角落。
-                        val coverShape = RoundedCornerShape(lerp(R.Player28.dp, R.Card18.dp, modeT))
+                        //
+                        // A4 审计 Major-4：这两个闭包只在**布局期/绘制期**被调用（offset /
+                        // layout / graphicsLayer / drawWithContent），闭包里读 modeT.value
+                        // 不会登记为组合期读取——模式切换 500ms 内舞台子树零重组，LyricRail
+                        // 与它的 Layout 全量行测量也不会被牵连。
+                        val coverRectAt: (Float) -> Rect = { t ->
+                            Rect(
+                                lerp(bigRect.left, smallRect.left, t),
+                                lerp(bigRect.top, smallRect.top, t),
+                                lerp(bigRect.right, smallRect.right, t),
+                                lerp(bigRect.bottom, smallRect.bottom, t),
+                            )
+                        }
+                        // 封面两端都是正方形，尺寸可直接插值；宽高分别 coerce 保留旧
+                        // Modifier.size 在父约束下的行为（见上方「不要椭圆」的横屏教训）
+                        val coverSideAt: (Float) -> Float = { t -> lerp(bigSize, smallSize, t) }
+                        // C4：圆角两端读 R 刻度（R.Player28 大封面端 / R.Card18 歌词小窗端）。
+                        // 数值在绘制期由 modeT 插值求出，不再在组合期生成 Shape。
 
-                        // 歌词 rail：常驻组合（P3-15——旧写法 modeT>0 的组合期读取让模式切换
-                        // 500ms 内整个舞台每帧重组）；淡入淡出交给下方 graphicsLayer 绘制期读。
+                        // 歌词 rail：常驻组合（P3-15）；显隐/淡入淡出都在绘制期读 modeT，
+                        // 不再有 modeT>0 的组合期分支。
                         // onSelect 门控 showLyrics：封面模式下 rail alpha=0 仍驻组合，不可见行不得响应点击
                         if (lyrics != null) {
                             LyricRail(
@@ -449,19 +612,33 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                 onSelect = { index -> if (showLyrics) state.seekTo(lyrics[index].timeSec + 0.01f) },
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .graphicsLayer { alpha = modeT * (flight?.softAlpha() ?: 1f) },
+                                    .graphicsLayer { alpha = modeT.value * (flight?.softAlpha() ?: 1f) },
                             )
                         }
 
                         // 唯一封面：永不卸载，切歌只换 bitmap；飞行期让位替身（共享真身 alpha 门控），
-                        // 歌词模式退出时封面不飞，改随非共享组原地淡出
+                        // 歌词模式退出时封面不飞，改随非共享组原地淡出。
+                        //
+                        // A4 审计 Major-4：位置/尺寸在布局期读 modeT（offset + layout lambda），
+                        // 圆角/裁切/阴影在绘制期读（graphicsLayer），描边改 drawWithContent——
+                        // 照抄替身层 PlayerFlightOverlay 已验证的范式。原先 offset/size/shadow/
+                        // border 全部吃组合期值，模式切换 500ms 内整个舞台逐帧重组。
                         val coverInteraction = remember { MutableInteractionSource() }
                         Box(
                             Modifier
                                 .offset {
-                                    IntOffset(coverRect.left.roundToInt(), coverRect.top.roundToInt())
+                                    val r = coverRectAt(modeT.value)
+                                    IntOffset(r.left.roundToInt(), r.top.roundToInt())
                                 }
-                                .size(with(density) { coverRect.width.toDp() })
+                                .layout { measurable, constraints ->
+                                    // flush=false 的 Modifier.size 等价：按 t 求边长，再对父约束
+                                    // coerce，最后以固定约束测子项
+                                    val side = coverSideAt(modeT.value).roundToInt().coerceAtLeast(0)
+                                    val w = constraints.constrainWidth(side)
+                                    val h = constraints.constrainHeight(side)
+                                    val placeable = measurable.measure(Constraints.fixed(w, h))
+                                    layout(w, h) { placeable.place(0, 0) }
+                                }
                                 .trackFlight(FlightKeys.PlayerCover)
                                 .graphicsLayer {
                                     val f = flight
@@ -476,13 +653,43 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                 }
                                 .pressScale(coverInteraction, pressed = 0.95f)
                                 .clickable(interactionSource = coverInteraction, indication = null, onClick = onCoverClick)
-                                .shadow(lerp(18.dp, 10.dp, modeT), coverShape)
-                                .border(1.dp, glass.stroke, coverShape),
+                                .graphicsLayer {
+                                    // 圆角 + 阴影 + 裁切全部绘制期求值：shape/clip 等价旧的
+                                    // .shadow(el, coverShape)（shadow 默认 clip=true），
+                                    // shadowElevation 等价旧 .shadow 的 elevation。
+                                    // 旧实现把 coverShape 放在组合期，这两个 modifier 每帧
+                                    // 重建 Modifier 链 → 整段舞台重组。
+                                    val t = modeT.value
+                                    shape = RoundedCornerShape(lerp(R.Player28.dp, R.Card18.dp, t))
+                                    clip = true
+                                    shadowElevation = lerp(18.dp, 10.dp, t).toPx()
+                                }
+                                .drawWithContent {
+                                    // 描边改绘制期：**几何必须与 Modifier.border 逐像素一致**——
+                                    // border 是「内缩半个线宽画 Stroke」，不是压着节点边界画
+                                    // （那样外半宽会被外层 clip 裁掉，只剩 0.5dp，描边比原来细一半）。
+                                    // 因此这里同样 inset sw/2、尺寸减 sw，圆角沿用整形半径。
+                                    drawContent()
+                                    val t = modeT.value
+                                    val sw = 1.dp.toPx()
+                                    drawRoundRect(
+                                        color = glass.stroke,
+                                        topLeft = Offset(sw / 2f, sw / 2f),
+                                        size = Size(size.width - sw, size.height - sw),
+                                        cornerRadius = CornerRadius(
+                                            lerp(R.Player28.dp, R.Card18.dp, t).toPx(),
+                                        ),
+                                        style = Stroke(sw),
+                                    )
+                                },
                         ) {
                             ArtThumb(
                                 song.art,
                                 Modifier.fillMaxSize(),
-                                coverShape,
+                                // 外层 graphicsLayer 已按 t 裁形（等价旧 ArtThumb 自裁），
+                                // 内层传 RectangleShape 避免把组合期 shape 带进 ArtThumb
+                                // ——与替身层同一做法（见 PlayerFlightOverlay 的封面替身）
+                                RectangleShape,
                                 bitmap = song.coverBitmap,
                                 artworkUri = song.artworkUri,
                             )
@@ -500,9 +707,43 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .offset {
-                                        IntOffset(0, (coverRect.bottom + with(density) { 20.dp.toPx() }).roundToInt())
+                                        // 旧值 coverRect.bottom 是组合期快照；这里在布局期
+                                        // 按同一 t 重算，文案跟着封面走而不是钉在起始位置
+                                        val bottom = coverRectAt(modeT.value).bottom
+                                        IntOffset(0, (bottom + with(density) { 20.dp.toPx() }).roundToInt())
                                     }
-                                    .graphicsLayer { alpha = (1f - modeT) * (flight?.softAlpha() ?: 1f) },
+                                    .graphicsLayer { alpha = (1f - modeT.value) * (flight?.softAlpha() ?: 1f) },
+                            )
+                        }
+
+                        // ── B-1：seek 反馈胶囊（「-10s」/「+10s」）──
+                        //
+                        // 位置 = 舞台正中：用户滑动时手指在舞台区域里，反馈必须出现在
+                        // **视线本来就在的地方**，而不是底部控制台（那样等于让他低头再抬头）。
+                        //
+                        // 为什么用 AnimatedVisibility 淡入淡出而不是直接 if：滑动手势可能在
+                        // 一秒内连发两三次，硬切会让胶囊闪烁。淡出 200ms 也留出「我滑的是退」的
+                        // 确认时间。
+                        //
+                        // 语义上它是**装饰性回执**：真实的时间已经在下方控制台更新了，
+                        // 所以这里 contentDescription 留 null（读屏用户通过 TalkBack 的
+                        // seek 无障碍动作走另一条路，见 LyricLineRow 的 semantics）。
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = seekHint != null,
+                            enter = fadeIn(),
+                            exit = fadeOut(),
+                            modifier = Modifier.align(Alignment.Center),
+                        ) {
+                            Text(
+                                seekHint.orEmpty(),
+                                color = LocalGlassColors.current.textPrimary,
+                                // Title（20 Bold）：足够在封面/歌词之上被读到，又不至于
+                                // 盖住内容（胶囊只是瞬态回执，不是内容）
+                                style = GlassText.Title,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(R.Card14.dp))
+                                    .background(Color.Black.copy(alpha = 0.45f))
+                                    .padding(horizontal = 18.dp, vertical = 10.dp),
                             )
                         }
                     }
@@ -545,10 +786,15 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             var modeLabel by remember { mutableStateOf<String?>(null) }
             LaunchedEffect(modeLabel) {
                 if (modeLabel == null) return@LaunchedEffect
-                // 1200ms 是**阅读时长**（四个字的词组 + 一次视线下移），不是动效时长，
-                // 所以刻意不乘 GlassMotion.scale：克制档下若也跟着缩，用户会看不清
-                // 自己刚按出了什么模式。
-                delay(1_200)
+                // 2000ms 是**阅读时长**（四个字的词组 + 一次视线下移 + 一次确认），
+                // 不是动效时长，所以刻意不乘 GlassMotion.scale：克制档下若也跟着缩，
+                // 用户会看不清自己刚按出了什么模式。
+                //
+                // A-5（本轮）从 1200ms 延长到 2000ms：四态按钮的四个图标（顺序播放 /
+                // 列表循环 / 单曲循环 / 随机播放）彼此形近，光看图标的差异不足以让人
+                // 一眼确认「现在是哪一档」——真正承担辨识职责的就是这一行文字。
+                // 1.2s 读四个字刚刚够，但加上「图标变了」到「我该看哪里」的反应时间就不够。
+                delay(2_000)
                 modeLabel = null
             }
             // 2.2-D：拖动进度条时的预览比例（null = 未拖动，显示真实进度）。
@@ -659,13 +905,17 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                     onRemove = state::removeQueueItem,
                                     onClearUpNext = state::clearUpNext,
                                     isPlaying = state.playing,
+                                    // A-3：撤销窗口（状态层持有期限，面板只负责渲染）
+                                    undoClearCount = if (state.canUndoClearUpNext) state.undoClearUpNextCount else 0,
+                                    onUndoClearUpNext = state::undoClearUpNext,
+                                    onDismissUndo = state::dismissUndoClearUpNext,
                                 )
                             }
                         },
                         contentDescription = "打开播放队列",
                         modifier = Modifier.graphicsLayer { alpha = softAlpha() },
                     ) {
-                        Icon(GlassIcons.Queue, null, Modifier.size(21.dp),
+                        Icon(GlassIcons.Queue, null, Modifier.size(20.dp),
                             tint = LocalGlassColors.current.textSecondary)
                     }
                 }
@@ -691,10 +941,16 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                 // 为什么是它：它背后是封面位图 + 舞台（无滚动列表文字穿越），是本 App
                 // 唯一一块「玻璃后面有照片」的常驻面板——液态档的方向性斜面与 specular
                 // 只有在背后有内容时才读得出立体感，压在纯色极光上会像一圈没必要的亮边。
+                //
+                // ⚠️ 对端：PlayerFlightOverlay 的 FlightGlassPanel 落点端必须同为 Liquid
+                // （tint 走 liquidHazeTint、描边/顶线淡出、斜面/specular 淡入，模糊 26dp）。
+                // 改这里的 level/blur/liquidMotion 必须同步改那边，否则落地交叉淡化窗内
+                // 玻璃明度/色相/描边会跳变（正是替身层 KDoc 警告的「差一档」）。
                 level = GlassLevel.Liquid,
                 shape = RoundedCornerShape(R.Player28.dp),
-                // 模糊升到 Hi（26dp）：液态档的差异化在装饰层，模糊强度与 Hi 同级即可。
-                blur = GlassLevel.Hi,
+                // 模糊档取 Liquid（半径与 Hi 同 26dp）： tint 走 Liquid 的「低浓度白霜+accent
+                // 色相」配方（见 HazeGlass.glassHaze），避免纯白霜把控制台罩成奶白/灰平板。
+                blur = GlassLevel.Liquid,
                 // 光影驱动：绑**播放进度**（已有连续值，零新增基础设施）。
                 // 传 lambda 而不是解构后的 Float —— 它在绘制期逐帧读取，不触发重组；
                 // 传值会让整块控制台在播放中每帧重组（本仓反复点名的错误写法）。
@@ -860,8 +1116,11 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
             val hint: String? = when {
                 modeLabel != null -> modeLabel
                 lyrics == null -> null
-                showLyrics -> "点击歌词行可跳转 · 左右滑动切换封面 / 歌词"
-                else -> "左右滑动切换封面 / 歌词"
+                // B-1：手势语义变了，教学文案必须同步改——否则用户按旧文案做单指滑动，
+                // 想切模式却 seek 了 10 秒，会认为手势失灵。
+                // 纯音乐仍不出字（同一句「纯音乐，请欣赏」已经在舞台上，见上方 E4 注释）。
+                showLyrics -> "左右滑动快进快退 · 双指滑动切换封面 / 歌词 · 点歌词行跳转"
+                else -> "左右滑动快进快退 · 双指滑动切换封面 / 歌词"
             }
             val hintBlock: @Composable () -> Unit = {
             // 空态仍然渲染**同一个 Text**，只把文案换成一个不可见字符（而不是直接不渲染）：
@@ -1081,7 +1340,15 @@ private fun LyricRail(
     }
 }
 
-/** 单行歌词：当前 24sp 粗体 + 强调色辉光；邻行 55% 白；远处 34% 白 + 微模糊；整行再乘位置衰减（绘制期读） */
+/**
+ * 单行歌词：当前 24sp 粗体 + 强调色辉光；邻行 55% 白；远处 34% 白；整行再乘位置衰减（绘制期读）。
+ *
+ * **不再给远行挂 `Modifier.blur(0.4.dp)`**（A4 审计 Info-10）：rail 是自定义 Layout、
+ * 全部歌词行常驻组合（不是 LazyColumn），每行一个 blur 就是每行一个独立的 RenderEffect
+ * 图层——几十行常驻，而 0.4dp 在 3x 屏上约 1.2px，肉眼不可辨，深浅/远近层级实际由
+ * `GlassColors.lyricAdjacent` / `lyricFar` 的 alpha 承担。删掉后层级表现不变，
+ * 常驻渲染层数量与显存占用下降。
+ */
 @Composable
 private fun LyricLineRow(
     text: String,
@@ -1141,9 +1408,34 @@ private fun LyricLineRow(
             } else null,
         ),
         modifier = modifier
-            .then(if (distance > 1) Modifier.blur(0.4.dp) else Modifier)
             .graphicsLayer { alpha = positionalAlphaProvider() }
-            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick),
+            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+            // ── C-3（本轮）：歌词行的读屏语义 ──
+            //
+            // 改动前这一行只有一个 clickable，没有任何语义标注。TalkBack 用户划过来
+            // 听到的是「按钮」——三个字的标签既没说这是歌词、也没说是哪一句，
+            // 更没说是「正在唱的那句」还是「点一下会跳过去的那句」。
+            // 一片歌词几十行，读屏用户实际上完全无法使用这个界面。
+            //
+            // 三段信息的分配（与全仓 PlayPauseButton / PlayModeButton 同一套用法）：
+            // - contentDescription 回答「这是什么」：带上歌词文本本身，
+            //   这样读屏念出来就是「歌词：xxx」而不是干巴巴的「按钮」；
+            // - stateDescription 回答「现在是什么状态」：只有当前行才给「当前行」，
+            //   其余行为 null（TalkBack 对 null 不播报，不会制造噪音）；
+            // - onClick 的 label 回答「点它会怎样」：让读屏在双击前给出动作提示。
+            //
+            // 为什么用 `this.semantics{}` 而不是合并子树：这行只有一个 Text 子节点，
+            // 没有需要合并的兄弟，直接在 clickable 同一节点上补语义即可
+            // （分裂成两个节点会让 uiautomator 报出「可点节点没标签」的问题，
+            //  那正是 PlayModeButton 注释里记录过的三代踩坑）。
+            .semantics {
+                this.role = Role.Button
+                this.contentDescription = "歌词：$text"
+                if (distance == 0) this.stateDescription = "当前行"
+                // 用 SemanticsActions 的 label 重载：`onClick = {}` 的裸赋值形式不带
+                // 动作标签，读屏在双击前不会说「跳转到这一句」。
+                this.onClick(label = "跳转到这一句") { onClick(); true }
+            },
     )
 }
 
@@ -1194,18 +1486,27 @@ private fun PlayPauseButton(
             .clip(CircleShape)
             .background(Brush.linearGradient(listOf(glass.hi, glass.lo)))
             .border(1.dp, glass.stroke, CircleShape)
-            .drawBehind {
-                // box-shadow inset 0 1px 0 白50%（被圆形裁成短弦）
-                drawLine(
-                    brush = Brush.horizontalGradient(
-                        listOf(Color.Transparent, Color.White.copy(alpha = 0.5f), Color.Transparent),
-                        startX = size.width * 0.15f,
-                        endX = size.width * 0.85f,
-                    ),
-                    start = Offset(size.width * 0.15f, 0.5f),
-                    end = Offset(size.width * 0.85f, 0.5f),
-                    strokeWidth = 1.dp.toPx(),
+            .drawWithCache {
+                // 顶线 Brush 进 cache：旧 drawBehind 每次绘制都 new 一个 horizontalGradient
+                // （Shader 级分配）——按压缩放/主题渐变重绘时都在累积。Brush 只依赖
+                // size/固定颜色，cache 块天然覆盖失效条件（同 Glass.kt 的 glassTopLine）
+                val startX = size.width * 0.15f
+                val endX = size.width * 0.85f
+                val topLine = Brush.horizontalGradient(
+                    listOf(Color.Transparent, Color.White.copy(alpha = 0.5f), Color.Transparent),
+                    startX = startX,
+                    endX = endX,
                 )
+                val strokeWidth = 1.dp.toPx()
+                onDrawBehind {
+                    // box-shadow inset 0 1px 0 白50%（被圆形裁成短弦）
+                    drawLine(
+                        brush = topLine,
+                        start = Offset(startX, 0.5f),
+                        end = Offset(endX, 0.5f),
+                        strokeWidth = strokeWidth,
+                    )
+                }
             }
             // 读屏语义：整个 66dp 圆是一个可点按钮。contentDescription 固定为「播放/暂停」这一对
             // 动作名的**当前动作**，stateDescription 单独表达「正在播放/已暂停」——
@@ -1462,6 +1763,16 @@ private fun ConsoleIcon(
 /** 播放速度档位（Media3 原生 Sonic 变速不变调） */
 private val PlaybackSpeedOptions = listOf(0.75f, 1f, 1.25f, 1.5f, 2f)
 
+/**
+ * B-1：单次左右滑动的 seek 步长（秒）。
+ *
+ * 10 秒的取值依据：一句歌词通常 3–6 秒，10s 约等于「往回一到两句」——
+ * 这正是「这句没听清」的典型回溯距离。5s 太碎（要连划两三下），
+ * 30s 太跳（越过整段主歌，很难精确落回想要的那句）。
+ * 行业同类（YouTube 双击左右 = 10s、多数播客 App 的 ±15s）都在同一量级。
+ */
+private const val SEEK_STEP_SEC = 10f
+
 /** 速度档位展示名：固定一位小数（1f 显示「1.0×」，与 0.75× 对齐） */
 private fun speedLabel(speed: Float): String =
     if (speed == speed.toInt().toFloat()) "${speed.toInt()}.0×" else "$speed×"
@@ -1525,6 +1836,66 @@ private fun PlaybackOptionsSheet(
                 onClick = {
                     state.selectPlaybackSpeed(speed)
                     onDismiss()
+                },
+            )
+        }
+
+        // ── C-1（本轮）：桌面歌词 ──
+        //
+        // 这一组只在宿主接线后出现（`sys.desktopLyricsOn != null`）。桌面歌词此前
+        // 只藏在设置页「播放」组里，可发现性几乎为零——用户在播放页想要「让歌词浮到
+        // 桌面上」这个念头，正好发生在他看着歌词的时候，而那时面板是最自然的入口。
+        //
+        // ## 为什么开关与外观放在同一组
+        // 三者都是「桌面歌词长什么样/在不在」这一个话题。分两组会让面板顶部的
+        // 「定时关闭」与「播放速度」之间夹一段无关内容，反而更难扫。
+        //
+        // ## 为什么字号/透明度在**未开启时仍然显示**（而不是整组隐藏）
+        // 用户可以先调好外观再打开开关（预调）。隐藏的话他得「先开、再调、不满意再调」，
+        // 而悬浮窗每改一次都会立刻反映在桌面上——先调后开是更好的顺序。
+        // 但加了「未开启」的弱化提示，避免用户以为调了没生效。
+        val sys = LocalSystemActions.current
+        val lyricsOn = sys.desktopLyricsOn
+        if (lyricsOn != null) {
+            val on = lyricsOn()
+            GroupLabel("桌面歌词")
+            SheetAction(
+                // Home 图标：与设置页那一行同符号（悬浮在桌面上的字），
+                // 让用户在两个位置认出是同一件事
+                icon = GlassIcons.Home,
+                label = if (on) "桌面歌词已开启" else "开启桌面歌词",
+                subtitle = if (on) "悬浮在桌面，可拖动 · 点此关闭" else "让歌词浮在桌面上，需悬浮窗权限",
+                emphasized = on,
+                onClick = { sys.toggleDesktopLyrics?.invoke() },
+            )
+            // 字号
+            val fontStep = sys.desktopLyricsFontStep?.invoke() ?: DesktopLyricsStyle.DEFAULT_FONT_STEP
+            SheetAction(
+                icon = GlassIcons.Edit,
+                label = "歌词字号",
+                // 未开启时补一句弱化提示：让用户知道调了也会生效，只是现在还看不见
+                subtitle = DesktopLyricsStyle.FontSteps.getOrNull(fontStep)?.let {
+                    if (on) it else "$it · 开启后生效"
+                },
+                // 右侧显示当前档位名而不是箭头：这是「多选一」，告诉用户现在在哪一档
+                onClick = {
+                    // 循环切换而不是弹二级面板：5 档不值得再开一层。
+                    // 循环的好处是「一直点」能遍历所有档位，且总能回到起点。
+                    val next = (fontStep + 1).mod(DesktopLyricsStyle.FontSteps.size)
+                    sys.setDesktopLyricsFontStep?.invoke(next)
+                },
+            )
+            // 不透明度
+            val opStep = sys.desktopLyricsOpacity?.invoke() ?: DesktopLyricsStyle.DEFAULT_OPACITY_STEP
+            SheetAction(
+                icon = GlassIcons.Edit,
+                label = "歌词不透明度",
+                subtitle = DesktopLyricsStyle.OpacitySteps.getOrNull(opStep)?.let {
+                    if (on) it else "$it · 开启后生效"
+                },
+                onClick = {
+                    val next = (opStep + 1).mod(DesktopLyricsStyle.OpacitySteps.size)
+                    sys.setDesktopLyricsOpacity?.invoke(next)
                 },
             )
         }

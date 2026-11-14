@@ -72,10 +72,29 @@ android {
     val releaseStoreFile = secret("release.storeFile", "RELEASE_STORE_FILE")
     val hasReleaseSigning = releaseStoreFile != null && file(releaseStoreFile).isFile
 
+    // 本机 debug 签名覆盖：默认 debug keystore 位于 ~/.android，其 lock 文件在本机
+    // 沙箱/权限下无法被 AGP 排他加锁 → AccessDeniedException。改用工作区内的一份副本
+    // （同一证书、同一口令），构建产物签名不变。
+    //
+    // **必须有存在性判断**：`.tmp/` 是本机工作目录、不进版本库（见 .gitignore），
+    // 因此 CI / 他人 clone 上该文件不存在。无条件指向它会让 `assembleDebug` 在
+    // 签名阶段失败——而 CI 的整条流水线只做「构建 + 单测」，那等于仓库一 clone 就红。
+    // 找不到副本时回退 AGP 默认的 ~/.android/debug.keystore（Linux/macOS 上本来就可写）。
+    val localDebugKeystore = rootProject.file(".tmp/keystore/debug.keystore")
+    val hasLocalDebugKeystore = localDebugKeystore.isFile
+
     buildTypes {
         debug {
             // 与原 APK 调试变体一致：com.local.music.debug
             applicationIdSuffix = ".debug"
+            if (hasLocalDebugKeystore) {
+                signingConfig = signingConfigs.create("localdebug") {
+                    storeFile = localDebugKeystore
+                    storePassword = "android"
+                    keyAlias = "androiddebugkey"
+                    keyPassword = "android"
+                }
+            }
         }
         release {
             // 分发变体保持与已装基线同 ID 同签名：侧载 release 包 = 「更新」而非另装一个应用

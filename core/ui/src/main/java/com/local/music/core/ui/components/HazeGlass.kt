@@ -5,7 +5,11 @@ import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.unit.dp
+import com.local.music.core.ui.theme.AuroraPalette
+import com.local.music.core.ui.theme.GlassColors
+import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeStyle
@@ -56,14 +60,33 @@ val LocalHazeState = compositionLocalOf<HazeState?> { null }
  * ③退化设备上收益恒为 0。
  * 可读性保障仍在 [com.local.music.core.ui.theme.GlassColors.chromeScrim]。
  */
+/**
+ * Liquid 档的 haze tint 配方：低浓度白霜 + 歌曲 accent 色相。
+ *
+ * **跨模块 public 的唯一理由**：app 模块的飞行替身（`FlightGlassPanel`）落地端必须与
+ * 真身同源。替身旧实现落点是 Md 的纯 hi 白霜，交接窗内明度/色相会跳半档——配方复制
+ * 一份就是这个问题的温床，所以只留这一份，真身与替身都读它。
+ */
+fun liquidHazeTint(glass: GlassColors, palette: AuroraPalette): Color =
+    lerp(glass.liquidFill, palette.seed2.copy(alpha = 0.14f), 0.55f)
+
 @Composable
 fun Modifier.glassHaze(level: GlassLevel): Modifier {
     val state = LocalHazeState.current ?: return this
     val glass = LocalGlassColors.current
-    val style = remember(level, glass) {
+    val palette = LocalAuroraPalette.current
+    val style = remember(level, glass, palette) {
+        // Liquid（控制台） tint = 低浓度白霜 + 歌曲 accent 色相：背后已是真模糊的极光/照片，
+        // 纯白霜会把浅色罩成奶白卡、深色罩成灰卡（用户反馈「太偏黑/偏白」）。注入 seed2 色相
+        // 后玻璃读作「有色玻璃」，色彩来自当前歌曲而非固定白/黑。其余档保持纯填充色。
+        val tint = if (level == GlassLevel.Liquid) {
+            liquidHazeTint(glass, palette)
+        } else {
+            glass.fill(level)
+        }
         HazeStyle(
             backgroundColor = Color.Transparent,
-            tints = listOf(HazeTint(glass.fill(level))),
+            tints = listOf(HazeTint(tint)),
             blurRadius = when (level) {
                 GlassLevel.Hi -> 26.dp
                 GlassLevel.Md -> 20.dp
@@ -75,7 +98,7 @@ fun Modifier.glassHaze(level: GlassLevel): Modifier {
                 GlassLevel.Liquid -> 26.dp
             },
             noiseFactor = 0.05f,
-            fallbackTint = HazeTint(glass.fill(level)),
+            fallbackTint = HazeTint(tint),
         )
     }
     return hazeEffect(state = state, style = style)

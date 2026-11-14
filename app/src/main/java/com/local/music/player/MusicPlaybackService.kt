@@ -23,6 +23,7 @@ import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
 import com.local.music.MainActivity
+import com.local.music.core.ui.components.DesktopLyricsStyle
 import com.local.music.core.ui.state.AudioFxSettings
 import com.local.music.core.ui.state.SongSpec
 import com.local.music.lyrics.DesktopLyricsController
@@ -156,6 +157,7 @@ class MusicPlaybackService : MediaSessionService() {
                             .add(SessionCommand(CMD_SET_SLEEP_TIMER, Bundle.EMPTY))
                             .add(SessionCommand(CMD_SET_AUDIO_FX, Bundle.EMPTY))
                             .add(SessionCommand(CMD_SET_DESKTOP_LYRICS, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_SET_DESKTOP_LYRICS_STYLE, Bundle.EMPTY))
                             .build()
                         return MediaSession.ConnectionResult.accept(
                             sessionCommands,
@@ -234,11 +236,31 @@ class MusicPlaybackService : MediaSessionService() {
                             // 桌面歌词开关（P0-8）：show/hide 内部自兜全部异常，
                             // 失败（权限/ROM 拒绝）只影响歌词窗本身，不影响播放链路。
                             // **为什么只在这里做不进状态重放**：见 CMD_SET_DESKTOP_LYRICS 常量处注释
+                            //
+                            // 本轮（C-1/字号透明度）：先应用外观档位再 show。顺序很重要——
+                            // show() 会用当前档位构造初次 View（字号/alpha/触摸标志），
+                            // 反过来（先 show 再 applyStyle）会让首帧用默认外观闪一下。
+                            // 关闭方向也照样应用一次：值记在控制器里，下次打开直接是对的。
+                            desktopLyrics.applyStyle(
+                                font = args.getInt(KEY_DESKTOP_LYRICS_FONT, DesktopLyricsStyle.DEFAULT_FONT_STEP),
+                                opacity = args.getInt(KEY_DESKTOP_LYRICS_OPACITY, DesktopLyricsStyle.DEFAULT_OPACITY_STEP),
+                                lockPosition = args.getBoolean(KEY_DESKTOP_LYRICS_LOCKED, false),
+                            )
                             if (args.getBoolean(KEY_DESKTOP_LYRICS_ON, false)) {
                                 desktopLyrics.show()
                             } else {
                                 desktopLyrics.hide()
                             }
+                        } else if (customCommand.customAction == CMD_SET_DESKTOP_LYRICS_STYLE) {
+                            // 外观单独一条命令（本轮）：用户改字号/透明度时开关本来就是开的，
+                            // 复用开关命令也能工作（把 on 再传一遍），但那会让「改字号」隐式
+                            // 携带「确保打开」的语义——将来若有人给开关命令加副作用就会串味。
+                            // 单独一条命令各管一件事，读代码的人不必反推。
+                            desktopLyrics.applyStyle(
+                                font = args.getInt(KEY_DESKTOP_LYRICS_FONT, DesktopLyricsStyle.DEFAULT_FONT_STEP),
+                                opacity = args.getInt(KEY_DESKTOP_LYRICS_OPACITY, DesktopLyricsStyle.DEFAULT_OPACITY_STEP),
+                                lockPosition = args.getBoolean(KEY_DESKTOP_LYRICS_LOCKED, false),
+                            )
                         } else if (customCommand.customAction == CMD_INSERT_SHUFFLE_FIX) {
                             @Suppress("DEPRECATION", "UNCHECKED_CAST")
                             val specs = args.getSerializable(KEY_SPECS) as? ArrayList<SongSpec>
@@ -853,6 +875,17 @@ class MusicPlaybackService : MediaSessionService() {
          */
         const val CMD_SET_DESKTOP_LYRICS = "com.local.music.SET_DESKTOP_LYRICS"
         const val KEY_DESKTOP_LYRICS_ON = "desktopLyricsOn"
+
+        /**
+         * 桌面歌词**外观**单独命令（本轮）。与开关命令分开的理由见 [onCustomCommand] 内注释。
+         *
+         * 三个键名与开关命令共用同一组（[KEY_DESKTOP_LYRICS_FONT] 等）：两条命令
+         * 携带的是同一份外观参数，共用键名避免「同义不同名」的漂移。
+         */
+        const val CMD_SET_DESKTOP_LYRICS_STYLE = "com.local.music.SET_DESKTOP_LYRICS_STYLE"
+        const val KEY_DESKTOP_LYRICS_FONT = "desktopLyricsFont"
+        const val KEY_DESKTOP_LYRICS_OPACITY = "desktopLyricsOpacity"
+        const val KEY_DESKTOP_LYRICS_LOCKED = "desktopLyricsLocked"
 
         /**
          * 曲目 id 前缀约定：MediaLibrary 扫描写入的稳定 id = "f" + 文件绝对路径

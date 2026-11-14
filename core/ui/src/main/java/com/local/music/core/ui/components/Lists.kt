@@ -61,6 +61,7 @@ import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.auroraAccentColor
+import com.local.music.core.ui.theme.onSeedColor
 
 /**
  * SongRow 的行高（9dp 上下内边距 + 内容高度）——队列滚动定位与拖拽重排共享的数学基准。
@@ -290,6 +291,14 @@ fun GlassTabs(
 ) {
     val palette = LocalAuroraPalette.current
     val glass = LocalGlassColors.current
+    // A4 视觉审计：选中 tab 的底色是 palette.seed **实底**，前景必须由 onSeedColor() 按
+    // WCAG 对比度在「白 vs 近黑」里二选一。旧实现硬编码 Color.White：琥珀 #E0A800 /
+    // 草绿 #57A94A 等浅 seed 上白字只有 2.15:1/2.93:1 —— 「当前在哪一页」这个最高频的
+    // 状态指示反而成了全屏最难读的元素。详情页播放胶囊（PlaylistDetailScreen）与空态
+    // CTA（EmptyState）早已接线，唯独这里漏了；onSeedColor 的 KDoc 明确把 tab 选中态
+    // 列为必须消费点，web 参考实现 Glass.jsx 的 Segmented 用的也是 var(--on-seed)。
+    // 取值必须在组合期（onSeedColor 是 @Composable，读 LocalAuroraPalette）。
+    val onSeed = onSeedColor()
     Row(
         modifier
             .fillMaxWidth()
@@ -307,7 +316,7 @@ fun GlassTabs(
                 if (on) Color.Transparent else glass.strokeSoft, GlassMotion.tweenHover(), label = "tabBorder$index",
             )
             val textColor by animateColorAsState(
-                if (on) Color.White else LocalGlassColors.current.textSecondary, GlassMotion.tweenHover(), label = "tabText$index",
+                if (on) onSeed else glass.textSecondary, GlassMotion.tweenHover(), label = "tabText$index",
             )
             val shadowElevation by animateDpAsState(if (on) 6.dp else 0.dp, GlassMotion.tweenHover(), label = "tabShadow$index")
             Box(
@@ -645,9 +654,9 @@ fun SettingRow(
                     Modifier
                 },
             )
-            .padding(horizontal = S.Gap16.dp, vertical = S.Gap12.dp),
+            .padding(horizontal = S.Gap16.dp, vertical = S.Gap16.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
+        horizontalArrangement = Arrangement.spacedBy(S.Gap16.dp),
     ) {
         Box(
             Modifier
@@ -661,7 +670,7 @@ fun SettingRow(
         }
         Column(Modifier.weight(1f)) {
             Text(title, color = LocalGlassColors.current.textPrimary, style = GlassText.BodyMedium)
-            Spacer(Modifier.height(2.dp))
+            Spacer(Modifier.height(S.Gap4.dp))
             // B5：副标题补 maxLines = 2 —— 副标题里的「当前 x」状态说明（如导入/更新失败原因）
             // 文案长度不可控，此前换行无上限：长文案会折到 3 行以上，把整行撑高，
             // 相邻行的基线随之错位（设置页是密集列表，一处撑高整段看起来就"散"了）。

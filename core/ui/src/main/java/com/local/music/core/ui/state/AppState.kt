@@ -460,6 +460,40 @@ class AppState(
     /** 当前队列的播放来源展示名（曲库/歌单名/搜索…），播放页顶栏「来自」文案用 */
     var queueSource by mutableStateOf<String?>(null)
         private set
+
+    /**
+     * B-2（本轮）：[queueSource] 对应的详情页目标，供顶栏「来自「xx」」点击回跳。
+     *
+     * ## 为什么刻意**不进快照**
+     * 快照已封板到 v11（`VERSION` 与 137 条迁移测试钉死），为「一个跳转目标」升版
+     * 要补 encode/decode/legacy 三条路径，成本远超收益。而后果很轻：进程被杀后重启，
+     * 顶栏那行字仍显示（`queueSource` 在快照里），只是点击落到曲库首页——
+     * 这本来就是「来源不明」时的既定行为，不会出错。
+     *
+     * ## 为什么不用 `DetailTarget` 反查
+     * `queueSource` 是**展示名**（「通勤」「周杰伦的床边故事」），同名歌单/同名专辑
+     * 是合法的（见 LibraryGroup.id 的注释：专辑靠 (名, 专辑艺术家) 双键区分）。
+     * 用展示名反查会跳到「第一张同名的」，那是比不跳更糟的错。
+     */
+    var queueSourceTarget by mutableStateOf<DetailTarget?>(null)
+        private set
+
+    /**
+     * B-2：从播放页回到「这次播放的来源详情页」。
+     *
+     * 收在状态层而不是让 UI 自己拼 `closePlayer() + openDetail()`：
+     * 这两个动作的顺序与守卫（播放页必须由 closePlayer 收起，否则 playerOrigin
+     * 会被记成 Player，之后 closePlayer 原地打转，见该函数注释）是一处**不可拆的
+     * 时序约束**，散到调用点就一定会有人漏掉一半。
+     *
+     * 无来源目标（曲库整库播放/搜索播放）时收起播放页即可——`closePlayer()` 本来
+     * 就回 `playerOrigin`，那是这些场景的正确落点。
+     */
+    fun backToSource() {
+        val target = queueSourceTarget
+        closePlayer()
+        if (target != null) openDetail(target)
+    }
     /** 是否正在播放。
      *  **初值必须是 false**：旧实现是 true，于是「无曲库 / 权限拒绝」设备启动瞬间会按播放态
      *  渲染悬浮 Chrome 的波形与走动进度线（占位曲时长 1s，tick 约 1s 后走完才熄火），
@@ -540,19 +574,108 @@ class AppState(
         if (enabled) customSeedArgb = null
         scheduleSave()
     }
-    var lyricEnabled by mutableStateOf(true)
-    var glassLevel by mutableStateOf(GlassIntensity.Standard)
-    var motionLevel by mutableStateOf(MotionIntensity.Standard)
-    var eqPreset by mutableStateOf(EqPreset.Off)
+    /**
+     * 歌词域持有者（本轮从 AppState 拆出）。
+     *
+     * 与 [fx] 同款结构：状态与领域规则移入 holder，AppState 只保留**转发**，
+     * 让六屏既有调用点（`state.lyricEnabled` / `state.currentLyrics`）一个字不用改。
+     * 边界与取舍见 [LyricsHolder] 的 KDoc。
+     */
+    private val lyrics = LyricsHolder(onChanged = { scheduleSave() })
+
+    /** 歌词显示开关（转发） */
+    var lyricEnabled: Boolean
+        get() = lyrics.enabled
+        set(value) = lyrics.applyEnabled(value)
+
+    // ── 扫描结果一次性反馈（本轮新增）────────────────────────
+    /**
+     * 扫描完成后的一次性提示文案（「扫描完成，共 N 首」）。null = 没有待显示的结果。
+     *
+     * **为什么不进快照**：这是一个**瞬态事件**而不是设置状态。若进快照，进程被杀后重启
+     * 会把「上次扫描完成」重播一遍——用户看到的是一条与本次启动无关的通知。
+     * 同理它也不参与 `scheduleSave()` 的脏判定，读侧消费后立刻置 null（见
+     * [consumeScanResult]）。
+     *
+     * **为什么需要在状态层而不是设置页局部变量**：扫描由 GlassApp 发起，而用户此刻
+     * 通常停在曲库页——提示必须能跨屏显示（设置页的 `scanning` 局部态只服务那一行副标题）。
+     */
+    var scanResultToast by mutableStateOf<String?>(null)
+        private set
+
+    /** 消费（关闭）扫描结果提示。UI 侧自动消退计时到点、或用户点击时调用。 */
+    fun consumeScanResult() {
+        scanResultToast = null
+    }
 
     /**
-     * 音效链设置（响度归一 / 低音增强 / 虚拟环绕）：**默认全关**，见 [AudioFxSettings] 的
-     * 「为什么不默认开启」说明。改动一律经 [commitAudioFx]（由 setLoudnessNorm / setBassBoost /
-     * selectBassLevel / setVirtualizer / selectVirtualLevel 这几个公开 setter 调用）下发，
-     * 不要直接赋新值——直接赋值只改 UI 状态、服务端不知道，表现为「开关拨了没反应」。
+     * 记录一次成功的扫描结果：生成提示文案。
+     *
+     * 文案分两档（empty / named），因为「扫到 0 首」和「扫到 N 首」是**两种不同的结论**，
+     * 用同一句话概括会让用户在「曲库确实是空的」与「扫描坏了」之间无法分辨——
+     * 这正是 P1-2 那类静默失败最容易发生的观感来源。
+     *
+     * @param total 本次扫描落库的曲目数（**全量**，不含过滤——与 library 同口径）
      */
-    var audioFx by mutableStateOf(AudioFxSettings())
-        private set
+    fun reportScanResult(total: Int) {
+        scanResultToast = if (total > 0) "扫描完成，共 $total 首" else "扫描完成，但没有找到音频文件"
+    }
+
+    /**
+     * 被过滤条件排除的曲目数 = 整库 − 可见曲库。
+     *
+     * 用途只有一个：曲库空态在**确实有歌但被滤掉**时给出可行动的解释。
+     * 用户在设置里排除过一个目录/开着短音频过滤后忘了，看到空曲库会以为扫描坏了——
+     * 旧空态文案「可能还没有扫描，或扫描结果被过滤条件排除了」把两种原因混在一起，
+     * 用户既不能确认是哪种、也不知道去哪里改。
+     *
+     * 为什么在这里算而不是调用方各算：过滤口径（排除目录 + 短音频阈值）只在
+     * [visibleLibrary] 一处权威，调用方自己减会绕开它的缓存与将来的第三类过滤条件。
+     */
+    val filteredOutCount: Int
+        get() {
+            val all = library.size
+            if (all == 0) return 0
+            return (all - visibleLibrary().size).coerceAtLeast(0)
+        }
+
+    var glassLevel by mutableStateOf(GlassIntensity.Standard)
+    var motionLevel by mutableStateOf(MotionIntensity.Standard)
+    /**
+     * 音效设置（外部视图）：委托给 [fx] 持有者。
+     *
+     * ## 本轮拆域说明
+     * 音效域的**状态与动作**已整体移入 [AudioFxHolder]，这里只保留一层**转发**，
+     * 目的是让六屏的既有调用点（`state.eqPreset` / `state.audioFx` / `state.setBassBoost(...)`）
+     * **一个字都不用改**。
+     *
+     * 为什么不做「彻底删除转发、让 UI 直接持有 AudioFxHolder」：
+     * 那需要把 holder 经 CompositionLocal 或参数下发到 6 个屏 + 2 个面板，
+     * 而这些屏同时还要读 AppState 的其它几百个成员——等于把「单源状态」拆成
+     * 「双源」，每次加功能都要想「这个放哪边」。转发一层只有 10 行，
+     * 却保住了「UI 只认识 AppState 一个对象」这条已确立的边界。
+     *
+     * 换句话说：**拆的是实现（2900 行里的音效逻辑独立成文件），不是接口。**
+     */
+    private val fx = AudioFxHolder(
+        // 两个回调都写成 lambda 而不是取出 engine 的局部量：
+        // engine 会在 attachPlayer 时被替换，闭包里必须读**当下**的 engine
+        // （成员属性访问在 lambda 内每次求值，天然满足）
+        onApply = { next -> engine?.setAudioFx(next) },
+        onChanged = { scheduleSave() },
+    ).apply {
+        // EQ 下发与音效链是服务端的两条不同命令（Equalizer.Preset vs audiofx 三件套），
+        // 所以在构造后单独接线。为什么不在构造参数里给：那个参数与 onApply 形状不同
+        // （它要一个 EqPreset），硬合并成「一个接受 Any 的回调」反而更差。
+        bindEqApplier { preset -> engine?.setEqPreset(preset.name) }
+    }
+
+    /** 均衡器预设（转发） */
+    val eqPreset: EqPreset get() = fx.eqPreset
+
+    /** 音效链设置（转发） */
+    val audioFx: AudioFxSettings get() = fx.settings
+
     var playbackSpeed by mutableFloatStateOf(1f) // 播放速度档（快照 v5 持久化；服务端 Sonic 变速不变调）
         private set
     var themeMode by mutableStateOf(ThemeMode.Dark)
@@ -717,17 +840,25 @@ class AppState(
     /**
      * 当前歌的歌词：队列为空（占位曲）不给词；有 uri 的真曲给 .lrc/内嵌词，
      * 没有则 null（播放页显示「纯音乐，请欣赏」空态）
+     *
+     * 三条判据已下沉到 [LyricsHolder.visibleLyricsOf]（领域规则集中在 holder 里，
+     * 桌面临时歌词/小部件将来可取同一套判定），这里只负责提供输入。
      */
     val currentLyrics: List<LyricLine>?
-        get() = when {
-            queue.isEmpty() -> null
-            currentSong.mediaUri == null -> null
-            else -> currentSong.lyricLines
-        }
+        get() = LyricsHolder.visibleLyricsOf(
+            queueIsEmpty = queue.isEmpty(),
+            hasMediaUri = currentSong.mediaUri != null,
+            lyrics = currentSong.lyricLines,
+        )
 
-    /** 当前行歌词 = 最后一条 timeSec <= 进度（无歌词时无意义） */
+    /**
+     * 当前行歌词 = 最后一条 timeSec <= 进度（无歌词时无意义）
+     *
+     * 算法已下沉到 [LyricsHolder.indexOf]（二分查找，与桌面歌词控制器同一套算法——
+     * 两处不一致会出现「App 内第 12 行、桌面歌词第 11 行」的差一错误）。
+     */
     val currentLyricIndex: Int
-        get() = (currentLyrics ?: emptyList()).indexOfLast { it.timeSec <= progressSec }.coerceAtLeast(0)
+        get() = LyricsHolder.indexOf(currentLyrics ?: emptyList(), progressSec)
 
     // ── 真曲库装载 ────────────────────────────────────────
 
@@ -1257,13 +1388,16 @@ class AppState(
 
     /** 设置指纹：GlassApp 用 snapshotFlow 监听设置变更触发存盘 */
     fun settingsKey(): String =
-        "$followCover|$lyricEnabled|${glassLevel.name}|${motionLevel.name}|${eqPreset.name}|${themeMode.name}|" +
+        "$followCover|$lyricEnabled|${glassLevel.name}|${motionLevel.name}|${themeMode.name}|" +
             // 背景来源与照片 uri 必须进指纹：否则「只换了背景图」不会触发存盘，
             // 重启后回到上一张（用户会以为选择没生效）
             "${backgroundMode.name}|${backgroundPhotoUri.orEmpty()}|" +
             "$shuffleOn|${repeatMode.name}|$playbackSpeed|$scanFilterShort|$customSeedArgb|${queueSource.orEmpty()}|" +
-            // 音效链也要进指纹：否则「只拨音效开关」不会触发存盘，重启后开关回弹（用户会以为设置没保存）
-            "$audioFx|" +
+            // 音效域（EQ + 音效链）也要进指纹：否则「只拨音效开关」不会触发存盘，
+            // 重启后开关回弹（用户会以为设置没保存）。
+            // 用 holder 的 keyPart() 而不是在这里拼字段：音效域将来加成员时
+            // 只需改 holder 一处，不会漏进指纹。
+            "${fx.keyPart()}|" +
             excludedFolders.joinToString(",")
 
     fun snapshot(): AppStateSnapshot {
@@ -1348,17 +1482,15 @@ class AppState(
     /** 恢复快照：设置/收藏/历史/歌单立即生效；播放现场由 applyPendingPlayback 应用（幂等） */
     fun restore(snapshot: AppStateSnapshot) {
         followCover = snapshot.followCover
-        lyricEnabled = snapshot.lyricEnabled
+        lyrics.restore(snapshot.lyricEnabled)
         glassLevel = runCatching { GlassIntensity.valueOf(snapshot.glassLevel) }.getOrDefault(GlassIntensity.Standard)
         motionLevel = runCatching { MotionIntensity.valueOf(snapshot.motionLevel) }.getOrDefault(MotionIntensity.Standard)
-        eqPreset = runCatching { EqPreset.valueOf(snapshot.eqPreset) }.getOrDefault(EqPreset.Off)
-        // 音效链（v10）：旧版本（≤v9）备份没有该字段 → 解码走默认值 = 全关，用户听感不变。
-        // 档位索引做一次钳制：万一备份来自改过档位数的版本，越界索引会落在数组外（崩溃），
-        // AudioFxSettings 的 safeBassLevel/safeVirtualLevel 在读取侧已兜住，这里再归一一次存下来，
-        // 保证快照里存的值始终合法（避免把一个坏索引反复写回磁盘）。
-        audioFx = snapshot.audioFx.copy(
-            bassLevel = snapshot.audioFx.safeBassLevel,
-            virtualLevel = snapshot.audioFx.safeVirtualLevel,
+        // 音效域（EQ 预设 + 音效链）整体交给 holder 恢复：
+        // 枚举名容错、档位钳制、以及「恢复不触发下发/存盘」这三件事都在 holder 内部收敛
+        // （见 AudioFxHolder.restore 的 KDoc）。
+        fx.restore(
+            preset = runCatching { EqPreset.valueOf(snapshot.eqPreset) }.getOrDefault(EqPreset.Off),
+            fx = snapshot.audioFx,
         )
         themeMode = runCatching { ThemeMode.valueOf(snapshot.themeMode) }.getOrDefault(ThemeMode.Dark)
         // 背景来源（v11）：旧版本（≤v10）无这两字段 → 默认极光 + 无照片，用户观感不变。
@@ -1726,10 +1858,30 @@ class AppState(
     }
 
     /** 播放指定曲目；context 为其所在队列（同队列引用时仅切索引）；source 为播放来源展示名 */
-    fun playSong(song: DemoSong, context: List<DemoSong> = queue, source: String? = null) {
+    fun playSong(
+        song: DemoSong,
+        context: List<DemoSong> = queue,
+        source: String? = null,
+        /**
+         * B-2（本轮）：这次播放的**来源详情页目标**（专辑/艺术家/文件夹/流派/歌单）。
+         *
+         * 播放页顶栏一直显示「来自「歌单名」」，但那行字改不了——用户看到「来自『通勤』」
+         * 却无法点它回到那张歌单。这个字段就是那行字的**目的地**。
+         *
+         * 为 null 的含义是「没有可回去的详情页」（曲库整库播放、搜索直接播放），
+         * 此时顶栏点击落到曲库首页——与[queueSource]为 null 时显示「本地音乐」一致。
+         *
+         * **为什么不进快照**：详见 [queueSourceTarget] 的 KDoc。
+         */
+        sourceTarget: DetailTarget? = null,
+    ) {
         val queueChanged = context !== queue
         if (queueChanged) queue = context
         if (source != null) queueSource = source
+        // 来源目标与来源名必须**同源更新**：只在 source != null 时写，是为了避免
+        // 「从队列面板点播（不传 source）」把上一次的来源覆写成 null——那种播法
+        // 并没有换语境，顶栏该继续显示原来的「来自『xx』」。
+        if (source != null) queueSourceTarget = sourceTarget
         // indexOf 找不到时返回 -1：旧写法 coerceAtLeast(0) 会静默改成队首，于是「要播的歌不在
         // 传入 context 里」这种调用方 bug 表现为「点了 A 播了 B」，且没有任何痕迹。
         // 宁可原地不动（不切歌、不改索引），也不播错——当前各调用点传参都正确，这是边界守卫。
@@ -1873,6 +2025,27 @@ class AppState(
 
     fun seekToFraction(fraction: Float) = seekTo(fraction * durationSec)
 
+    /**
+     * 相对跳转（B-1 本轮新增）：在当前位置上快进/快退 [deltaSec] 秒。
+     *
+     * 为什么不直接在 UI 里写 `seekTo(progressSec + 10)`：`progressSec` 是**高频变化**的
+     * 播放进度（100ms 心跳），若在组合期读它算目标值，整个调用点会每 tick 重组一次
+     * ——这正是本仓反复点名的错误写法（见 ProgressTrack 的「绘制期读」注释）。
+     * 把手势发生那一刻的读与写都收在状态层内部，UI 侧只需要传一个常量。
+     *
+     * 钳制交给 [seekTo]：它对 `coerceIn(0f, durationSec)` 已经是权威，
+     * 这里不重复实现（否则两处阈值将来会漂移）。
+     *
+     * @return 目标秒数（已钳制），供 UI 显示「-10s / +10s」反馈时使用
+     */
+    fun seekBy(deltaSec: Float): Float {
+        // 空队列/占位曲：没有可 seek 的东西（与 seekTo 的守卫同源）
+        if (!hasSongs) return progressSec
+        val target = (progressSec + deltaSec).coerceIn(0f, durationSec)
+        seekTo(target)
+        return target
+    }
+
     /** 演示模式完播（引擎路径的完播 / 单曲循环由服务端播放器承担） */
     private fun handleTrackEnd() {
         // 完播计数（D1）：只在真正播到结尾时 +1，手动切歌/拖动进度不计
@@ -1966,53 +2139,35 @@ class AppState(
     /** 均衡器预设：立即下发服务端（Off = 关闭音效），不等下一首歌装载。
      *  命名避开 var eqPreset 的 JVM setter（setEqPreset）签名冲突 */
     fun selectEqPreset(preset: EqPreset) {
-        eqPreset = preset
-        engine?.setEqPreset(preset.name)
-        scheduleSave()
+        // 转发给音效域持有者：它负责「去重 → 落状态 → 下发 → 存盘」的完整链路
+        // （见 AudioFxHolder.selectEqPreset）。EQ 的下发回调已在构造期接线。
+        fx.selectEqPreset(preset)
     }
 
     /**
-     * 音效链：立即下发服务端 + 记快照。
+     * 音效链：立即下发服务端 + 记快照（转发给 [fx]）。
      *
-     * **为什么每项都单独给 setter 而不是让 UI 直接改 `audioFx = ...`**：
-     * `audioFx` 是 private set，UI 改不了；所有改动必须经过这里，才能保证
-     * 「状态变了 → 服务端一定收到」这条不变量。旧实现的 EQ 就有过直接给 `eqPreset` 赋值
+     * **为什么每项都单独给 setter 而不是让 UI 直接改**：
+     * `audioFx` 现在是只读转发属性，UI 改不了；所有改动必须经过这里，才能保证
+     * 「状态变了 → 服务端一定收到」这条不变量。旧实现的 EQ 就有过直接赋值
      * 导致「界面显示切了、实际没下发」的窗口，这里从类型上堵死。
      *
-     * 三项都走同一个 [commitAudioFx]：内容未变时**不重复下发**（拨同一档不该产生 binder 流量，
-     * 也让 [settingsKey] 的指纹在无实际变化时保持稳定，避免触发多余存盘）。
+     * 五项都走 holder 的同一个提交口：内容未变时**不重复下发**（拨同一档不该产生
+     * binder 流量，也让 [settingsKey] 的指纹在无实际变化时保持稳定）。
      */
-    fun setLoudnessNorm(enabled: Boolean) {
-        commitAudioFx(audioFx.copy(loudnessNorm = enabled))
-    }
+    fun setLoudnessNorm(enabled: Boolean) = fx.setLoudnessNorm(enabled)
 
     /** 低音增强开关 */
-    fun setBassBoost(enabled: Boolean) {
-        commitAudioFx(audioFx.copy(bassBoost = enabled))
-    }
+    fun setBassBoost(enabled: Boolean) = fx.setBassBoost(enabled)
 
     /** 低音强度档位（索引，越界自动钳制到合法档） */
-    fun selectBassLevel(level: Int) {
-        commitAudioFx(audioFx.copy(bassLevel = level.coerceIn(0, BassBoostStrengths.lastIndex)))
-    }
+    fun selectBassLevel(level: Int) = fx.selectBassLevel(level)
 
     /** 虚拟环绕开关 */
-    fun setVirtualizer(enabled: Boolean) {
-        commitAudioFx(audioFx.copy(virtualizer = enabled))
-    }
+    fun setVirtualizer(enabled: Boolean) = fx.setVirtualizer(enabled)
 
     /** 虚拟环绕强度档位 */
-    fun selectVirtualLevel(level: Int) {
-        commitAudioFx(audioFx.copy(virtualLevel = level.coerceIn(0, VirtualizerStrengths.lastIndex)))
-    }
-
-    /** 音效链唯一提交口：去重 → 落 UI 状态 → 下发服务端 → 存盘 */
-    private fun commitAudioFx(next: AudioFxSettings) {
-        if (next == audioFx) return
-        audioFx = next
-        engine?.setAudioFx(next)
-        scheduleSave()
-    }
+    fun selectVirtualLevel(level: Int) = fx.selectVirtualLevel(level)
 
     /** 播放速度：立即下发服务端（Media3 原生 Sonic 变速不变调）。
      *  命名避开 var playbackSpeed 的 JVM setter（setPlaybackSpeed）签名冲突 */
@@ -2201,11 +2356,145 @@ class AppState(
         scheduleSave()
     }
 
+    /**
+     * 「清空接下来」的一次性撤销现场（A-3 本轮新增）。
+     *
+     * ## 为什么需要它
+     * `clearUpNext()` 是**破坏性且不可撤销**的操作：用户可能刚攒了 50 首待播，
+     * 误触「清空」两个字，整个听单安排就没了——而它连一次确认都没有
+     * （改动前连提示都没有，面板关掉后无任何痕迹）。加确认弹窗更糟：
+     * 队列编辑是高频轻操作，「确定要清空吗」会把每次正常使用都拖慢一步。
+     * 撤销窗口是这类操作的标准答案——默认执行、给 4 秒反悔期。
+     *
+     * ## 为什么存整份 Song 而不是 id
+     * 撤销要能把队列**原样**插回（含 id 之外的展示字段）。存 id 再查曲库看似更省，
+     * 但被清掉的曲目可能随后从曲库消失（用户同时删了文件/重扫），那时撤销会插回
+     * 一批失效条目——而这些歌**当时确实在队列里**，撤销的语义就是「回到那一刻」。
+     *
+     * ## 为什么要带队列版本戳
+     * 撤销窗口期内用户可能又做了别的编辑（拖一行、播一首、加歌）。此时把旧队列片段
+     * 插回去会得到一个「既不等于清空前、也不等于当前」的第三种状态，比不给撤销更糟。
+     * 所以暂存时记下当时的队列指纹，撤销前比对；不一致就明确拒绝并告知，
+     * 而不是悄悄做一件用户没预期的事。
+     */
+    private data class ClearedUpNext(
+        val songs: List<DemoSong>,
+        val fromIndex: Int,
+        /**
+         * 清空**完成之后**的队列指纹，用于判定「现场是否还成立」。
+         *
+         * ## 为什么记的是清空后而不是清空前
+         * 撤销的有效条件是「队列除了那次清空之外没被别人动过」。校验时刻的队列状态
+         * 是「已清空」，所以基准必须是**同一时刻**的快照——若记清空前，那么一切正常
+         * 的撤销请求都会因为「指纹变了」被拒绝（撤销功能彻底不可用）。
+         *
+         * 这是本功能的**唯一核心判据**，第一版写反过（记清空前），单测立刻抓到。
+         */
+        val fingerprint: Int,
+    )
+
+    private var clearedUpNext: ClearedUpNext? = null
+
+    /**
+     * 队列指纹：只取「顺序 + 身份」，不含进度等高频变化字段。
+     *
+     * 用 `List.hashCode()` 而不是自己拼字符串：队列可能是几千首，字符串拼接会在
+     * 每次编辑时分配大量临时对象；而 `DemoSong` 是 data class（equals/hashCode 按
+     * 全部构造参数），引用相等时 List.hashCode 走的是逐元素 equals——对「内容没变」
+     * 的判定足够严格。
+     */
+    private fun queueFingerprint(): Int = queue.hashCode() * 31 + queueIndex
+
+    // ── 撤销窗口的计时（A-3）──────────────────────────────────
+    //
+    // **为什么不用协程计时**：AppState 是纯 Kotlin 状态层（不依赖 Android，靠注入 clock
+    // 才可单测，见构造参数 KDoc）。若在这里 `launch { delay(4000) }`，就需要引入一个
+    // 协程作用域——那既破坏「纯状态层」这条已确立的边界，也让「4 秒后窗口关闭」这件事
+    // 在单测里不可断言（除非再注入一个 TestScope）。
+    //
+    // 改用**期限 + 注入时钟**：清空时记一个 deadline，`canUndoClearUpNext` 做成按当前
+    // 时钟判断的只读派生值。好处是：
+    //   1. 零新增并发原语，单测推进 `now` 就能验证过期语义；
+    //   2. 窗口在**任何一次读取**时自动失效，不依赖「有没有人恰好跑了计时器」
+    //      ——即使 UI 一直没重组，用户点撤销时也一定会被期限拦下。
+    //
+    // 4 秒取值：与主流撤销条（Material Snackbar 默认 4s）一致。短于 3s 用户在读完
+    // 「已清空 N 首」之前就没了；长于 6s 会让「清空」看起来像需要确认的重操作，
+    // 反而拖慢高频的队列编辑。
+    private var undoDeadlineMs = 0L
+
+    /**
+     * 撤销提示是否**当前仍有效**（窗口未超时）。
+     *
+     * 做成计算属性而不是持久布尔：过期是时间的函数，不是某次事件的结果。
+     * 若用布尔 + 计时器置 false，就得保证计时器一定被启动、且不会被面板的
+     * 生命周期取消（这正是把它放在状态层的理由）。
+     */
+    val canUndoClearUpNext: Boolean
+        get() = undoClearUpNextCount > 0 && clearedUpNext != null && clock() < undoDeadlineMs
+
+    /** 撤销条上显示的条数（0 表示无可用撤销） */
+    var undoClearUpNextCount by mutableIntStateOf(0)
+        private set
+
+    /**
+     * 关闭撤销窗口（超时 / 用户点了别处 / 已撤销 / 现场失效）。
+     *
+     * 只清 UI 门面与暂存，不动队列——调用方按语义自行决定后续。
+     */
+    fun dismissUndoClearUpNext() {
+        clearedUpNext = null
+        undoClearUpNextCount = 0
+        undoDeadlineMs = 0L
+    }
+
+    /**
+     * 撤销上一次「清空接下来」：把被清掉的曲目原样插回当前曲之后。
+     *
+     * @return true = 已插回；false = 现场已失效（超时 / 队列在此期间被改过 / 没有可撤销现场）
+     *
+     * 失败**不静默**：调用方据此给用户一句「队列已变化，无法撤销」。静默返回 false
+     * 会让用户以为撤销按钮坏了。
+     */
+    fun undoClearUpNext(): Boolean {
+        val pending = clearedUpNext ?: return false
+        // 过期与现场失效用同一个返回值：对用户而言两者都是「这一下没能撤销」，
+        // 而撤销条会立刻消失（见调用点），他本来也只需要这一个结论。
+        val valid = clock() < undoDeadlineMs && pending.fingerprint == queueFingerprint()
+        dismissUndoClearUpNext()
+        if (!valid) return false
+        // 插回位置 = 当前曲之后。清空前后 queueIndex 不变（clearUpNext 只 take 前缀），
+        // 所以这里再钳一次即可（防御：万一现场期间的编辑让索引越界）
+        val at = (queueIndex + 1).coerceIn(0, queue.size)
+        if (engineDriving() && alignQueueWithEngine()) {
+            // 服务端也要插回：pinLast = true 表达「这些是原样的待播段」，随机模式下
+            // 不应被洗牌序拆散到当前曲之前（与「下一首播放全部」同款意图）
+            engine!!.addQueueItems(at, pending.songs.mapNotNull { it.toSpec() }, pinLast = true)
+        }
+        queue = queue.toMutableList().apply { addAll(at, pending.songs) }
+        scheduleSave()
+        return true
+    }
+
     /** 清空「接下来」：保留已播前缀与当前曲，移除其后全部 */
     fun clearUpNext() {
         if (queueIndex >= queue.lastIndex) return
+        // A-3：先把待清的片段与「清空瞬间」的队列指纹存下来。
+        // 指纹必须在**改动队列之前**取——改动后取到的就是「清空后」的状态，
+        // 那样撤销校验永远成立（等于没有校验）。
+        val removed = queue.drop(queueIndex + 1)
         if (engineDriving() && alignQueueWithEngine()) engine!!.removeQueueItems(queueIndex + 1, queue.size)
+        // 先把队列改成清空后的状态，再取指纹——指纹必须是「撤销窗口开始时的队列」，
+        // 也就是**清空后**的快照。理由见 ClearedUpNext.fingerprint 的 KDoc。
         queue = queue.take(queueIndex + 1)
+        clearedUpNext = ClearedUpNext(
+            songs = removed,
+            fromIndex = queueIndex + 1,
+            fingerprint = queueFingerprint(),
+        )
+        undoClearUpNextCount = removed.size
+        // 有东西可撤才开窗；空片段（理论上进不来，queueIndex 已守卫）不开
+        undoDeadlineMs = if (removed.isNotEmpty()) clock() + UNDO_WINDOW_MS else 0L
         scheduleSave()
     }
 
@@ -2835,5 +3124,13 @@ class AppState(
          * 状态层不能反向依赖 app 模块，故此处留同值常量；改阈值时两处一起改。
          */
         const val MIN_TRACK_SEC = 30
+
+        /**
+         * 「清空接下来」的撤销窗口（A-3）：4 秒。
+         *
+         * 取值依据见 [undoDeadlineMs] 的 KDoc：与 Material Snackbar 默认时长一致，
+         * 足够读完「已清空 N 首」并决定要不要反悔，又不至于让高频队列编辑变慢。
+         */
+        private const val UNDO_WINDOW_MS = 4_000L
     }
 }

@@ -20,9 +20,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.Role
@@ -36,6 +38,7 @@ import com.local.music.core.ui.theme.GlassColors
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.onSeedColor
 
 /**
  * 玻璃层级。
@@ -81,38 +84,48 @@ internal fun GlassColors.fill(level: GlassLevel): Color = when (level) {
     GlassLevel.Hi -> hi
     GlassLevel.Md -> md
     GlassLevel.Lo -> lo
-    // Liquid 的「填充」取 hi：它的差异化**全部在装饰层**（方向性斜面 + specular），
-    // 不在填充浓度。若这里另取一个更亮的值，会与「Liquid 是装饰语言而非亮度档」
-    // 这条定义冲突，也让「玻璃强度」设置的缩放失去可比性。
-    GlassLevel.Liquid -> hi
+    // Liquid 的「填充」取 hi 的**低浓度版**：控制台背后现在是真模糊的极光/照片
+    // （GlassApp 把覆盖层背景挂进了 playerHaze 源），玻璃的色彩与纵深应来自被模糊的
+    // 背景本身。旧值直接取 hi（浅 60% 白 / 深 16% 白）会把模糊背景罩成奶白/灰平板
+    // （用户反馈「太偏黑/偏白」）；降到 35% 浓度后背景色相透出、读作有色玻璃，
+    // 透字由真模糊承担而非靠厚填充压死。差异化装饰（斜面+specular）不受影响。
+    GlassLevel.Liquid -> hi.copy(alpha = hi.alpha * 0.35f)
 }
 
 /**
- * 液态档的**方向性斜面 + specular**，一笔画完（`drawWithCache` 保 Brush 帧间复用）。
+ * Liquid 档的填充色（跨模块 public：app 模块的飞行替身必须画同一个端点）。
  *
- * ## 层序为什么必须在这里
- *
- * 本修饰符要挂在 `clip(shape)` **之后**、内容**之前**（与 [glassTopLine]/haze 同一段）。
- * 边缘四笔用 `drawLine` 贴着节点边界画，被 clip 裁掉圆角外的部分——这正是要的：
- * 圆角处斜面自然跟着弧线走，不需要为 RoundedCornerShape 单独算路径。
- *
- * ## specular 的「动态」来源
- *
- * [motion] 是 0..1 的连续值（播放进度 / 歌词滚动 / 无限漂移都可以），只用来平移亮斑
- * 的横向位置与缩放半径。**必须由调用方以绘制期可读的形式提供**（lambda 或
- * `() -> Float`），不要传一个组合期读的动画值——那会让整块玻璃每次动画帧都重组。
- * 这里接收的是 `() -> Float`，在 `onDrawBehind` 内逐帧读取（绘制期），零重组。
- *
- * ## 性能红线
- *
- * 所有 Brush 都在 `drawWithCache` 的 cache 块里构造（只依赖 size/颜色），帧间复用；
- * `onDrawBehind` 内只做 draw 调用。这是本仓既定红线（见 [glassTopLine]、
- * [com.local.music.core.ui.components.AuroraBackground] 的同款说明）。
+ * 真身（[GlassSurface] 的 `level = Liquid`）与替身（`FlightGlassPanel` 的 t=1 端）
+ * 一旦填充色不一致，落地交叉淡化窗内玻璃明度会跳半档——这正是替身层 KDoc 警告的
+ * 「任何一层差一档」。所以配方只留这一份，替身读它而不是复制 0.35f。
  */
-private fun Modifier.liquidGlassDecor(
-    glass: GlassColors,
-    motion: () -> Float,
-): Modifier = drawWithCache {
+val GlassColors.liquidFill: Color get() = fill(GlassLevel.Liquid)
+
+/**
+ * 液态档装饰的笔刷集：只在 `drawWithCache` 的 cache 块里构造一次，绘制期帧间复用。
+ *
+ * 为什么抽成独立类型：飞行替身（app 模块的 `PlayerFlightOverlay.FlightGlassPanel`）的
+ * 落点端也是 Liquid，需要画**同一套**方向性斜面 + specular。如果替身自己复制一份笔刷
+ * 构造，就又是「改真身忘改对端」的温床；共用这个 holder 后，两处只共享反证过的事实。
+ *
+ * 跨模块 public（而非 internal）的唯一理由：真身在本模块、替身在 app 模块，两者必须
+ * 同源。它不是给业务代码直接调用的绘制 API，普通调用方请用 [GlassSurface]。
+ */
+class LiquidGlassBrushes(
+    val top: Brush,
+    val bottom: Brush,
+    val left: Brush,
+    val right: Brush,
+    val specular: Brush,
+)
+
+/** 构造 [LiquidGlassBrushes]；**必须在 drawWithCache 的 cache 块里调用**（零 Shader 分配红线）。
+ *
+ * 参数是 `size` 而不是 DrawScope receiver：drawWithCache 的 cache 块 receiver 是
+ * `CacheDrawScope`（只提供 size/density，不是 DrawScope），把尺寸显式传入可以让真身
+ * （liquidGlassDecor）与飞行替身（FlightGlassPanel）共用同一个构造器。
+ */
+fun liquidGlassBrushes(glass: GlassColors, size: Size): LiquidGlassBrushes {
     val w = size.width
     val h = size.height
     val sideInset = w * 0.10f
@@ -143,33 +156,77 @@ private fun Modifier.liquidGlassDecor(
         center = Offset.Zero,
         radius = 1f,
     )
-    val strokeWidth = 1.dp.toPx()
-    onDrawBehind {
-        // ── 1. specular（最先画，在边缘之下）──
-        // 亮斑中心在右上偏内；motion 让它在横向小幅漂移（±6% 宽）并轻微呼吸。
-        val t = motion().coerceIn(0f, 1f)
-        val cx = w * (0.74f + 0.06f * (t - 0.5f) * 2f)
-        val cy = h * 0.16f
-        val rx = w * (0.42f + 0.05f * t)
-        val ry = h * 0.30f
-        withTransform({
-            translate(cx, cy)
-            scale(rx, ry, pivot = Offset.Zero)
-        }) {
-            drawCircle(brush = specularBrush, radius = 1f, center = Offset.Zero)
-        }
+    return LiquidGlassBrushes(topBrush, bottomBrush, leftBrush, rightBrush, specularBrush)
+}
 
-        // ── 2. 方向性斜面（顶亮 / 侧中 / 底暗）──
-        drawLine(topBrush, Offset(0f, strokeWidth / 2f), Offset(w, strokeWidth / 2f), strokeWidth)
-        drawLine(
-            bottomBrush,
-            Offset(0f, h - strokeWidth / 2f), Offset(w, h - strokeWidth / 2f), strokeWidth,
-        )
-        drawLine(leftBrush, Offset(strokeWidth / 2f, 0f), Offset(strokeWidth / 2f, h), strokeWidth)
-        drawLine(
-            rightBrush,
-            Offset(w - strokeWidth / 2f, 0f), Offset(w - strokeWidth / 2f, h), strokeWidth,
-        )
+/**
+ * 画液态档的 specular + 方向性斜面（1px 贴边）。
+ *
+ * [alpha] 用于飞行替身的落地端淡入（真身恒 1）；[motion] 是 0..1 的连续光影驱动值，
+ * 必须来自绘制期可读的 lambda。
+ */
+fun DrawScope.drawLiquidGlass(brushes: LiquidGlassBrushes, motion: Float, alpha: Float) {
+    val w = size.width
+    val h = size.height
+    val strokeWidth = 1.dp.toPx()
+    // ── 1. specular（最先画，在边缘之下）──
+    // 亮斑中心在右上偏内；motion 让它在横向小幅漂移（±6% 宽）并轻微呼吸。
+    val t = motion.coerceIn(0f, 1f)
+    val cx = w * (0.74f + 0.06f * (t - 0.5f) * 2f)
+    val cy = h * 0.16f
+    val rx = w * (0.42f + 0.05f * t)
+    val ry = h * 0.30f
+    withTransform({
+        translate(cx, cy)
+        scale(rx, ry, pivot = Offset.Zero)
+    }) {
+        drawCircle(brush = brushes.specular, radius = 1f, center = Offset.Zero, alpha = alpha)
+    }
+
+    // ── 2. 方向性斜面（顶亮 / 侧中 / 底暗）──
+    drawLine(brushes.top, Offset(0f, strokeWidth / 2f), Offset(w, strokeWidth / 2f), strokeWidth, alpha = alpha)
+    drawLine(
+        brushes.bottom,
+        Offset(0f, h - strokeWidth / 2f), Offset(w, h - strokeWidth / 2f),
+        strokeWidth, alpha = alpha,
+    )
+    drawLine(brushes.left, Offset(strokeWidth / 2f, 0f), Offset(strokeWidth / 2f, h), strokeWidth, alpha = alpha)
+    drawLine(
+        brushes.right,
+        Offset(w - strokeWidth / 2f, 0f), Offset(w - strokeWidth / 2f, h),
+        strokeWidth, alpha = alpha,
+    )
+}
+
+/**
+ * 液态档的**方向性斜面 + specular**，一笔画完（`drawWithCache` 保 Brush 帧间复用）。
+ *
+ * ## 层序为什么必须在这里
+ *
+ * 本修饰符要挂在 `clip(shape)` **之后**、内容**之前**（与 [glassTopLine]/haze 同一段）。
+ * 边缘四笔用 `drawLine` 贴着节点边界画，被 clip 裁掉圆角外的部分——这正是要的：
+ * 圆角处斜面自然跟着弧线走，不需要为 RoundedCornerShape 单独算路径。
+ *
+ * ## specular 的「动态」来源
+ *
+ * [motion] 是 0..1 的连续值（播放进度 / 歌词滚动 / 无限漂移都可以），只用来平移亮斑
+ * 的横向位置与缩放半径。**必须由调用方以绘制期可读的形式提供**（lambda 或
+ * `() -> Float`），不要传一个组合期读的动画值——那会让整块玻璃每次动画帧都重组。
+ * 这里接收的是 `() -> Float`，在 `onDrawBehind` 内逐帧读取（绘制期），零重组。
+ *
+ * ## 性能红线
+ *
+ * 所有 Brush 都在 `drawWithCache` 的 cache 块里构造（只依赖 size/颜色），帧间复用；
+ * `onDrawBehind` 内只做 draw 调用。这是本仓既定红线（见 [glassTopLine]、
+ * [com.local.music.core.ui.components.AuroraBackground] 的同款说明）。
+ */
+private fun Modifier.liquidGlassDecor(
+    glass: GlassColors,
+    motion: () -> Float,
+): Modifier = drawWithCache {
+    val brushes = liquidGlassBrushes(glass, size)
+    onDrawBehind {
+        drawLiquidGlass(brushes, motion(), 1f)
     }
 }
 
@@ -330,6 +387,21 @@ fun GlassSurface(
     blur: GlassLevel? = null,
     scrim: Color? = null,
     liquidMotion: () -> Float = { 0f },
+    /**
+     * 描边颜色覆盖（本轮新增，null = 用层级 token 的默认值）。
+     *
+     * 为什么需要这个口子：输入框要在**聚焦时**把描边换成强调色，而描边颜色原本由
+     * 层级 token（strokeSoft）在内部决定，调用方无从影响。
+     *
+     * 为什么做成参数而不是让调用方在外部 `.border(...)`：外层再画一圈会得到
+     * **两条描边**（一条在 clip 内、一条在 clip 外），圆角处会出现双线错位——
+     * 玻璃卡片的描边必须只有一处来源。
+     *
+     * **默认 null 保证零回归**：现有所有调用点都不传，行为逐像素不变。
+     * 只有 Hi/Md 两档真正绘制描边（Lo/Liquid 不画），所以本参数对那两档无效——
+     * 这与「Lo 靠形状自证、Liquid 用方向性斜面」的既有规则一致，不是遗漏。
+     */
+    strokeColor: Color? = null,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val glass = LocalGlassColors.current
@@ -408,9 +480,9 @@ fun GlassSurface(
     //   会把「光从上面来」的方向性重新抹平成四边等亮。
     m = when (level) {
         GlassLevel.Hi -> m
-            .border(1.dp, glass.strokeSoft, shape)
+            .border(1.dp, strokeColor ?: glass.strokeSoft, shape)
             .glassTopLine(glass.topLine)
-        GlassLevel.Md -> m.border(1.dp, glass.strokeSoft, shape)
+        GlassLevel.Md -> m.border(1.dp, strokeColor ?: glass.strokeSoft, shape)
         GlassLevel.Lo -> m
         GlassLevel.Liquid -> m.liquidGlassDecor(glass, liquidMotion)
     }
@@ -442,7 +514,9 @@ fun GlassSurface(
 fun GlassIconButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    size: Dp = 40.dp,
+    // 44dp：iOS HIG 最小触达。旧 40dp 视觉够但手指落点偏小，
+    // 头部/控制台等纯图标按钮密集处误触率偏高。
+    size: Dp = 44.dp,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val glass = LocalGlassColors.current
@@ -469,6 +543,12 @@ fun GlassToggle(
 ) {
     val glass = LocalGlassColors.current
     val palette = com.local.music.core.ui.theme.LocalAuroraPalette.current
+    // A4 视觉审计：开启态轨道是 palette.seed 实底，滑块必须读 onSeedColor()（其 KDoc
+    // 明确把「开关滑块」列为消费点，web 参考 Glass.jsx 用的是 var(--on-seed)）。
+    // 旧实现恒 Color.White：琥珀 #E0A800 轨道上的白滑块只有 2.15:1，「开/关」这个
+    // 二态控制的状态指示反而变弱。随 fraction 插值而不是 if(checked) 硬切——
+    // 轨道本身是渐变的（textPrimary 18% → seed），滑块若硬切会在中途与轨道撞色。
+    val onSeed = onSeedColor()
     val interactionSource = remember { MutableInteractionSource() }
     val fraction by animateFloatAsState(
         targetValue = if (checked) 1f else 0f,
@@ -499,7 +579,7 @@ fun GlassToggle(
                 .align(Alignment.CenterStart)
                 .size(thumbSize)
                 .clip(CircleShape)
-                .background(Color.White),
+                .background(androidx.compose.ui.graphics.lerp(Color.White, onSeed, fraction)),
         )
     }
 }

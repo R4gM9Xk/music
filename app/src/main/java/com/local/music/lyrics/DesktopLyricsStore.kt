@@ -6,7 +6,9 @@ import android.net.Uri
 import android.provider.Settings
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.local.music.core.ui.components.DesktopLyricsStyle
 import kotlinx.coroutines.flow.first
 
 /**
@@ -30,6 +32,26 @@ object DesktopLyricsStore {
 
     private val KEY_ON = booleanPreferencesKey("on")
 
+    /**
+     * 外观档位（本轮新增）。
+     *
+     * 存**档位索引**而不是 sp/百分比数值：档位是用户可理解的离散选择
+     * （「标准」「清晰」），存索引让「把某档的数值调一调」不会影响已保存的偏好，
+     * 也让旧版本读新版本写入的未知索引时能安全回落到默认档（见 [readStyle]）。
+     */
+    private val KEY_FONT_STEP = intPreferencesKey("font_step")
+    private val KEY_OPACITY_STEP = intPreferencesKey("opacity_step")
+
+    /**
+     * 锁定位置（C-2 本轮新增）。
+     *
+     * 锁定的语义是「触摸穿透」：悬浮窗变成纯展示，任何触摸都落到下层应用。
+     * 为什么需要它——可拖动的悬浮条在**滑动操作**里是个持续风险：
+     * 用户在刷信息流/玩游戏时手指划过歌词条就会把它拖走，而他本想滚的是内容。
+     * 主流桌面歌词（QQ 音乐/网易云）都有这枚锁，属于「用了就回不去」的细节。
+     */
+    private val KEY_LOCKED = booleanPreferencesKey("locked")
+
     /** 读开关；IO 异常/文件不存在一律默认**关**（不给悬浮窗擅自弹出的机会） */
     suspend fun read(context: Context): Boolean = runCatching {
         context.applicationContext.desktopLyricsStore.data.first()[KEY_ON] ?: false
@@ -40,6 +62,47 @@ object DesktopLyricsStore {
         context.applicationContext.desktopLyricsStore.edit { it[KEY_ON] = on }
         true
     }.getOrDefault(false)
+
+    /** 外观档位快照（字号档, 不透明度档） */
+    data class Style(val fontStep: Int, val opacityStep: Int)
+
+    /**
+     * 读外观；任何异常/缺字段回落默认档。
+     *
+     * **必须做范围钳制**：DataStore 里的值是历史数据，旧版本（或未来版本）写入的
+     * 索引可能超出当前档位数。越界时若不钳制，`FontSteps[step]` 会直接抛
+     * IndexOutOfBounds **在服务进程里**（桌面歌词是服务侧渲染的），表现为播放服务崩溃。
+     */
+    suspend fun readStyle(context: Context): Style = runCatching {
+        val prefs = context.applicationContext.desktopLyricsStore.data.first()
+        val font = (prefs[KEY_FONT_STEP] ?: DesktopLyricsStyle.DEFAULT_FONT_STEP)
+            .coerceIn(0, DesktopLyricsStyle.FontSteps.lastIndex)
+        val opacity = (prefs[KEY_OPACITY_STEP] ?: DesktopLyricsStyle.DEFAULT_OPACITY_STEP)
+            .coerceIn(0, DesktopLyricsStyle.OpacitySteps.lastIndex)
+        Style(font, opacity)
+    }.getOrDefault(Style(DesktopLyricsStyle.DEFAULT_FONT_STEP, DesktopLyricsStyle.DEFAULT_OPACITY_STEP))
+
+    /** 写字号档（已钳制，越界值不会落盘） */
+    suspend fun writeFontStep(context: Context, step: Int) = runCatching {
+        val v = step.coerceIn(0, DesktopLyricsStyle.FontSteps.lastIndex)
+        context.applicationContext.desktopLyricsStore.edit { it[KEY_FONT_STEP] = v }
+    }.onFailure { android.util.Log.w("DesktopLyric", "write font step failed", it) }
+
+    /** 写不透明度档（已钳制） */
+    suspend fun writeOpacityStep(context: Context, step: Int) = runCatching {
+        val v = step.coerceIn(0, DesktopLyricsStyle.OpacitySteps.lastIndex)
+        context.applicationContext.desktopLyricsStore.edit { it[KEY_OPACITY_STEP] = v }
+    }.onFailure { android.util.Log.w("DesktopLyric", "write opacity step failed", it) }
+
+    /** 读锁定态；默认**不锁**（首次使用应该能拖，锁是用户主动加的保护） */
+    suspend fun readLocked(context: Context): Boolean = runCatching {
+        context.applicationContext.desktopLyricsStore.data.first()[KEY_LOCKED] ?: false
+    }.getOrDefault(false)
+
+    /** 写锁定态 */
+    suspend fun writeLocked(context: Context, locked: Boolean) = runCatching {
+        context.applicationContext.desktopLyricsStore.edit { it[KEY_LOCKED] = locked }
+    }.onFailure { android.util.Log.w("DesktopLyric", "write locked failed", it) }
 
     /**
      * 跳系统「显示在其他应用上层」授权页（带 package uri 直达本应用的开关）。

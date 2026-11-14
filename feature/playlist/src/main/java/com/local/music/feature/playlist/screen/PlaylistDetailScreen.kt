@@ -227,6 +227,16 @@ fun PlaylistDetailScreen(
                                 tracks = listedTracks,
                                 title = data.title,
                                 reorderable = false,
+                                // 列表位移动画（本轮新增，A3-13）：从歌单移除一首时，
+                                // 后续行整体上移。改动前是瞬时硬切——用户点了「从歌单移除」，
+                                // 那一行消失、下面的行瞬间跳上来，眼睛捕捉不到「是哪一行走了」，
+                                // 也看不出「它后面那些歌还在」。
+                                //
+                                // 这里不需要额外担心分段卡轮廓：不可重排分支用的是
+                                // `detailCardSegment(isFirst, isLast)` 按行切色带，
+                                // animateItem 移动的是**整行容器**，色带随行一起滑动，
+                                // 首/末段的圆角在动画结束后由新的 isFirst/isLast 决定 —— 正确。
+                                modifier = Modifier.animateItem(),
                             )
                         }
                     }
@@ -346,7 +356,7 @@ private fun DetailHeader(
                 },
                 size = 36.dp,
             ) {
-                Icon(GlassIcons.Plus, null, Modifier.size(19.dp), tint = LocalGlassColors.current.textPrimary)
+                Icon(GlassIcons.Plus, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
             }
         }
         GlassIconButton(
@@ -378,7 +388,7 @@ private fun DetailHeader(
             size = 36.dp,
         ) {
             // 有意 null、非遗漏：语义已挂在外层圆钮上
-            Icon(GlassIcons.More, null, Modifier.size(19.dp), tint = LocalGlassColors.current.textPrimary)
+            Icon(GlassIcons.More, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
         }
     }
 }
@@ -487,9 +497,11 @@ private fun DetailTrackRow(
     tracks: List<DemoSong>,
     title: String,
     reorderable: Boolean,
+    modifier: Modifier = Modifier,
 ) {
     val modal = LocalModalState.current
     SongRow(
+        modifier = modifier,
         song = track,
         squareThumb = true,
         playing = track.id == state.currentSong.id,
@@ -519,7 +531,9 @@ private fun DetailTrackRow(
             }
         }),
         onClick = {
-            state.playSong(track, tracks, title)
+            // B-2：把详情页目标一并带进播放现场 —— 播放页顶栏「来自「xx」」据此可点回本页。
+            // 不传的话顶栏那行字永远点不动（源字符串里没有目的地信息）。
+            state.playSong(track, tracks, title, sourceTarget = state.detail)
             state.openPlayer()
         },
     )

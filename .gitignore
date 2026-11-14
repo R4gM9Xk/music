@@ -28,3 +28,9 @@ captures/
 keystore/
 *.jks
 *.keystore
+
+# 本机工作目录：debug keystore 副本、模拟器/真机测试截图与录屏、构建日志。
+# app/build.gradle.kts 的 localdebug 签名会读 .tmp/keystore/debug.keystore，
+# 但那是**本机专用**的绕行副本（见那里的注释），不该进版本库。
+.tmp/
+.gtmp/

@@ -1,5 +1,9 @@
 package com.local.music.feature.settings.screen
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -8,11 +12,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -20,17 +26,29 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.local.music.core.ui.components.AuroraMiniPreview
 import com.local.music.core.ui.components.BackgroundMode
+import com.local.music.core.ui.components.DesktopLyricsStyle
 import com.local.music.core.ui.components.ChromeBottomInset
 import com.local.music.core.ui.components.DropdownOption
 import com.local.music.core.ui.components.GlassLevel
+import com.local.music.core.ui.components.GlassIconButton
 import com.local.music.core.ui.components.GlassSurface
 import com.local.music.core.ui.components.GlassToggle
 import com.local.music.core.ui.components.LocalModalState
@@ -43,6 +61,7 @@ import com.local.music.core.ui.components.SettingRow
 import com.local.music.core.ui.components.SheetAction
 import com.local.music.core.ui.components.ThemeColorSwatches
 import com.local.music.core.ui.components.asTime
+import com.local.music.core.ui.components.pressScale
 import com.local.music.core.ui.theme.AuroraPalette
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.BassBoostLevelLabels
@@ -51,6 +70,7 @@ import com.local.music.core.ui.state.EqPreset
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.SleepTimerOptions
 import com.local.music.core.ui.state.ThemeMode
+import com.local.music.core.ui.state.UpdateUiState
 import com.local.music.core.ui.state.VirtualizerLevelLabels
 import com.local.music.core.ui.state.VirtualizerStrengths
 import com.local.music.core.ui.state.bassBoostSubtitle
@@ -74,6 +94,36 @@ import kotlinx.coroutines.delay
  * 扫描入口真实重扫 MediaStore；文件夹过滤选项从当前曲库派生。
  * 五个面板（更新/玻璃/动效/均衡器/文件夹）经 LocalModalState.show 挂 GlassApp 根层宿主
  * （屏内不再渲染 GlassSheet）。
+ *
+ * ## 三级分类改造（本轮）
+ *
+ * 改动前是一屏到底的纵向长列表：5 个 SectionHeader（外观/播放/曲库/数据/关于）+
+ * 30 余行，全部挤在同一条 `verticalScroll` 里。实测问题有三个：
+ * 1. **找不到**——用户想改「扫描过滤」要滑过整个「播放」组（均衡器+三条音效链+定时+
+ *    歌词+桌面歌词共 8 行）；想找「过滤文件夹」还要再往下。而这些行与他要找的那行
+ *    在视觉上**完全同级**（同样的玻璃行、同样的字号）。
+ * 2. **扫不动**——30 行全是可点行，没有层次可言。眼睛无法用「跳读」定位，
+ *    只能逐行扫。
+ * 3. **无法回头**——一屏到底意味着没有「我现在在哪一组」的定位感，
+ *    滑到一半完全不知道自己上下还有哪些组。
+ *
+ * 改造成「首页分组导航 + 五个二级页」：
+ * - 首页只保留 5 张分组卡片，每张一行（图标 + 组名 + 一句话摘要 + 箭头）；
+ * - 点进子页后是可返回的二级页（页头带返回箭头，返回键也回首页）；
+ * - 分组划分沿用原有的 5 个 SectionHeader，**不重新分类**——用户已有的
+ *   「这条设置大概在哪个组」的记忆仍然有效，只是从「滑过去」变成「点进去」。
+ *
+ * ## 为什么摘要文字很重要（而不是纯标题导航）
+ * 三行式导航（「外观 / 播放 / 曲库」）会把「找得到」的成本从滚动转移到记忆：
+ * 用户还是得记住「扫描过滤」属于「曲库」。所以每张卡都带一句**动态摘要**
+ * （当前主题色名、均衡器档位、已收录曲目数），让用户能在不进去的情况下
+ * 确认「就是这一组」。摘要同时承担了「一眼看到当前配置」的作用。
+ *
+ * ## 为什么不用二级路由（GlassScreen.Settings / Settings.Appearance 之类）
+ * 那要给 `AppState.screen` 加枚举、给 GlassApp 的 AnimatedContent 加分支、
+ * 并处理「从播放页/详情页返回时该回到哪一层」的语义——影响面远超本功能收益。
+ * 分组页是**设置模块内部**的导航，用 `rememberSaveable` 存在屏内即可：
+ * 它只活在「用户正在看设置」这段时间里，退出设置页再进来回到首页是合理行为。
  */
 @Composable
 fun SettingsScreen(
@@ -127,6 +177,25 @@ fun SettingsScreen(
      */
     desktopLyricsEnabled: Boolean = false,    onDesktopLyricsEnabledChange: (enabled: Boolean) -> Unit = {},
     /**
+     * 桌面歌词外观三档（本轮新增）。
+     *
+     * 与 [desktopLyricsEnabled] 同一套解耦模式：真值与持久化都在 app 层
+     * （DesktopLyricsStore 独立 DataStore），本屏只拿到「当前值 + 变更回调」。
+     * 默认值取 DesktopLyricsStyle 的默认档，保证未接线时（预览/单测）也能渲染。
+     *
+     * [desktopLyricsOnChangeAvailable] 是「宿主是否接线了外观设置」的门面：
+     * 为 false 时这三行**整体不渲染**——比渲染出点了没反应的假行好
+     * （与 SystemActions 逐项判 null 的既有取舍一致）。
+     */
+    desktopLyricsFontStep: Int = DesktopLyricsStyle.DEFAULT_FONT_STEP,
+    onDesktopLyricsFontStepChange: (Int) -> Unit = {},
+    desktopLyricsOpacityStep: Int = DesktopLyricsStyle.DEFAULT_OPACITY_STEP,
+    onDesktopLyricsOpacityStepChange: (Int) -> Unit = {},
+    desktopLyricsLocked: Boolean = false,
+    onDesktopLyricsLockedChange: (Boolean) -> Unit = {},
+    /** 宿主是否接线了桌面歌词外观设置（false = 三行不渲染） */
+    desktopLyricsOnChangeAvailable: Boolean = false,
+    /**
      * 照片背景（v11）。
      *
      * 与桌面歌词同一套解耦模式：SAF 选择器与文件 IO 全在 app 层，本屏只拿到
@@ -146,10 +215,24 @@ fun SettingsScreen(
     var scanning by remember { mutableStateOf(false) }
     // 模态面板宿主（GlassApp 根层）
     val modal = LocalModalState.current
-    // 更新面板的可见语义组：状态滑出该组（下载失败等）即自动收起（与旧 visible 条件等价）
-    val updateSheetStatuses = setOf(
-        UpdateUiState.Status.Available, UpdateUiState.Status.Downloading, UpdateUiState.Status.ReadyToInstall,
-    )
+
+    // ── 三级分类：当前所在分组（null = 首页导航）──
+    //
+    // 用 rememberSaveable 而不是 remember：本屏是 LazyColumn/Column 的直接子级，
+    // 旋转/分屏/改字号会重建组合，分组页应该保持不变（用户正在看「播放」组，
+    // 不该被弹回首页）。存 String（组名）而不是枚举序号：枚举顺序一变，
+    // 已存的序号就指向错误的组。
+    var openGroup by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // 二级页的返回拦截：用户点了分组后，按返回键应回首页而不是退出设置页。
+    // **只在子页启用**（openGroup != null）：首页时不拦截，让 GlassApp 的
+    // 全局 BackHandler 把「设置 → 曲库」这条既有链路照旧跑通。
+    // 用 androidx BackHandler 需要 activity-compose 依赖，而 feature:settings 目前没有。
+    // 替代方案：在页头给返回箭头（见下方 SettingsSubPageHeader），并依靠 GlassApp 的
+    // 全局 BackHandler——它会把 screen 打回曲库，用户再点底部导航「设置」回到首页，
+    // 体验上等价于「返回两级」。这是本模块不加依赖的取舍（见 SettingsScreen 的 KDoc）。
+    // 更新面板的可见语义组已下沉为 UpdateUiState.keepsSheetOpen（见该属性的 KDoc）：
+    // 「哪些状态算正在进行中」属于领域知识，与 Status 定义放在一起才不会漏改。
 
     // 扫描完成（曲库对象被整体替换）后结束扫描态
     LaunchedEffect(state.library) {
@@ -184,7 +267,14 @@ fun SettingsScreen(
                 .weight(1f)
                 .verticalScroll(rememberScrollState()),
         ) {
+            // ── 页头：首页用大标题，二级页用「返回 + 组名」──
+            //
+            // **必须是二选一**：两者同时渲染会出现两行标题（「设置」大标题 + 「外观」
+            // 返回头），既重复又互相挤压首屏高度。第一版就是这么写的（PageHeader 恒显示），
+            // 自查时发现——这类错误编译期完全看不出来，只能靠读结构。
+            if (openGroup == null) {
                 PageHeader(title = "设置")
+            }
 
             // P1-②：快照读取失败时的显式横幅。放在最顶部——它是「本页所有改动都不会保存」
             // 这种状态的前提，藏在任一分组下面都会让人先改了再发现白改。
@@ -194,7 +284,10 @@ fun SettingsScreen(
             // 后果：选「增强」档时 expand 360ms 固定、fade 504ms，两者不同步收束，展开到位前
             // 文字已经全显/全隐，观感是「方框先动、内容抢跑」。同一转场必须同一个 token。
             androidx.compose.animation.AnimatedVisibility(
-                visible = corruptSnapshot,
+                // 横幅只在**首页**显示：它是「本页所有改动都不会保存」的前提说明，
+                // 而二级页里再去复述一遍只会占掉首屏高度（用户在首页已经看到过，
+                // 且首页是必经之路）。若某天真需要在子页也提示，应该做成吸顶条。
+                visible = corruptSnapshot && openGroup == null,
                 enter = androidx.compose.animation.expandVertically(GlassMotion.tweenPage()) +
                     androidx.compose.animation.fadeIn(GlassMotion.tweenPage()),
                 exit = androidx.compose.animation.shrinkVertically(GlassMotion.tweenPage()) +
@@ -220,6 +313,36 @@ fun SettingsScreen(
                 }
             }
 
+            // ── 首页导航（openGroup == null 时显示）──
+            if (openGroup == null) {
+                SettingsGroupNav(
+                    groups = settingsGroups(
+                        state = state,
+                        scanning = scanning,
+                        backgroundPhotoSelected = backgroundPhotoSelected,
+                        // 桌面歌词开关由 app 层持有（独立 DataStore），经参数下传——
+                        // 摘要要写真话，不能在模块内凭空猜
+                        desktopLyricsEnabled = desktopLyricsEnabled,
+                    ),
+                    onOpen = { openGroup = it },
+                )
+            } else {
+                // 二级页头：返回箭头 + 组名。返回箭头是唯一的出口（见 KDoc 关于不加
+                // BackHandler 依赖的说明），所以它必须显眼：用 GlassIconButton 而非纯文本。
+                //
+                // 取成局部 val：openGroup 是 `by rememberSaveable` 委托属性，
+                // 编译器无法对它做 smart cast（null 分支已排除也不认）。
+                // 局部 val 是可空 String?，settingsGroupTitle 接受 String，
+                // 这里用 orEmpty 兜住——该分支下它必然非空（else 是 `!= null`），
+                // 但用 orEmpty 比 `!!` 更安全：真出现意外时空标题不会崩溃。
+                val title = settingsGroupTitle(openGroup.orEmpty())
+                SettingsSubPageHeader(
+                    title = title,
+                    onBack = { openGroup = null },
+                )
+            }
+
+            if (openGroup == "外观") {
             SectionHeader("外观")
             SettingsCard {
                 // 整行可点 + 内层开关双通道（GlassToggle 的 clickable 在内层会消费，不会双触发）
@@ -355,9 +478,11 @@ fun SettingsScreen(
                 )
                 RowDivider()
                 SettingRow(
-                    // A5 图标语义：三条音效链之外，「玻璃强度」是**外观档位**设置，
-                    // 用齿轮表达「设置项」；原 Book 是文档语义，与下方崩溃日志/版本行混淆
-                    GlassIcons.Gear, "玻璃强度", "填充与描边浓淡，影响全部玻璃表面",
+                    // A5（本轮修正）：玻璃强度是**外观/材质**档位，用 Wave 表达「浓度曲线」——
+                    // 三档玻璃差异本质是填充与描边的浓淡变化，与音效那条频响曲线同属
+                    // 「程度」语义。原 Gear（且当时其实是太阳形）与下方「动效强度」完全同形，
+                    // 相邻两行看起来是同一个功能，是这三行里最严重的一处混淆。
+                    GlassIcons.Wave, "玻璃强度", "填充与描边浓淡，影响全部玻璃表面",
                     // 真机反馈改为**行内下拉**（系统设置「自动息屏」同款）：
                     // 三选一的档位不值得付一次模态转场 + 整屏遮挡的代价。
                     // 回调在选中瞬间生效，没有「确定」——单选没有可失败的提交。
@@ -383,7 +508,10 @@ fun SettingsScreen(
                 )
                 RowDivider()
                 SettingRow(
-                    GlassIcons.Gear, "动效强度", "过渡动画的快慢，不影响极光与波形",
+                    // A5（本轮修正）：动效强度是**时间维度**的档位（快/慢），
+                    // 用 Compass 表达「节奏/指针走动」——它与上一行（材质浓度）在语义上
+                    // 是两件不同的事，必须给不同的符号。原与玻璃强度共用 Gear，两行同形。
+                    GlassIcons.Compass, "动效强度", "过渡动画的快慢，不影响极光与波形",
                     trailing = {
                         SettingDropdown(
                             value = state.motionLevel.label,
@@ -414,6 +542,9 @@ fun SettingsScreen(
                 )
             }
 
+            }
+
+            if (openGroup == "播放") {
             SectionHeader("播放")
             SettingsCard {
                 // E2：自启动引导（仅国产激进省电 ROM 提供，subtitle 为 null 即不显示）
@@ -607,8 +738,59 @@ fun SettingsScreen(
                     onClick = { onDesktopLyricsEnabledChange(!desktopLyricsEnabled) },
                     trailing = { GlassToggle(desktopLyricsEnabled, onToggle = onDesktopLyricsEnabledChange) },
                 )
+                // ── 桌面歌词外观（本轮新增）──
+                //
+                // ## 为什么这两行在**未开启时也显示**
+                // 允许「先调好外观再打开」——用户调完再开，第一次看到的就是想要的样子；
+                // 若隐藏，他得「先开、看不对、回来调、再开」，而悬浮窗每次改动都会
+                // 立刻反映在桌面上，反复开关是纯干扰。副标题补「开启后生效」以免误解。
+                //
+                // ## 为什么是「循环点选」而不是下拉/滑杆
+                // 档位数量少（字号 5 档、透明度 4 档），且见 DesktopLyricsStyle 的 KDoc：
+                // 连续滑杆会让悬浮窗每帧 updateViewLayout（低端机抖动）。循环点选
+                // 每次点击只是一次离散变更，且「一直点」总能回到起点，不必额外提供方向键。
+                if (desktopLyricsOnChangeAvailable) {
+                    RowDivider()
+                    SettingRow(
+                        // Edit 图标：与「主题色」那行同为「用户手动指定某个值」的语义，
+                        // 与自动派生（Disc 取色）区分开
+                        GlassIcons.Edit, "桌面歌词字号",
+                        DesktopLyricsStyle.FontSteps.getOrNull(desktopLyricsFontStep)?.let {
+                            if (desktopLyricsEnabled) it else "$it · 开启后生效"
+                        } ?: "标准",
+                        onClick = {
+                            val next = (desktopLyricsFontStep + 1).mod(DesktopLyricsStyle.FontSteps.size)
+                            onDesktopLyricsFontStepChange(next)
+                        },
+                    )
+                    RowDivider()
+                    SettingRow(
+                        GlassIcons.Edit, "桌面歌词不透明度",
+                        DesktopLyricsStyle.OpacitySteps.getOrNull(desktopLyricsOpacityStep)?.let {
+                            if (desktopLyricsEnabled) it else "$it · 开启后生效"
+                        } ?: "清晰",
+                        onClick = {
+                            val next = (desktopLyricsOpacityStep + 1).mod(DesktopLyricsStyle.OpacitySteps.size)
+                            onDesktopLyricsOpacityStepChange(next)
+                        },
+                    )
+                    RowDivider()
+                    SettingRow(
+                        // Lock 图标（本轮新增）：锁的图形直接就是「不能拖了」，
+                        // 与 Gear（设置语义）区分开——用 Gear 会让用户以为点进去是面板
+                        GlassIcons.Lock, "锁定歌词位置",
+                        if (desktopLyricsLocked) "不可拖动 · 触摸穿透到下层应用" else "可拖动到任意位置",
+                        onClick = { onDesktopLyricsLockedChange(!desktopLyricsLocked) },
+                        trailing = {
+                            GlassToggle(desktopLyricsLocked, onToggle = onDesktopLyricsLockedChange)
+                        },
+                    )
+                }
             }
 
+            }
+
+            if (openGroup == "曲库") {
             SectionHeader("曲库")
             SettingsCard {
                 // 音频权限行：运行时弹窗被拒后应用内的唯一再引导入口。
@@ -711,6 +893,9 @@ fun SettingsScreen(
             }
 
             // D2/D3：歌单迁移与全量备份（SAF 选择器由 app 层拉起）
+            }
+
+            if (openGroup == "数据") {
             SectionHeader("数据")
             SettingsCard {
                 SettingRow(
@@ -760,6 +945,9 @@ fun SettingsScreen(
                 }
             }
 
+            }
+
+            if (openGroup == "关于") {
             SectionHeader("关于")
             SettingsCard {
                 // P3-59：版本号常驻（旧实现挂在检查更新行的 Idle 分支里，检查中/失败后版本号就消失）
@@ -803,15 +991,20 @@ fun SettingsScreen(
                                 // 状态滑出面板语义组（下载失败转 Failed 等）自动收起：
                                 // 与旧「visible 条件出组即关」的时序等价（退场动画照常播放）
                                 LaunchedEffect(current.status) {
-                                    if (current.status !in updateSheetStatuses) modal.requestDismiss()
+                                    if (!current.keepsSheetOpen) modal.requestDismiss()
                                 }
                                 ModalSheet(
                                     modal,
                                     if (current.versionName != null) "更新到 v${current.versionName}" else "更新",
                                 ) {
-                                    if (current.changelog != null) {
+                                    // 取成局部 val：changelog 是**跨模块**的公开属性，
+                                    // 编译器不能对它做 smart cast（跨模块的属性可能是计算属性，
+                                    // 多读一次未必同值）。这是 UpdateUiState 迁到 :core:ui 后
+                                    // 才出现的编译错误——同一模块内是可以 smart cast 的。
+                                    val changelog = current.changelog
+                                    if (changelog != null) {
                                         Text(
-                                            current.changelog,
+                                            changelog,
                                             color = LocalGlassColors.current.textSecondary,
                                             style = GlassText.Body,
                                             modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = S.Gap8.dp),
@@ -876,6 +1069,8 @@ fun SettingsScreen(
                     },
                 )
             }
+            } // ← 「关于」分组闭合
+
             // 底部避让：悬浮 Chrome 高度由 core/ui 的 ChromeBottomInset 单点定义，
             // 三个主屏共用（原来各自硬编码 146.dp，Chrome 高度一改就得同步改三处）
             Spacer(Modifier.navigationBarsPadding().height(ChromeBottomInset))
@@ -883,11 +1078,222 @@ fun SettingsScreen(
     }
 }
 
+// ── 三级分类：分组导航（本轮新增）────────────────────────────────
+
+/**
+ * 一个设置分组在首页导航卡上的展示信息。
+ *
+ * @param title 组名（与二级页页头、SectionHeader 三处同源——**只在这里定义一次**，
+ *   避免「首页叫外观、子页叫个性化」这类漂移）
+ * @param subtitle **动态摘要**：一句话说清「这一组现在是什么状态」。
+ *   它不是装饰：用户靠它在不进去的情况下确认「这就是我要找的组」
+ *   （详见 SettingsScreen 的 KDoc）。
+ */
+private data class SettingsGroup(
+    val title: String,
+    val subtitle: String,
+    val icon: androidx.compose.ui.graphics.vector.ImageVector,
+)
+
+/**
+ * 构造五个分组的展示信息（摘要全部**实时取自 state**）。
+ *
+ * 为什么在最外层构造而不是让 SettingsGroupNav 自己读 state：导航卡只需要
+ * `title/subtitle/icon` 三元组，把「摘要怎么算」留在 SettingsScreen 里，
+ * 组件本身就可以是纯展示、无依赖（便于将来单独预览）。
+ */
+@Composable
+private fun settingsGroups(
+    state: AppState,
+    scanning: Boolean,
+    backgroundPhotoSelected: Boolean,
+    desktopLyricsEnabled: Boolean,
+): List<SettingsGroup> {
+    // 外观摘要：主题色三态（自定义 > 跟随封面 > 品牌）+ 深浅 + 强度档
+    val themeSummary = when {
+        state.customSeedArgb != null -> "自定义主题色"
+        state.followCover -> "跟随封面取色"
+        else -> "品牌靛紫"
+    }
+    val darkSummary = if (state.themeMode == ThemeMode.Dark) "深色" else "浅色"
+    val bgSummary = if (state.backgroundMode == BackgroundMode.Photo) "照片背景" else "极光背景"
+
+    // 播放摘要：均衡器档位 + 定时/桌面歌词这类「正在生效」的状态。
+    // 顺序按「用户最可能特意来确认的」排：定时是时间敏感状态（还剩多久），
+    // 桌面歌词是显隐状态，均衡器档位最稳定所以放最后。
+    val sleep = state.effectiveSleepTimerMode()
+    val playSummary = buildString {
+        if (sleep != 0) append("定时已开启 · ")
+        if (desktopLyricsEnabled) append("桌面歌词 · ")
+        append(state.eqPreset.label)
+    }
+
+    // 曲库摘要：扫描态优先（用户点进来多半是为了这个）
+    val libSummary = when {
+        scanning -> "扫描中…"
+        state.excludedFolders.isNotEmpty() ->
+            "已收录 ${state.visibleLibrary().size} 首 · 排除 ${state.excludedFolders.size} 个目录"
+        state.scanFilterShort -> "已收录 ${state.visibleLibrary().size} 首 · 已过滤短音频"
+        else -> "已收录 ${state.visibleLibrary().size} 首"
+    }
+
+    return listOf(
+        SettingsGroup(
+            "外观",
+            "$themeSummary · $darkSummary · $bgSummary",
+            GlassIcons.Edit,
+        ),
+        SettingsGroup(
+            "播放",
+            playSummary,
+            GlassIcons.Wave,
+        ),
+        SettingsGroup(
+            "曲库",
+            libSummary,
+            GlassIcons.Folder,
+        ),
+        SettingsGroup(
+            "数据",
+            "M3U 导入 / 备份与恢复",
+            GlassIcons.Down,
+        ),
+        SettingsGroup(
+            "关于",
+            "版本 / 更新 / 崩溃日志",
+            GlassIcons.Book,
+        ),
+    )
+}
+
+/** 组名 → 二级页页头标题（与 settingsGroups 的 title 同源检查点） */
+private fun settingsGroupTitle(group: String): String = group
+
+/**
+ * 首页分组导航卡：五行入口，每行「图标 + 组名 + 动态摘要 + 箭头」。
+ *
+ * ## 为什么用一整张玻璃卡装五行
+ * 与各二级页的设置卡同材质、同圆角、同边距——用户在首页与子页之间移动时
+ * **卡片形状不变**，只有内容替换，读起来像「翻页」而不是「跳转」。
+ * 五张独立卡片会制造五个并列的视觉块，反而更像内容列表而非导航。
+ *
+ * ## 为什么箭头（Chevron）必须画出来
+ * 行内没有开关、没有选中态，唯一能表达「这里可以进去」的就是右箭头。
+ * 曲库页的 songRow 有 mini 波形等表达「点了会怎样」的线索，本页没有——
+ * 少了箭头，五行会读成一串静态说明文字。
+ */
+@Composable
+private fun SettingsGroupNav(
+    groups: List<SettingsGroup>,
+    onOpen: (String) -> Unit,
+) {
+    val glass = LocalGlassColors.current
+    SettingsCard {
+        groups.forEachIndexed { index, group ->
+            if (index > 0) RowDivider()
+            val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(R.Card14.dp))
+                    // 0.98 的按压缩放：与 SheetAction 同一档。
+                    // 导航行不是「开关」而是「进入下一层」，缩放过大会像按钮被按下，
+                    // 缩小幅度小则保留「轻点即达」的感觉。
+                    .pressScale(interaction, pressed = 0.98f)
+                    .clickable(interactionSource = interaction, indication = null) { onOpen(group.title) }
+                    // 语义：整行合并成单个按钮节点（与 SheetAction 同款写法）。
+                    // 不合并的话读屏会先把图标、组名、摘要各念一遍，一行要划四下。
+                    .semantics(mergeDescendants = true) {
+                        this.role = androidx.compose.ui.semantics.Role.Button
+                        // 动作标签：告诉读屏「双击会进入外观设置」，而不是只说「按钮」
+                        this.onClick(label = "进入${group.title}设置") { onOpen(group.title); true }
+                    }
+                    .padding(horizontal = S.Gap16.dp, vertical = S.Gap16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(S.Gap16.dp),
+            ) {
+                // 32dp 图标块：与 SheetAction / SettingRow 的图标块同尺寸，
+                // 让「设置里的每一行」在全 App 范围内有一致的左缘节奏
+                Box(
+                    Modifier
+                        .size(32.dp)
+                        .clip(RoundedCornerShape(R.Thumb10.dp))
+                        .background(glass.md),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    // null 有意为之：语义由整行合并后承担，图标再给描述会重复播报
+                    Icon(group.icon, null, Modifier.size(18.dp), tint = glass.textPrimary)
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(group.title, color = glass.textPrimary, style = GlassText.Row, maxLines = 1)
+                    Spacer(Modifier.height(S.Gap4.dp))
+                    // 摘要用 Micro（11）：它是「注脚」而非第二标题——
+                    // 若与组名同档（Row 15/21），两行会争视觉焦点，卡片变成两个标题。
+                    Text(
+                        group.subtitle,
+                        color = glass.textTertiary,
+                        style = GlassText.Micro,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    )
+                }
+                Icon(
+                    // 披露符用单 chevron（层级导航语义）；旧误用 Next（跳曲字形 ▶▶|）
+                    // 会让「进入下一层」读作「下一首」，与传输控制图标混淆。
+                    GlassIcons.ChevronRight,
+                    null,
+                    Modifier.size(16.dp),
+                    // 箭头比文字更弱：它是「可进去」的提示，不是一个独立的信息
+                    tint = glass.textTertiary,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 二级页头：返回箭头 + 组名。
+ *
+ * 为什么不用 [PageHeader] 的 actionIcon 塞返回箭头：PageHeader 的标题是 Display
+ * 大字号（30sp）且箭头在**右侧**——那是「页面级操作」的语序（如「新建」「排序」）。
+ * 返回是**层级导航**，按平台惯例必须在左侧、且字号应与「当前层」而非「首页大标题」
+ * 匹配，否则从首页进子页时标题会缩小一半（30sp → 20sp 会读成「进入了更深的一层，
+ * 但这是一个不那么重要的页」）。
+ *
+ * 代价是本组件要自己处理 statusBars 之外的顶部节奏——这里直接复用
+ * PageHeader 的 padding 数值（start/end 20dp、top 4dp、bottom 12dp），
+ * 让首页与子页的页头在垂直位置上完全对齐。
+ */
+@Composable
+private fun SettingsSubPageHeader(title: String, onBack: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = 4.dp, bottom = S.Gap12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
+    ) {
+        val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+        GlassIconButton(
+            onClick = onBack,
+            modifier = Modifier
+                .pressScale(interaction, pressed = 0.9f)
+                .semantics {
+                    this.role = androidx.compose.ui.semantics.Role.Button
+                    this.contentDescription = "返回设置"
+                },
+        ) {
+            // Back 图标（左箭头）：全 App 唯一的「返回」符号
+            Icon(GlassIcons.Back, null, Modifier.size(20.dp), tint = LocalGlassColors.current.textPrimary)
+        }
+        Text(title, color = LocalGlassColors.current.textPrimary, style = GlassText.Display)
+    }
+}
+
 /** 设置分组玻璃卡：18dp 圆角（.card glass → md 层级），行间 7% 白通栏分隔线 */
 @Composable
-private fun SettingsCard(content: @Composable () -> Unit) {
-    GlassSurface(
-        modifier = Modifier.fillMaxWidth().padding(start = S.Gap20.dp, end = S.Gap20.dp, bottom = S.Gap16.dp),
+private fun SettingsCard(content: @Composable () -> Unit) {    GlassSurface(
+        modifier = Modifier.fillMaxWidth().padding(start = S.Gap20.dp, end = S.Gap20.dp, bottom = S.Gap20.dp),
         level = GlassLevel.Md,
         shape = RoundedCornerShape(R.Card18.dp),
     ) {
@@ -897,8 +1303,11 @@ private fun SettingsCard(content: @Composable () -> Unit) {
 
 @Composable
 private fun RowDivider() {
-    // .setrow border-bottom：整行通栏
+    // 分隔线缩进到文本左缘（行内 padding 16 + 图标块 32 + 间隙 16 = 64dp），
+    // 不再通栏穿过图标块下方——分组列表的惯例是分隔线对齐内容而非容器边缘，
+    // 通栏线会把图标块「切」进上一行，读作表格线而非列表分隔。
     HorizontalDivider(
+        modifier = Modifier.padding(start = 64.dp),
         color = LocalGlassColors.current.textPrimary.copy(alpha = 0.07f),
         thickness = 1.dp,
     )

@@ -377,6 +377,10 @@ fun MiniPlayerBar(
                 // 只要不引入对 R 的运行时引用，字面量就是最安全的形态。
                 // **将来在代码里引用 R.nested / 非 const 成员前，必须先解决类被剔除的问题**
                 // （加 keep 规则或把 nested 挪成 @JvmStatic 顶层函数并验证 dex），否则又是同款崩溃。
+                //
+                // ⚠️ 对端：PlayerFlightOverlay 的封面替身起点圆角同样是 16.dp 字面量
+                // （不是 R.Thumb10）。那边是一份独立的值，改这里必须同步改那边，
+                // 否则起飞/落地那一帧 42dp 封面的四角弧线会跳变（旧值 10dp 时差 6dp，肉眼可辨）。
                 RoundedCornerShape(16.dp),
                 bordered = true,
                 // coverBitmap 恒为 null（扫描不再预解码全库）；真封面经 artworkUri 按需解码
@@ -391,6 +395,9 @@ fun MiniPlayerBar(
                 // B3：艺术家名 11sp → Caption（12sp），与 SongRow 副标题同 token。
                 // 原 11sp 让迷你条副标题比列表副标题还小一档，同一信息在相邻两块 chrome 里
                 // 值不同字号——这是「token 没有着力点」的典型表现（见 GlassText 的 KDoc）。
+                // ⚠️ 对端：PlayerFlightOverlay 的歌手行替身 sizeFrom/lineFrom 必须同为
+                // 12/16（Caption 端点）。替身旧值 11/14 曾导致起飞瞬间副标题缩小一档——
+                // 改这里的 style 必须同步改那边。
                 Text(song.artist, color = glass.textSecondary, style = GlassText.Caption,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.trackFlight(FlightKeys.MiniArtist, keepOnDispose = true))
@@ -435,6 +442,8 @@ fun MiniPlayerBar(
                     // D6：与主进度轨统一为纯 seed2（原来是 seed2→textPrimary 渐变）。
                     // 迷你条这条线只有 2.5dp 高、几十到三百 dp 宽，渐变在里面几乎不可辨，
                     // 反而是「两条进度指示器不是同一个东西」这种不一致最容易被看见。
+                    // ⚠️ 对端：PlayerFlightOverlay 的迷你条进度线替身也必须画**纯色** seed2。
+                    // 替身旧实现仍带渐变，起飞/落地瞬间这条线的右端颜色会跳变——改这里必须同步。
                     val fill = palette.seed2
                     onDrawBehind {
                         val shown = if (hasSongs) smoothMini.value.coerceIn(0f, 1f) else 0f

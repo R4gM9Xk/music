@@ -17,6 +17,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.util.lerp
 
 /**
  * 液态玻璃流 · 设计 token
@@ -809,6 +810,23 @@ data class GlassColors(
  *  [GlassColors.chromeScrim] 必须一起插值：它是深浅两套**不同方向**的颜色
  *  （深色往黑压、浅色往白压）。漏掉这个字段的话，构造出来的 GlassColors 会回落到
  *  默认值（深色深底），浅色模式整条 chrome 会在切换瞬间变成一块半透明黑板。 */
+/**
+ * chrome scrim 有色化 + 深色提到不可辨阈值（迷你条/导航「太偏黑/偏白但仍透字」修复）。
+ *
+ * 旧 scrim 是中性近黑(#1A1A24)/近白(#F2F2F6)扁平色：深色 0.80 未达不可辨阈值（仍透字）
+ * 且整条读作黑板，浅色读作白板——与背景极光色相脱节，玻璃感丢失。改为从当前极光
+ * deep 偏 seed 的**有色底**（与背景同色相 → 读作有色玻璃而非黑/白板），深色 alpha 提到
+ * 0.86/0.78（chromeScrim KDoc 推算的不可辨阈值，压住透字），浅色保持 0.74/0.66
+ * （浅色透字经复算本就过剩）。在主题根一处改 token，Chrome 真身与飞行替身同源一致。
+ */
+private fun GlassColors.withChromeScrim(palette: AuroraPalette, lightFraction: Float): GlassColors {
+    val base = lerp(palette.deep, palette.seed, 0.22f)
+    return copy(
+        chromeScrim = base.copy(alpha = lerp(0.86f, 0.74f, lightFraction)),
+        chromeScrimNav = base.copy(alpha = lerp(0.78f, 0.66f, lightFraction)),
+    )
+}
+
 fun lerpGlassColors(from: GlassColors, to: GlassColors, fraction: Float): GlassColors = GlassColors(
     hi = lerp(from.hi, to.hi, fraction),
     md = lerp(from.md, to.md, fraction),
@@ -987,6 +1005,7 @@ fun GlassTheme(
     val darkGlass = GlassColors().deriveBy(fillScale, strokeScale)
     val lightGlass = GlassColors.light().deriveBy(fillScale, strokeScale)
     val glass = lerpGlassColors(darkGlass, lightGlass, themeFraction)
+        .withChromeScrim(effectivePalette, themeFraction)
 
     CompositionLocalProvider(
         // 直接提供混合结果：第三层动画是多余滞后（见上），不是设计意图

@@ -26,6 +26,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
@@ -35,6 +40,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,6 +55,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
@@ -60,6 +68,7 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.GlassText
@@ -323,6 +332,144 @@ fun GlassSheet(
     scrollState: ScrollState = rememberScrollState(),
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    GlassSheetScaffold(
+        visible = visible,
+        onDismiss = onDismiss,
+        title = title,
+        modifier = modifier,
+    ) { contentMaxHeight ->
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(max = contentMaxHeight)
+                .verticalScroll(scrollState),
+            content = content,
+        )
+    }
+}
+
+/**
+ * 懒加载版底部面板（本轮新增，配合队列面板 Lazy 化）。
+ *
+ * ## 为什么需要单独一个入口，而不是给 [GlassSheet] 加个开关
+ * 两者的**滚动容器类型**根本不同：普通版是 `Column + verticalScroll(ScrollState)`，
+ * 懒加载版是 `LazyColumn(LazyListState)`。这不是「同一个东西的两种模式」——
+ * [ScrollState] 与 [LazyListState] 是两套互不兼容的 API（前者 measure 全部子项、
+ * 后者按需组合），任何一方的调用方（例如 ReorderableColumn 的行数学）都只认其中一套。
+ * 做成 boolean 参数会让签名上写着一个 `ScrollState` 却在 true 时被忽略——
+ * 那是最难排查的一类 API。
+ *
+ * ## 内容列为什么自己不是滚动容器
+ * Lazy 列表必须**独占**滚动轴（不能嵌在 verticalScroll 里，会抛「测量被赋予无限高度」）。
+ * 所以这里的内容列是一个普通 Column（不滚），把 `heightIn(max)` 约束交给
+ * [LazyColumn] 自己——它拿到有界高度才能正确懒加载。
+ *
+ * @param content `LazyListScope` 的扩展 lambda：调用方用 `item {}` / `items {}` 描述内容
+ */
+@Composable
+fun GlassSheetLazy(
+    visible: Boolean,
+    onDismiss: () -> Unit,
+    title: String,
+    listState: LazyListState,
+    modifier: Modifier = Modifier,
+    /**
+     * 列表下方的固定脚注（可选）。
+     *
+     * 为什么需要它：有些面板要在列表**之后**放一块不滚动的区域（队列面板的撤销条）。
+     * 若把这类内容做成 LazyColumn 的最后一个 item，它会成为滚动内容的一部分——
+     * 对队列面板而言这会破坏「接下来段延伸到末尾」这条拖拽行数学的前提
+     * （见 QueueSheet 的 KDoc）。所以脚注必须留在 LazyColumn 之外、面板之内。
+     */
+    footer: (@Composable () -> Unit)? = null,
+    content: LazyListScope.() -> Unit,
+) {
+    GlassSheetScaffold(
+        visible = visible,
+        onDismiss = onDismiss,
+        title = title,
+        modifier = modifier,
+    ) { contentMaxHeight ->
+        // ── 高度约束：本函数唯一需要小心的地方（真机踩坑记录，改前请读完）──
+        //
+        // ## 现象（一加 13 真机，2026-11-14）
+        // 队列面板的玻璃卡只包住约 2.5 行，后面的行画在卡外、背景全透，
+        // 且**溢出部分不接收点击**（「清空」按钮点了完全没反应）。
+        //
+        // ## 根因（这是关键，前 4 个版本都栽在没找到它）
+        // 传进来的 `contentMaxHeight` 是「屏幕高的 65%」（本机 514.8dp），
+        // 但它会被放进 Scaffold 那个带 `navigationBarsPadding()` +
+        // `padding(top 12 / bottom 16)` 的 Column 里。该 Column **按内容测高**，
+        // 分给子项的可用高度已经把 navbar（≈48dp）与内边距、把手（4dp）、
+        // 标题（≈38dp）都扣掉了 —— 只剩约 397dp。
+        //
+        // 也就是说：**子项声明 514.8dp，父级实际只给得出 397dp**。
+        // 普通版（`verticalScroll`）对此无感——视口被压小就照常滚动；
+        // 但 LazyColumn 会拿声明值当确定高度排版，而 Box 又按父级真正给出的
+        // 尺寸定框，于是「内容按大的排、卡片按小的画」，末尾几行跑到卡外、
+        // 且那部分的触摸命中区不在卡片内（点「清空」没反应就是这么来的）。
+        //
+        // 实测吻合：卡高 ≈1800px ÷ 4 density ≈ 450dp；而在 397dp 附近。
+        // 此前的 `lazySize=2059px`（= 514.8dp × 4）只是 LazyColumn **自己**
+        // 拿到的声明值，不代表卡片真有那么高——这也是我一度被误导的原因。
+        //
+        // ## 修复
+        // 在**本函数内**先扣掉面板骨架，让子项声明的高度与父级能提供的一致。
+        // 只在 lazy 版扣、不动 `GlassSheet` 的公共算法：普通版有 9 个调用点，
+        // 统一改会让所有面板矮 118dp（例如「歌曲操作」面板），那是不必要的回归。
+        val chromeDp = 48 + 12 + 16 + 4 + 38 // navbar + padTop + padBottom + 把手 + 标题
+        val listMaxHeight = (contentMaxHeight.value - chromeDp).dp.coerceAtLeast(160.dp)
+        // 让一个**普通（非滚动）** Box 持有确定高度，LazyColumn 填满它。
+        // Box 量这一层时拿到的是明确的 listMaxHeight（普通容器的尺寸由 height
+        // 修饰符直接得出，与内容测量无关），于是卡片高度正确、clip 也裁得对。
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(listMaxHeight),
+        ) {
+            LazyColumn(
+                Modifier.fillMaxSize(),
+                state = listState,
+                content = content,
+            )
+            if (footer != null) {
+                // 脚注**叠在**列表底部之上，而不是把列表挤矮：
+                // 挤矮会让列表高度随脚注出现/消失跳变，而撤销条是 4 秒后自动
+                // 消失的瞬态元素，那种跳变会很显眼。
+                Box(
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(QueueUndoBarHeight),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    footer.invoke()
+                }
+            }
+        }
+    }
+}
+
+/** 撤销条固定高度（dp）：一行 Caption（17 行高）+ 上下 padding 各 8 + 余量 */
+private val QueueUndoBarHeight = 48.dp
+
+/**
+ * 面板共同骨架：scrim + 入场动画 + 玻璃卡 + 把手 + 标题。
+ *
+ * 抽出来的唯一目的是让 [GlassSheet] 与 [GlassSheetLazy] 共享**除滚动容器之外**的一切
+ * （入场/退场动画、遮罩、把手、标题层级、高度约束推导）。复制一份的结果是：
+ * 任何一次视觉调整都要记得改两处，而漏掉的那一处会静默漂移。
+ *
+ * @param scrollableContent 收到「内容区最大高度」，自行决定怎么用（普通列 / Lazy 列）
+ */
+@Composable
+private fun GlassSheetScaffold(
+    visible: Boolean,
+    onDismiss: () -> Unit,
+    title: String,
+    modifier: Modifier,
+    scrollableContent: @Composable (contentMaxHeight: Dp) -> Unit,
+) {
     // 用 MutableTransitionState 而不是 visible 布尔 + AnimatedVisibility：那是唯一能
     // 「知道退场动画真的跑完了」的公开入口（isIdle 且 targetState=false）。宿主据此清 content，
     // 取代「按 tweenPage 时长 delay」——delay 与动画不同源（起表差一帧 / 退场掉帧 /
@@ -484,22 +631,23 @@ fun GlassSheet(
                         // 内边距先行扣减），把「剩余可用高度」作为 mainAxisMax 传给本列。
                         // 于是横屏极小屏（360dp）上 280dp 会被父约束自动压到约 244dp，
                         // 面板不会被顶穿、也不会被 GlassSurface 的 clip 裁掉。
-                        // 换句话说：**下限表达「别太矮」，上限由布局本身负责**——
-                        // 手写 `coerceAtMost(screenHeight - 骨架)` 与父约束效果等价，
-                        // 只是多一处要跟着改的魔数（已按 920/640/420/360dp 逐项核算）。
                         //
                         // 顺序要求：heightIn 必须作用在滚动**视口**上（排在 verticalScroll
                         // 之前）。反过来的话它约束的是滚动内容而不是视口，max 就不再是
                         // 「面板最多多高」而是「内容最多多高」，语义和实际效果都变了。
+                        //
+                        // ## 注意：这个值是「面板内容区的外层上限」，不是内层可用的绝对值
+                        // 对普通版（verticalScroll）无害——verticalScroll 的视口会自己
+                        // 服从父约束（被压到 438dp 也照常滚动，只是矮一点）。
+                        // 但对 **lazy 版**它是个坑：LazyColumn 会拿这个值当**确定高度**
+                        // 声明，而父级实际只给得出「此值 − 骨架（navbar+padding+把手+标题）」，
+                        // 两者错位导致列表绘制/命中区溢出卡片。所以 `GlassSheetLazy`
+                        // 内部会再扣一次骨架（见该函数），这里保持原值不变。
                         val screenHeight = LocalConfiguration.current.screenHeightDp
                         val contentMaxHeight = (screenHeight * 0.65f).dp.coerceAtLeast(280.dp)
-                        Column(
-                            Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = contentMaxHeight)
-                                .verticalScroll(scrollState),
-                            content = content,
-                        )
+                        // 滚动容器由调用方（GlassSheet / GlassSheetLazy）提供，
+                        // 这一层只负责「把有界高度传下去」与外壳装饰
+                        scrollableContent(contentMaxHeight)
                     }
                 }
             }
@@ -618,10 +766,46 @@ private fun SectionLabel(text: String) {
 }
 
 /**
+ * 队列面板段头的**固定高度**（dp）。
+ *
+ * 为什么这个数必须写成常量、而不是靠测量：拖拽重排的行数学需要知道「接下来」段
+ * 顶部在列表内容坐标里的偏移，而 LazyColumn 的 item 坐标无法可靠测量
+ * （理由见 [rememberReorderableLazyState] 的 KDoc）。既然只能算，就必须把
+ * 段头高度钉成一个**与实际布局一致**的常量。
+ *
+ * 当前值 = padding(top S.Gap12 = 12) + padding(bottom 4) + Micro 行高(LHMicro = 14) = 30dp。
+ * **改 SectionLabel 的内边距或字号时必须同步改这里**，否则拖拽的目标槽位会整体偏移。
+ * 之所以只留这一个常量而不是算三个：已播放 / 正在播放 / 接下来 三个段头用的是
+ * 同一套内边距与同一个字号（见 [SectionLabel] 与下面 upcoming-header 的 Row），
+ * 高度天然相同。
+ */
+private val SheetSectionLabelHeight = 30.dp
+
+/**
  * 播放队列面板（两段式）：已播段（普通行）/ 正在播放（波形高亮、不可拖不可删）
  * / 接下来（可拖拽重排、可移除、可清空）。
  * 行序 = 播放器队列平铺序；拖拽域仅「接下来」段（onMove 索引已换算回队列空间，
  * 全部 > 当前曲索引 → 当前曲与引擎窗口不受影响）。
+ *
+ * ## 本轮：Lazy 化（挂起已久的性能项）
+ *
+ * 改动前是 `Column + verticalScroll`：打开面板时**一次性组合全部行**。典型队列
+ * （<60 首）打开约 150ms，尚可；但数百首以上时每一行都要主线程同步解码封面
+ * （冷缓存 1-3ms/行），500 首就是数百 ms 的可见卡顿，且整段行全部常驻组合。
+ *
+ * 现在是 `LazyColumn`：只为视口内的行组合与解码。收益随队列长度线性放大。
+ *
+ * ## Lazy 化牵动了什么（这是它被挂起这么久的真实原因）
+ * 拖拽重排的行数学原本建立在 `ScrollState` 之上（[ReorderableColumn]），
+ * 而 `LazyColumn` 只有 `LazyListState`，且屏幕外的行**不被组合**——
+ * 「逐行 positionInParent」那套测量完全不成立。修复方式见
+ * [rememberReorderableLazyState]：靠「段内行高恒定 + 段延伸到末尾」这两条不变量，
+ * 把行数学简化回一维纯算术。
+ *
+ * ## 段头的位置为什么关键
+ * 可拖区段（「接下来」）之后**不能再有任何变高元素**（包括另一个段头），
+ * 否则「列表内容偏移 = 首可见下标 × 行高」这条推算失效。撤销条因此被放在
+ * LazyColumn **之外**（面板内容列的最后一项），而不是作为列表 item 追加。
  */
 @Composable
 fun QueueSheet(
@@ -634,138 +818,238 @@ fun QueueSheet(
     onRemove: (index: Int) -> Unit,
     onClearUpNext: () -> Unit,
     isPlaying: Boolean = true,
+    /**
+     * A-3：撤销窗口。
+     *
+     * 三个参数都是**由调用方（AppState）驱动**的最小面：数量决定撤销条显不显示、
+     * 文案要写几首；[onUndoClearUpNext] 返回 false 表示现场已失效，本面板据它决定
+     * 要不要给「无法撤销」的回执；[onDismissUndo] 让超时与主动关闭都收敛到状态层
+     * 一处（面板自己不持有计时，否则面板被关掉后计时就断了，撤销窗口会永远开着）。
+     *
+     * 为什么撤销条做在**面板内**而不是 App 级浮层：清空动作发生在面板里，
+     * 撤销条贴着发生地出现，用户不需要把视线移出面板去找「刚才那个东西在哪」。
+     * 代价是关掉面板就失去撤销入口——这与 4 秒窗口一致（超过窗口本来也不给撤销）。
+     */
+    undoClearCount: Int = 0,
+    onUndoClearUpNext: () -> Boolean = { false },
+    onDismissUndo: () -> Unit = {},
 ) {
-    val scrollState = rememberScrollState()
+    val listState = rememberLazyListState()
     val density = LocalDensity.current
     val glass = LocalGlassColors.current
-    // 定位数学全程 Float（A2-04）：rowPx/labelPx 先 toInt 再乘索引会让截断误差随行数
-    // 线性放大（66dp×2.75 密度每行丢 0.5px，500 行 ≈250px≈1.4 行）——乘完再取整
     val rowPx = with(density) { SongRowHeight.toPx() }
-    // 段头标签（已播放/正在播放）近似高度：定位公式要计入，否则当前曲定位偏低
-    val labelPx = with(density) { 34.dp.toPx() }
     // 空队列时 lastIndex=-1，coerceIn(0,-1) 会抛 IAE（冷启动默认屏=Player，权限拒/无音频即触发）
     val safeIndex = if (queue.isEmpty()) 0 else currentIndex.coerceIn(0, queue.lastIndex)
     // 长拖中自动切歌会推进 currentIndex：onMove 换算必须读实时值，否则松手提交时用的是
     // 拖拽起点的陈旧基准，会把「接下来」段内的相对位置搬到错误的队列绝对索引上
     val liveSafeIndex by rememberUpdatedState(safeIndex)
+    val upcomingCount = (queue.size - safeIndex - 1).coerceAtLeast(0)
+
+    // ── 「接下来」段顶部在列表内容坐标里的 y（px）──
+    //
+    // **纯算术，不测量**（理由见 rememberReorderableLazyState 的 KDoc）：
+    // 段头之前的内容结构是确定的——
+    //   已播放段头 + 已播行数×行高 + 正在播放段头 + 1×行高 + 接下来段头
+    // 段内第 0 行的顶边就是这些之和。
+    //
+    // 三个段头高度相同（同一个 SectionLabel / 同一套内边距），所以只有一个常量。
+    // **改段头内边距或字号时必须同步改 SheetSectionLabelHeight**，否则目标槽位整体偏移。
+    val sectionTopPx = with(density) {
+        val header = SheetSectionLabelHeight.toPx()
+        val played = if (safeIndex > 0) header + safeIndex * rowPx else 0f
+        val current = header + rowPx          // 「正在播放」段头 + 当前曲一行
+        played + current + header             // + 「接下来」段头
+    }
+
+    // 打开面板时定位到当前曲（与原实现同语义）。
+    // Lazy 版改用 scrollToItem：直接按「第几个 item」定位，不再需要手算像素——
+    // 这本身是 Lazy 化的一个附带收益（原实现要计入段头高度 labelPx 的估算误差）。
     LaunchedEffect(visible, currentIndex) {
         if (!visible) return@LaunchedEffect
-        // 用户正在滚动/拖拽时跳过跟随（A2-03）：自动切歌不该把浏览中的视口无动画拽走，
-        // 下一次 currentIndex 变化会重试；打开面板的首次定位不受影响（此时无人滚动）
-        if (scrollState.isScrollInProgress) return@LaunchedEffect
-        // 等面板完成布局（maxValue>0）后按行高定位
-        withTimeoutOrNull(500) {
-            while (scrollState.maxValue <= 0) withFrameNanos { }
-        }
-        // 当前曲上方内容 = 前段行 + 段头标签；目标停在当前曲上一行（无前段则顶到 0）
-        val above = safeIndex * rowPx + (if (safeIndex > 0) 2 else 1) * labelPx
-        val target = (above - rowPx).roundToInt().coerceIn(0, scrollState.maxValue)
-        scrollState.scrollTo(target)
+        // 用户正在滚动/拖拽时跳过跟随（A2-03）：自动切歌不该把浏览中的视口拽走
+        if (listState.isScrollInProgress) return@LaunchedEffect
+        // item 布局：0 = 已播放段头（仅当 safeIndex > 0）、之后是已播行、
+        // 然后是「正在播放」段头 + 当前行。目标 = 让当前曲**上一行**停在顶部。
+        val playedHeader = if (safeIndex > 0) 1 else 0
+        val currentRowItemIndex = playedHeader + safeIndex + 1 // +1 = 「正在播放」段头
+        val target = (currentRowItemIndex - 1).coerceAtLeast(0)
+        listState.scrollToItem(target)
     }
-    GlassSheet(
+
+    // 拖拽状态：段内行数 = upcomingCount，段首位置由上面量得的 sectionTopPx 提供
+    val reorder = rememberReorderableLazyState(
+        listState = listState,
+        rowHeight = SongRowHeight,
+        count = upcomingCount,
+        sectionTopPx = { sectionTopPx },
+        onMove = { from, to -> onMove(from + liveSafeIndex + 1, to + liveSafeIndex + 1) },
+        // 内容版本指纹 = 「行下标 → 队列索引」映射的基准（见原实现的详细推导）：
+        // 只取「当前曲索引 + 当前曲 id」，段内重排不会改变它，而自动切歌 / 引擎队列
+        // 回流都会改变它 → 覆盖全部会导致错位的场景，又不干扰刚落位的补间。
+        dataVersion = safeIndex to queue.getOrNull(safeIndex)?.id,
+    )
+
+    GlassSheetLazy(
         visible = visible, onDismiss = onDismiss,
-        title = "播放队列 · ${queue.size} 首", scrollState = scrollState,
+        title = "播放队列 · ${queue.size} 首",
+        listState = listState,
+        // 撤销条走脚注槽（面板内、LazyColumn 之外）：
+        // 它不能是列表 item —— 「接下来」段必须一直延伸到列表末尾，
+        // 段内出现任何变高元素都会让拖拽的行数学（列表偏移 = 首可见下标 × 行高）失效。
+        footer = if (undoClearCount > 0) {
+            {
+                QueueUndoBar(
+                    count = undoClearCount,
+                    onUndo = {
+                        onUndoClearUpNext()
+                        onDismissUndo()
+                    },
+                )
+            }
+        } else {
+            null
+        },
     ) {
         if (queue.isEmpty()) {
-            // 空队列空态：旧实现先画「正在播放」段头、再在取行时 return@GlassSheet，
+            // 空队列空态：旧实现先画「正在播放」段头、再在取行时提前 return，
             // 结果是一个孤立的「正在播放」标签 + 大片空白（曲库未装载/权限被拒时点队列即可见）。
-            Text(
-                "队列是空的 · 去曲库挑一首开始播放",
-                color = glass.textTertiary, style = GlassText.Body,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().padding(vertical = S.Gap32.dp),
-            )
-            return@GlassSheet
+            item(key = "queue-empty") {
+                Text(
+                    "队列是空的 · 去曲库挑一首开始播放",
+                    color = glass.textTertiary, style = GlassText.Body,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = S.Gap32.dp),
+                )
+            }
+            return@GlassSheetLazy
         }
+        // ── 已播放段（懒加载，key = 稳定曲目 id）──
         if (safeIndex > 0) {
-            SectionLabel("已播放 · $safeIndex 首")
-            queue.take(safeIndex).forEachIndexed { index, song ->
+            item(key = "played-header") { SectionLabel("已播放 · $safeIndex 首") }
+            itemsIndexed(
+                items = queue.take(safeIndex),
+                key = { _, song -> "played-${song.id}" },
+            ) { index, song ->
                 SongRow(song = song, onClick = { onPick(index) })
             }
         }
-        SectionLabel("正在播放")
-        SongRow(
-            song = queue.getOrNull(safeIndex) ?: return@GlassSheet,
-            playing = true,
-            wavePlaying = isPlaying,
-            onClick = { onPick(safeIndex) },
-        )
-        val upcomingCount = queue.size - safeIndex - 1
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap12.dp, bottom = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                "接下来 · $upcomingCount 首",
-                color = glass.textTertiary, style = GlassText.SectionLabelMicro,
-            )
-            Spacer(Modifier.weight(1f))
-            if (upcomingCount > 0) {
-                val clearInteraction = remember { MutableInteractionSource() }
-                // A4 破坏性色：这里原来用 accent（auroraAccentColor）——
-                // 「清空接下来」会**不可撤销**地丢掉整个待播段，却与「全部播放」这类
-                // 常规动作用了同一个强调色，等于没有任何风险信号。
-                // 改读 glass.destructive（低饱和暖红，见 GlassColors.destructive 的推导）。
-                //
-                // 本轮范围说明：只改「清空接下来」这一处。删除歌单的确认行在
-                // ActionsSheet.kt（别人写域），那些调用点走 SheetAction 新增的
-                // `destructive = true` 形参；本文件只负责把参数实现出来。
-                Text(
-                    "清空",
-                    color = glass.destructive, style = GlassText.CaptionMedium,
-                    modifier = Modifier
-                        .pressScale(clearInteraction, pressed = 0.92f)
-                        .clickable(interactionSource = clearInteraction, indication = null, onClick = onClearUpNext)
-                        // 读屏（无障碍 P0-4）：可见文字只有「清空」两个字，脱离视觉上下文时
-                        // 读屏念出来是歧义的——「清空」什么？整个队列？搜索框？当前筛选？
-                        // 它实际只清「接下来」这一段（当前曲与已播段不受影响），
-                        // 所以这里用 contentDescription 把**作用域**说清楚，并补 role = Button
-                        // （纯 Text + clickable 不会自动获得按钮角色，读屏不提示「双击激活」）。
-                        // 注意 contentDescription 会**覆盖**子 Text 的文字，不再重复播报。
-                        .semantics {
-                            this.role = Role.Button
-                            this.contentDescription = SheetA11y.CLEAR_UP_NEXT
-                        }
-                        .padding(horizontal = 6.dp, vertical = 4.dp),
+        item(key = "current-header") { SectionLabel("正在播放") }
+        item(key = "current-row") {
+            val current = queue.getOrNull(safeIndex)
+            if (current != null) {
+                SongRow(
+                    song = current,
+                    playing = true,
+                    wavePlaying = isPlaying,
+                    onClick = { onPick(safeIndex) },
                 )
             }
         }
+        // 「接下来」段头：**必须在这个位置**——它下方的所有行都是可拖区段，
+        // 且区段内不能有任何变高元素（见 KDoc 的段头位置说明）。
+        item(key = "upcoming-header") {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap12.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "接下来 · $upcomingCount 首",
+                    color = glass.textTertiary, style = GlassText.SectionLabelMicro,
+                )
+                Spacer(Modifier.weight(1f))
+                if (upcomingCount > 0) {
+                    val clearInteraction = remember { MutableInteractionSource() }
+                    // A4 破坏性色：「清空接下来」会丢掉整个待播段，与「全部播放」这类
+                    // 常规动作用同一个强调色等于没有风险信号 → 读 glass.destructive
+                    Text(
+                        "清空",
+                        color = glass.destructive, style = GlassText.CaptionMedium,
+                        modifier = Modifier
+                            .pressScale(clearInteraction, pressed = 0.92f)
+                            .clickable(interactionSource = clearInteraction, indication = null, onClick = onClearUpNext)
+                            // 读屏：可见文字只有「清空」，脱离上下文有歧义——
+                            // 用 contentDescription 把**作用域**说清楚（只清「接下来」），
+                            // 并补 role = Button（纯 Text + clickable 不会自动获得按钮角色）
+                            .semantics {
+                                this.role = Role.Button
+                                this.contentDescription = SheetA11y.CLEAR_UP_NEXT
+                            }
+                            .padding(horizontal = 6.dp, vertical = 4.dp),
+                    )
+                }
+            }
+        }
+        // ── 接下来段（可拖拽，懒加载）──
         if (upcomingCount > 0) {
-            // 内容版本指纹 = 「行下标 → 队列索引」这段映射的基准。映射是
-            // safeIndex + 1 + upcomingIndex，所以基准就是 safeIndex。
-            //
-            // 缺陷：行槽与手势闭包都按 upcomingIndex 冻结，提交时 onMove 才把 (from, to)
-            // 换算成队列绝对索引；长拖期间自动切歌推进 currentIndex → 「接下来」段整体
-            // 位移一格 → 同一批下标指向的歌整体错位 → 松手提交的是错歌（不可撤销）。
-            // 传版本让 ReorderableColumn 重建行槽并重启手势，语义 =
-            // 「拖拽中切歌则本次拖拽作废」。
-            //
-            // 为什么不掺「段内顺序」（段首曲 id / 队列长度）：段内重排的 onMove 提交本身
-            // 就会改变段内顺序，若把它算进版本，提交那一刻版本就变 → 槽位重建 + 手势重启
-            // 顺手取消掉刚落位的补间（第 4 项直接失效）。这里只取「当前曲索引 + 当前曲 id」
-            // ——段内重排只动 > safeIndex 的区间，这两者都不变；而自动切歌、引擎队列回流
-            // （当前曲被替换）都会变，覆盖全部会导致错位的情形。
-            //
-            // 代价：位移那一帧拖拽视觉中断（行回槽位、需重新长按）。取舍理由：正在自动
-            // 切歌时本就不该拖队列，丢一次手势远比提交一次错位移动安全。
-            val upcomingVersion = safeIndex to queue.getOrNull(safeIndex)?.id
-            ReorderableColumn(
-                count = upcomingCount,
-                rowHeight = SongRowHeight,
-                scrollState = scrollState,
-                onMove = { from, to -> onMove(from + liveSafeIndex + 1, to + liveSafeIndex + 1) },
-                autoscroll = true,
-                dataVersion = upcomingVersion,
-            ) { upcomingIndex ->
-                val queueIndex = safeIndex + 1 + upcomingIndex
+            itemsIndexed(
+                items = List(upcomingCount) { safeIndex + 1 + it },
+                key = { _, queueIndex -> "upcoming-${queue[queueIndex].id}" },
+            ) { upcomingIndex, queueIndex ->
                 SongRow(
                     song = queue[queueIndex],
-                    onClick = { onPick(queueIndex) },
+                    // 拖拽手势 + 让位/落位位移全挂在这一行的根节点上
+                    modifier = reorder.rowModifier(upcomingIndex, dataVersion = safeIndex),
+                    // ⚠ 拖拽期间**不可点击**：长按起拖后松手会同时触发 click（Compose 的
+                    // clickable 与 detectDragGesturesAfterLongPress 会各自收到事件）。
+                    // 原实现同样有此问题但被「拖完通常不在同一行」掩盖；Lazy 下更容易误触，
+                    // 这里显式在拖拽中忽略点击。
+                    onClick = { if (reorder.dragFrom < 0) onPick(queueIndex) },
                     onRemoveClick = { onRemove(queueIndex) },
                 )
             }
+        }
+    }
+}
+
+/**
+ * 队列撤销浮条（面板底部）。
+ *
+ * ## 为什么它不在 LazyColumn 里
+ * 「接下来」段必须一直延伸到列表末尾——段内出现任何变高元素（包括这条撤销条），
+ * 拖拽的行数学（`列表偏移 = 首可见下标 × 行高`）立刻失效。这是 Lazy 化的硬约束。
+ *
+ * ## 为什么不做成覆盖在面板上的浮层
+ * 覆盖会挡住列表最后一行（用户刚清空、正想看还剩下什么）。这里用**纵向追加**：
+ * 它占面板底部的固定高度，列表在它上方滚动——不遮任何内容。
+ */
+@Composable
+private fun QueueUndoBar(count: Int, onUndo: () -> Unit) {
+    AnimatedVisibility(
+        visible = count > 0,
+        enter = androidx.compose.animation.expandVertically() + androidx.compose.animation.fadeIn(),
+        exit = androidx.compose.animation.shrinkVertically() + androidx.compose.animation.fadeOut(),
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap8.dp, bottom = S.Gap8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "已清空 $count 首",
+                color = LocalGlassColors.current.textTertiary,
+                style = GlassText.Caption,
+            )
+            Spacer(Modifier.weight(1f))
+            val undoInteraction = remember { MutableInteractionSource() }
+            Text(
+                "撤销",
+                // 用强调色而不是 destructive：撤销是**挽回**动作，与「删除」的风险
+                // 语义相反。红色在这里会让用户以为这一步也有风险。
+                color = auroraAccentColor(),
+                style = GlassText.CaptionMedium,
+                modifier = Modifier
+                    .pressScale(undoInteraction, pressed = 0.92f)
+                    .clickable(interactionSource = undoInteraction, indication = null, onClick = onUndo)
+                    // 读屏：可见文字只有「撤销」，脱离上下文同样歧义
+                    .semantics {
+                        this.role = Role.Button
+                        this.contentDescription = "撤销清空，恢复 $count 首待播曲目"
+                    }
+                    .padding(horizontal = 6.dp, vertical = 4.dp),
+            )
         }
     }
 }

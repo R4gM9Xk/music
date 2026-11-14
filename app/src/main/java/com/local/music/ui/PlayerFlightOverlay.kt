@@ -15,6 +15,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -48,6 +49,10 @@ import com.local.music.core.ui.components.FlightKeys
 import com.local.music.core.ui.components.GlassNavBar
 import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.components.PlayerFlight
+import com.local.music.core.ui.components.drawLiquidGlass
+import com.local.music.core.ui.components.liquidFill
+import com.local.music.core.ui.components.liquidGlassBrushes
+import com.local.music.core.ui.components.liquidHazeTint
 import com.local.music.core.ui.theme.GlassColors
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalAuroraPalette
@@ -81,8 +86,14 @@ import kotlin.math.roundToInt
  * **必须改**（本轮已改，逐条见各调用点注释）：
  * 1. 歌名替身的 `sizeTo` 16→20、新增 `lineFrom/lineTo`（21→26）、字重 SemiBold→Bold
  *    —— 真身换了排版档（Heading → Title），字号/行高/字重都不再一致；
- * 2. 副标题两端补 `lineFrom/lineTo`（14→16，两端都是 Caption，等值是**精确端点**）；
- * 3. 与之无关但一并核过：`PlayerGlass` 的 rect 变小后，[FlightGlassPanel] 的 R28 圆角与
+ * 2. 歌手行两端都是 Caption（12/16）——迷你条真身与播放页副标题同 token，
+ *    替身的 `sizeFrom/lineFrom` 必须同值，不是「插值用的近似值」；
+ * 3. 迷你条进度线：真身 D6 已改**纯 seed2**，替身不得再画渐变（否则右端跳色）；
+ * 4. 封面起点圆角：真身 C4 嵌套圆角是 **16dp**（字面量），替身起点不得再用 R.Thumb10
+ *    （旧值 10dp 让 42dp 封面四角弧线差 6dp）；
+ * 5. 玻璃面板落点端：真身 v11 已升 **GlassLevel.Liquid**（方向性斜面 + specular、
+ *    无描边/顶线），替身必须落在同一档——见 [FlightGlassPanel] 的 KDoc；
+ * 6. 与之无关但一并核过：`PlayerGlass` 的 rect 变小后，[FlightGlassPanel] 的 R28 圆角与
  *    描边画法仍然成立（它按 size 自适应画，无硬编码宽高）。
  *
  * **必须在 PlayerScreen 侧同步**（不在本文件，列出以免漏）：歌名组出卡后不再是玻璃卡的
@@ -145,18 +156,18 @@ fun PlayerFlightOverlay(
             // Exiting 侧同理给 0 下限：beginExit 的 snapTo(1f) 在协程首帧才生效，
             // 首帧读到 t=0 会让替身与迷你条真身同时隐身（双隐闪）。
             .graphicsLayer {
-                val t = tAt()
+                // 单影原则（几何重合驱动，取代按路径 t 的固定交叉窗）：替身只在「途中」可见，
+                // 接近任一端点时让位给该端真身（真身按 PlayerFlight.*Coincidence 同窗渐入）。
+                // 旧固定窗在快起慢收缓动下与真身空间错位同时可见 = 进入/退出重影（录屏实证）。
+                // **enteringWait 必须恒 1**：等待期 Chrome 已卸载、替身是唯一的迷你条视觉，
+                // 若还让 alpha 由 t 派生，而 t 又因中止/上一轮残留不为 0，替身就直接隐形 →
+                // 迷你条闪没（正是这套替身机制本来要消灭的问题）。
                 alpha = when {
                     enteringWait -> 1f
-                    flight.phase == PlayerFlight.Phase.Entering -> ((1f - t) / 0.12f).coerceIn(0f, 1f)
-                    flight.phase == PlayerFlight.Phase.Exiting -> {
-                        // 两端交叉窗（时间等效）：起飞端 50% 路径渐入——与真身控制台的渐出曲线
-                        // （playerSharedAlpha 退出端 (t-0.5)/0.5）**互补**（两者和恒为 1），
-                        // 相同内容的玻璃/封面交叉时无亮度叠加；50% 而非对称 12% 是因为缓动
-                        // 起步快，12% 路径只相当于 ~28ms（依旧近似硬切）。落地端 12% 渐出
-                        // 让位迷你条真身（缓动慢尾巴 ≈165ms，与进场端一致）
-                        minOf((1f - t) / 0.5f, t / 0.12f).coerceIn(0f, 1f)
-                    }
+                    flight.phase == PlayerFlight.Phase.Entering ->
+                        (1f - flight.playerCoincidence()).coerceIn(0f, 1f)
+                    flight.phase == PlayerFlight.Phase.Exiting ->
+                        (1f - maxOf(flight.playerCoincidence(), flight.miniCoincidence())).coerceIn(0f, 1f)
                     else -> 1f
                 }
                 // 按压回弹接续（衔接修复②）：迷你条的 pressScale(.97) 回弹被 Chrome 卸载
@@ -196,7 +207,7 @@ fun PlayerFlightOverlay(
             }
         }
 
-        // ── 玻璃面板：Hi(迷你条) → Md(控制台)，填充/模糊半径随 t 插值，R角两端同为 28 ──
+        // ── 玻璃面板：Hi(迷你条) → Liquid(控制台)，填充/装饰随 t 插值，R角两端同为 28 ──
         run {
             val rect = flightRect(FlightKeys.MiniGlass, FlightKeys.PlayerGlass)
             FlightGlassPanel(
@@ -204,10 +215,13 @@ fun PlayerFlightOverlay(
                 tAt = tAt,
                 hazeState = appHaze,
                 glass = glass,
+                // specular 的光影驱动与真身控制台同值（state.progressFraction）：
+                // 落地帧亮斑位置不能跳。progressProvider 本来就是绘制期取值函数。
+                liquidMotion = progressProvider,
                 modifier = Modifier.flightOffset(rect, tAt).flightSize(rect, tAt),
             )
             // ── 迷你条进度线替身：真身迷你条底部 2.5dp 进度线（12dp 内缩、2dp 圆角、
-            //    15% 轨道 + seed2→textPrimary 渐变已播段）。替身缺了它，点按瞬间这条线
+            //    15% 轨道 + **纯 seed2** 已播段，D6）。替身缺了它，点按瞬间这条线
             //    会凭空消失、落地时又凭空出现；控制台端没有此元素，随 t 淡出。t=0 时与
             //    真身逐像素一致（几何/配色/裁切同源复制）。
             Box(
@@ -232,11 +246,13 @@ fun PlayerFlightOverlay(
                             size = Size(lineW, h),
                             cornerRadius = CornerRadius(2.dp.toPx()),
                         )
-                        // 已播段（真身：seed2 → textPrimary 渐变，宽度 = 进度 × 线宽）
+                        // 已播段（真身 D6：纯 seed2，宽度 = 进度 × 线宽）。
+                        // 旧实现画 seed2→textPrimary 渐变：真身删掉渐变后，替身的线右端
+                        // 在起飞/落地那一帧会跳色——「改真身忘改对端」的典型。
                         val w = lineW * progressProvider().coerceIn(0f, 1f)
                         if (w > 0f) {
                             drawRect(
-                                brush = Brush.horizontalGradient(listOf(palette.seed2, glass.textPrimary)),
+                                color = palette.seed2,
                                 topLeft = Offset(inset, y),
                                 size = Size(w, h),
                             )
@@ -245,7 +261,7 @@ fun PlayerFlightOverlay(
             )
         }
 
-        // ── 封面：42dp/R11 ⇄ 大封面/R28，阴影 0→18 渐起 ──
+        // ── 封面：42dp/R16 ⇄ 大封面/R28，阴影 0→18 渐起 ──
         if (!skipCover) {
             val rect = flightRect(FlightKeys.MiniCover, FlightKeys.PlayerCover)
             Box(
@@ -253,12 +269,14 @@ fun PlayerFlightOverlay(
                     .flightOffset(rect, tAt)
                     .flightSize(rect, tAt)
                     .graphicsLayer {
-                        // R角 10→28 与阴影 0→18 都在绘制期求值（层级属性直更，零重组）；
+                        // R角 16→28 与阴影 0→18 都在绘制期求值（层级属性直更，零重组）；
                         // shape+clip 等价原 .clip(lerp 形状)，shadowElevation 等价原 .shadow。
-                        // from 端必须是 R.Thumb10：迷你条真身封面就是 R10（旧 11dp 起点导致
-                        // 点按/落地瞬间封面圆角差 1dp，四角弧线肉眼可辨）
+                        // from 端必须是 **16dp 字面量**：迷你条真身封面是 C4 嵌套圆角
+                        // （Chrome.kt：外容器 R28 − 内边距 12dp = 16dp，那里也是字面量，
+                        // 因为 R.nested 是运行时引用、曾触发 dex 剔除 P0）。旧值 R.Thumb10=10dp
+                        // 让 42dp 封面的四角弧线在点按/落地瞬间差 6dp，肉眼可辨。
                         val t = tAt()
-                        shape = RoundedCornerShape(lerp(R.Thumb10.dp, R.Player28.dp, t))
+                        shape = RoundedCornerShape(lerp(16.dp, R.Player28.dp, t))
                         clip = true
                         shadowElevation = lerp(0.dp, 18.dp, t).toPx()
                     }
@@ -273,7 +291,7 @@ fun PlayerFlightOverlay(
                             color = lerp(glass.strokeSoft, glass.stroke, t),
                             topLeft = Offset(sw / 2f, sw / 2f),
                             size = Size(size.width - sw, size.height - sw),
-                            cornerRadius = CornerRadius(lerp(R.Thumb10.dp, R.Player28.dp, t).toPx() - sw / 2f),
+                            cornerRadius = CornerRadius(lerp(16.dp, R.Player28.dp, t).toPx() - sw / 2f),
                             style = Stroke(sw),
                         )
                     },
@@ -321,8 +339,11 @@ fun PlayerFlightOverlay(
             FlightLabel(
                 text = song.artist,
                 color = glass.textSecondary,
-                sizeFrom = 11f, sizeTo = 12f,
-                lineFrom = 14f, lineTo = 16f,
+                // 起点必须对齐迷你条真身的 Caption（Chrome.kt B3：12sp/16）。旧实现写
+                // 11sp/14（B3 之前的残留）：起飞瞬间副标题会缩小一档，且 :335 的注释
+                // 自称「精确端点」却与代码矛盾——这正是「改真身忘改对端」的第三处。
+                sizeFrom = 12f, sizeTo = 12f,
+                lineFrom = 16f, lineTo = 16f,
                 fontWeight = null,
                 rect = artistRect,
                 tAt = tAt,
@@ -333,8 +354,8 @@ fun PlayerFlightOverlay(
                 color = glass.textSecondary,
                 // 副标题两端都是 GlassText.Caption（12/16），迷你条艺术家端是同一 token，
                 // 所以 sizeFrom 与 lineFrom 在这里**不是插值用的近似值**，而是精确端点。
-                sizeFrom = 11f, sizeTo = 12f,
-                lineFrom = 14f, lineTo = 16f,
+                sizeFrom = 12f, sizeTo = 12f,
+                lineFrom = 16f, lineTo = 16f,
                 fontWeight = null,
                 rect = artistRect,
                 tAt = tAt,
@@ -361,17 +382,27 @@ fun PlayerFlightOverlay(
                         .clip(CircleShape)
                         .background(Brush.linearGradient(listOf(glass.hi, glass.lo)))
                         .border(1.dp, glass.stroke, CircleShape)
-                        .drawBehind {
-                            drawLine(
-                                brush = Brush.horizontalGradient(
-                                    listOf(Color.Transparent, Color.White.copy(alpha = 0.5f), Color.Transparent),
-                                    startX = size.width * 0.15f,
-                                    endX = size.width * 0.85f,
-                                ),
-                                start = Offset(size.width * 0.15f, 0.5f),
-                                end = Offset(size.width * 0.85f, 0.5f),
-                                strokeWidth = 1.dp.toPx(),
+                        // 顶线 Brush 进 drawWithCache：旧 drawBehind 每次绘制都 new 一个
+                        // horizontalGradient（Shader 级分配），飞行 500ms × 60fps 是纯 GC
+                        // 压力。Brush 只依赖 size/颜色，cache 块天然覆盖失效条件（同
+                        // Glass.kt 的 glassTopLine 写法）。
+                        .drawWithCache {
+                            val startX = size.width * 0.15f
+                            val endX = size.width * 0.85f
+                            val topLine = Brush.horizontalGradient(
+                                listOf(Color.Transparent, Color.White.copy(alpha = 0.5f), Color.Transparent),
+                                startX = startX,
+                                endX = endX,
                             )
+                            val strokeWidth = 1.dp.toPx()
+                            onDrawBehind {
+                                drawLine(
+                                    brush = topLine,
+                                    start = Offset(startX, 0.5f),
+                                    end = Offset(endX, 0.5f),
+                                    strokeWidth = strokeWidth,
+                                )
+                            }
                         },
                 )
                 Icon(
@@ -406,19 +437,34 @@ fun PlayerFlightOverlay(
 }
 
 /**
- * 飞行替身的玻璃面板：Hi→Md 填充、模糊半径 26→20 全程随 t 插值，R角两端同为 28。
+ * 飞行替身的玻璃面板：Hi(迷你条) → **Liquid**(控制台)，R角两端同为 28。
  *
- * 与真身 [GlassSurface] 的三层结构逐层对齐（任何一层差一档，交接交叉淡化时就会
- * 明度/圆角跳变）：
- * - clip(R28)：迷你条与控制台真实端点都是 R.Player28，旧 20→28 lerp 与两端都不符；
- * - hazeEffect（tint=fill）：有 haze 时**不再叠 background(fill)**——真身 haze 路径
- *   就是 tint 单层承担填充（P3-78 双重填充修复），旧替身在 tint 上又画一层 fill，
- *   比真身亮近一倍，进出交接瞬间控制台/迷你条明度跳半档；
- * - scrim：迷你条真身带 chromeScrim（透字压制，α0.74~0.80），控制台没有——旧替身
- *   两端都没有，点按瞬间迷你条突然变透、落地又突然变实；现随 t 从 chromeScrim 淡到透明；
- * - 1px strokeSoft 描边 + 顶部亮线：与真身同源同序（描边内缩半线宽，亮线 8%~92%）。
- * 无 haze 退化路径（LocalHazeState 为 null）才回退普通 fill，对齐 GlassSurface 的 !hazed 分支。
- * haze 样式参数是仅有的组合期 t 读取（haze 1.6 无绘制期样式 API），隔离在本节点最小重组域。
+ * ## 为什么落点端必须是 Liquid（A4 审计 Minor-5）
+ *
+ * v11 把播放页控制台升到 `GlassLevel.Liquid`（方向性斜面 + specular、无描边、无顶线），
+ * 替身却仍落在 Md：落地交叉淡化窗内，均匀描边/顶线会「褪掉」、白霜色相偏移成 accent
+ * 有色、斜面与 specular 凭空出现——正是本文件 KDoc 警告的「任何一层差一档，交接时
+ * 明度跳变」。现在两端逐层同源：
+ *
+ * - **haze tint**：hi → [liquidHazeTint]（真身 `glassHaze` 的 Liquid 配方，跨模块共用
+ *   同一份函数，不复制 0.55/0.14 这些魔数）；
+ * - **模糊半径全程 26dp**：Hi 与 Liquid 的真身半径都是 26（Md 才是 20），旧实现
+ *   26→20 插值在落地端反而与真身差 6dp——这是**实打实的端点错误**，不是观感差异。
+ *   半径固定后，飞行中真正随 t 变的只剩 tint，`HazeStyle` 仍每帧重建一次（haze 1.6
+ *   的 API 天花板，样式对象只能在组合期构造），代价已收到最小；
+ * - **scrim**：迷你条真身带 chromeScrim（透字压制），控制台没有——随 t 淡到透明；
+ * - **描边 + 顶线**：Hi 独家装饰，alpha 随 t 淡出（Liquid 不画这两层）；
+ * - **方向性斜面 + specular**：alpha 随 t 淡入，t=1 时与真身共用 `liquidGlassBrushes` /
+ *   `drawLiquidGlass`（同一套笔刷与绘制顺序）。specular 的 motion 取播放进度，与真身
+ *   控制台的 `liquidMotion` 同值，落地帧亮斑位置不跳。
+ *
+ * 无 haze 退化路径（LocalHazeState 为 null）才回退普通 fill——终点是 **Liquid 的填充**
+ * （而非 Md），对齐 GlassSurface 的 !hazed 分支。
+ *
+ * haze 样式参数是仅有的组合期 t 读取（haze 1.6 无绘制期样式 API），隔离在本节点最小
+ * 重组域；其余全部在绘制期读取。Brush 全部在 drawWithCache 的 cache 块构造；飞行中
+ * 面板尺寸逐帧变化会令 cache 重建（这是尺寸真变的固有代价），但静止/等待期帧间复用，
+ * 且不再有 drawBehind 里的无条件 `horizontalGradient` 分配。
  */
 @Composable
 private fun FlightGlassPanel(
@@ -426,11 +472,13 @@ private fun FlightGlassPanel(
     tAt: () -> Float,
     hazeState: HazeState?,
     glass: GlassColors,
+    liquidMotion: () -> Float,
     modifier: Modifier = Modifier,
 ) {
+    val palette = LocalAuroraPalette.current
     // 仅有的组合期 t 读取：haze 样式参数（见上）
     val t = tAt()
-    val fill = lerp(glass.hi, glass.md, t)
+    val tint = lerp(glass.hi, liquidHazeTint(glass, palette), t)
     Box(
         modifier
             .clip(FlightPanelShape)
@@ -440,43 +488,52 @@ private fun FlightGlassPanel(
                         state = hazeState,
                         style = HazeStyle(
                             backgroundColor = Color.Transparent,
-                            tints = listOf(HazeTint(fill)),
-                            blurRadius = lerp(26.dp, 20.dp, t),
+                            tints = listOf(HazeTint(tint)),
+                            // 26dp 两端同值（Hi / Liquid 真身都是 26）；Md 才是 20。
+                            // 飞行中半径不变，只有 tint 随 t 走向 Liquid 配方。
+                            blurRadius = 26.dp,
                             noiseFactor = 0.05f,
-                            fallbackTint = HazeTint(fill),
+                            fallbackTint = HazeTint(tint),
                         ),
                     )
                 } else {
                     Modifier
                 },
             )
-            .drawBehind {
-                val t2 = tAt()
-                // 无 haze 退化路径才补填充（对齐 GlassSurface：有 haze 时填充交给 tint）
-                if (hazeState == null) drawRect(lerp(glass.hi, glass.md, t2))
-                // 迷你条专属 scrim 随 t 淡出（落点在 haze 结果之上、描边之下，同 GlassSurface 层序）
-                drawRect(lerp(glass.chromeScrim, Color.Transparent, t2))
-                // 1px 常规描边：内缩半线宽，对齐 Border 修饰符的画法（原 .border 等价）
+            .drawWithCache {
+                val topLine = Brush.horizontalGradient(
+                    listOf(Color.Transparent, glass.topLine, Color.Transparent),
+                    startX = size.width * 0.08f,
+                    endX = size.width * 0.92f,
+                )
+                val decor = liquidGlassBrushes(glass, size)
                 val sw = 1.dp.toPx()
-                drawRoundRect(
-                    color = glass.strokeSoft,
-                    topLeft = Offset(sw / 2f, sw / 2f),
-                    size = Size(size.width - sw, size.height - sw),
-                    cornerRadius = CornerRadius(R.Player28.dp.toPx() - sw / 2f),
-                    style = Stroke(sw),
-                )
-                // GlassSurface 顶部亮线（glassTopLine 为模块私有，此处同款复刻）——
-                // 保持在描边之后绘制：原实现 border 在 drawBehind 之前，顶边重叠处亮线在上
-                drawLine(
-                    brush = Brush.horizontalGradient(
-                        listOf(Color.Transparent, glass.topLine, Color.Transparent),
-                        startX = size.width * 0.08f,
-                        endX = size.width * 0.92f,
-                    ),
-                    start = Offset(size.width * 0.08f, 0.5f),
-                    end = Offset(size.width * 0.92f, 0.5f),
-                    strokeWidth = 1.dp.toPx(),
-                )
+                onDrawBehind {
+                    val t2 = tAt()
+                    // 无 haze 退化路径才补填充（有 haze 时填充交给 tint）
+                    if (hazeState == null) drawRect(lerp(glass.hi, glass.liquidFill, t2))
+                    // 迷你条专属 scrim 随 t 淡出（落点在 haze 结果之上、描边/装饰之下）
+                    drawRect(lerp(glass.chromeScrim, Color.Transparent, t2))
+                    // 1px 常规描边：Hi 专属，随 t 淡出（Liquid 不画均匀描边）
+                    drawRoundRect(
+                        color = glass.strokeSoft,
+                        topLeft = Offset(sw / 2f, sw / 2f),
+                        size = Size(size.width - sw, size.height - sw),
+                        cornerRadius = CornerRadius(R.Player28.dp.toPx() - sw / 2f),
+                        style = Stroke(sw),
+                        alpha = 1f - t2,
+                    )
+                    // 顶部亮线：同样是 Hi 独家装饰（Liquid 用方向性斜面替代），随后淡出
+                    drawLine(
+                        brush = topLine,
+                        start = Offset(size.width * 0.08f, 0.5f),
+                        end = Offset(size.width * 0.92f, 0.5f),
+                        strokeWidth = sw,
+                        alpha = 1f - t2,
+                    )
+                    // Liquid 装饰淡入：t=0 完全不可见（迷你条是 Hi），t=1 与真身同源同序
+                    drawLiquidGlass(decor, liquidMotion(), t2)
+                }
             },
     )
 }

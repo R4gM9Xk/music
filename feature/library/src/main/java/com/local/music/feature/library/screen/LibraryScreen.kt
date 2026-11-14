@@ -59,6 +59,7 @@ import com.local.music.core.ui.components.rowPressFeedback
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.SongSort
+import com.local.music.core.ui.state.ThemeMode
 import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
@@ -146,11 +147,18 @@ fun LibraryScreen(
             item {
                 PageHeader(
                     title = "音乐",
-                    // P3-4/P3-27：两种主题统一用 Moon（月亮=当前深浅态，点击切另一态）；
-                    // 原 Gear 实为太阳形，深色下语义混乱。理想是新增 Sun 图标，属后续项
-                    actionIcon = GlassIcons.Moon,
+                    // P3-4/P3-27（本轮完成）：深浅色切换用**真太阳**。
+                    //
+                    // 历史：原用 Gear（其实是「圆 + 放射线」的太阳形），深色下语义混乱；
+                    // 后来临时改成统一用 Moon，但那只解决了「不误导」——月亮在浅色模式下
+                    // 表达不了「切到深色」这件事（它说的是「现在是晚上」，而现在是白天）。
+                    //
+                    // 现在按**当前态**二选一：浅色显示 Moon（点了变深）、深色显示 Sun
+                    // （点了变浅）。这才是状态类按钮的正确语义——图标画的是「点下去会到哪」。
+                    // Gear 已同时重画成真齿轮，两者不再有任何混淆可能。
+                    actionIcon = if (state.themeMode == ThemeMode.Dark) GlassIcons.Sun else GlassIcons.Moon,
                     onAction = state::toggleTheme,
-                    actionLabel = "切换深浅色模式",
+                    actionLabel = if (state.themeMode == ThemeMode.Dark) "切换到浅色模式" else "切换到深色模式",
                     // 排序入口只对歌曲 tab 有意义：仅歌曲 tab 显示
                     action2Icon = if (tab == 0) GlassIcons.Sort else null,
                     onAction2 = {
@@ -204,6 +212,8 @@ fun LibraryScreen(
                             audioDenied = audioDenied,
                             onRequestAudioPermission = onRequestAudioPermission,
                             onOpenSettings = { state.screen = GlassScreen.Settings },
+                            // A-1：整库有歌但全被过滤掉时，空态要能解释「为什么空」
+                            excludedByFilter = state.filteredOutCount,
                         )
                     }
                 } else {
@@ -215,6 +225,17 @@ fun LibraryScreen(
                             onMoreClick = { songActions(song) },
                             onLongClick = { songActions(song) },
                             onClick = { state.playSong(song, songs, "曲库") },
+                            // 列表位移动画（本轮新增，A3-13）：
+                            // 切换排序方式（标题/艺术家/专辑/最近添加）时，同一批曲目会
+                            // **整体重排**。改动前行是瞬时硬切——用户点了「按艺术家排序」，
+                            // 列表「啪」地变成另一个顺序，眼睛无法追踪任何一行去了哪里，
+                            // 只能重新扫一遍。animateItem 让每行沿旧位 → 新位滑动，
+                            // 「同一首歌挪到了这里」这件事变得可读。
+                            //
+                            // 只在**有稳定 key** 的列表上加：没有 key 时 Compose 无法识别
+                            // 「这是同一行移动了」，animateItem 会退化成整片淡出淡入，
+                            // 反而比硬切更晃眼。本列表的 key = 稳定歌曲 id，满足前提。
+                            modifier = Modifier.animateItem(),
                         )
                     }
                 }
@@ -555,6 +576,20 @@ private fun LibraryEmptyState(
     audioDenied: Boolean,
     onRequestAudioPermission: () -> Unit,
     onOpenSettings: () -> Unit,
+    /**
+     * A-1（本轮）：**整库有曲目但全被过滤条件排除**的数量。
+     *
+     * 只有 > 0 时才替换副标题与 CTA 文案。旧实现在这个场景下与「手机里真没歌」显示
+     * 完全相同的一屏：标题「曲库里还没有歌曲」+ 副标题「可能还没有扫描，或扫描结果
+     * 被过滤条件排除了」+「去设置页扫描」。用户刚在设置里排除过一个目录（或开着
+     * 「扫描过滤 · 短于 30 秒」），回到曲库看到这一屏会判定「扫描没生效」，
+     * 于是反复重扫——重扫当然也不会有效果，因为他真正要改的是过滤条件。
+     *
+     * 现在这个数把「有两种原因」变成「就是这一种原因，去这里改」：
+     * 标题不变（事实仍是「看不见歌」），副标题给出确切数量，CTA 从「去设置页扫描」
+     * 改为「查看过滤设置」——同一个目的地（设置页），但文案说的是用户真正该做的事。
+     */
+    excludedByFilter: Int = 0,
 ) {
     if (audioDenied) {
         GlassEmptyState(
@@ -564,6 +599,19 @@ private fun LibraryEmptyState(
             // 应用内唯一的授权入口，历史审计明确记录过不可移除
             actionLabel = "去授权",
             onAction = onRequestAudioPermission,
+        )
+    } else if (excludedByFilter > 0) {
+        GlassEmptyState(
+            icon = GlassIcons.Folder,
+            // 标题仍说「没有歌曲」而不是「有歌曲被隐藏」：曲库页此刻确实是空的，
+            // 说谎会让用户下拉找并不存在的内容。
+            title = "曲库里还没有歌曲",
+            subtitle = "$excludedByFilter 首被过滤条件排除 · 关掉过滤即可看到",
+            // 目的地仍是设置页——但让文案指向真正要改的那两行（扫描过滤 / 过滤文件夹）。
+            // 不新造一个「直达过滤面板」的入口：那需要跨模块新增导航语义，
+            // 而设置页这两行本来就在同一屏、滚动两步可达。
+            actionLabel = "查看过滤设置",
+            onAction = onOpenSettings,
         )
     } else {
         GlassEmptyState(

@@ -1,6 +1,12 @@
 package com.local.music.core.ui.components
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -105,6 +111,17 @@ fun <T> SettingDropdown(
         animationSpec = GlassMotion.tweenHover(),
         label = "dropdownArrow",
     )
+    // 列表的进/出场也走同一条 tweenHover（A4 审计 Minor-9）：旧实现把 Popup 包在
+    // `if (expanded)` 里，箭头在 250ms 里平滑翻转、列表却瞬现瞬隐——同一个控件两种语言。
+    //
+    // 为什么不能直接 `if (expanded) { Popup { AnimatedVisibility(...) } }`：Popup 是
+    // 独立 window，expanded 一翻 false 窗口立刻销毁，退场动画永远没有机会执行。
+    // 因此用 MutableTransitionState 同时持有目标态与动画当前态：
+    // - target=true / current=false：进场中 → Popup 必须继续挂载；
+    // - target=false / current=true：退场中 → Popup 必须继续挂载；
+    // - 两者都 false：彻底收起 → 才移除 Popup（此时窗口不留任何空壳）。
+    val listTransition = remember { MutableTransitionState(false) }
+    listTransition.targetState = expanded
 
     Box(modifier) {
         Row(
@@ -143,7 +160,7 @@ fun <T> SettingDropdown(
             )
         }
 
-        if (expanded) {
+        if (listTransition.currentState || listTransition.targetState) {
             val offsetY = with(androidx.compose.ui.platform.LocalDensity.current) { 40.dp.roundToPx() }
             Popup(
                 // 对齐到胶囊的右下角向下偏移 40dp（胶囊高约 28dp + 12dp 间隙）：
@@ -154,15 +171,32 @@ fun <T> SettingDropdown(
                 onDismissRequest = { expanded = false },
                 properties = PopupProperties(focusable = true),
             ) {
-                DropdownList(
-                    options = options,
-                    selected = selected,
-                    accent = accent,
-                    onPick = {
-                        onSelect(it)
-                        expanded = false
-                    },
-                )
+                AnimatedVisibility(
+                    visibleState = listTransition,
+                    // 从触发器下缘「长出来」：顶边锚定（列表中轴不跳），高度展开 + 淡入。
+                    // 不用 scaleIn：Popup 的 window 尺寸随内容测，缩放只改绘制不改窗口，
+                    // 展开高度才是「贴着行尾下拉」应有的运动。
+                    enter = fadeIn(GlassMotion.tweenHover()) +
+                        expandVertically(
+                            animationSpec = GlassMotion.tweenHover(),
+                            expandFrom = Alignment.Top,
+                        ),
+                    exit = fadeOut(GlassMotion.tweenHover()) +
+                        shrinkVertically(
+                            animationSpec = GlassMotion.tweenHover(),
+                            shrinkTowards = Alignment.Top,
+                        ),
+                ) {
+                    DropdownList(
+                        options = options,
+                        selected = selected,
+                        accent = accent,
+                        onPick = {
+                            onSelect(it)
+                            expanded = false
+                        },
+                    )
+                }
             }
         }
     }

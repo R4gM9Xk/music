@@ -12,9 +12,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.util.lerp
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.theme.GlassMotion
 import kotlinx.coroutines.CoroutineScope
@@ -199,56 +201,91 @@ class PlayerFlight(private val scope: CoroutineScope) {
     }
 
     /**
-     * 播放页共享真身（大封面 / 控制台根层）：进入飞行期让位替身（等待期即隐身），收尾 12% 交叉淡入；
-     * 退出**起飞端按时间等效窗口渐出**——旧实现直接回 0，真实控制台（含非共享的心形/进度/时间/
-     * 随机/上一首/循环）在点收起的那一帧整块消失、副标题瞬间被替身的短文本换掉（录屏帧 132→133 实证）。
-     * 窗口取路径 50% 而非对称的 12%：飞行缓动起步快、收尾慢，12% 路径在起飞端只相当于 ~28ms
-     * （依旧近似硬切），50% 才等效于进场端 12% 慢尾巴的 ~165ms 手感；替身按互补曲线渐入（见 Overlay）。
+     * 替身封面当前几何（与 Overlay 的 flightRect 同口径：冻结端点边缘线性插值）。
+     * 等待期 snapshot 只含 mini 键 → 退化为 mini 端静态几何。
      */
-    fun playerSharedAlpha(): Float = when {
-        phase == Phase.Idle -> 1f
-        phase == Phase.Entering -> if (!started) 0f else ((displayT() - 0.88f) / 0.12f).coerceIn(0f, 1f)
-        else -> ((displayT() - 0.5f) / 0.5f).coerceIn(0f, 1f)
+    private fun flightCoverRect(): Rect? {
+        val s = snapshot ?: return null
+        val a = s[FlightKeys.MiniCover]
+        val b = s[FlightKeys.PlayerCover]
+        val t = displayT()
+        return when {
+            a == null && b == null -> null
+            a == null -> b
+            b == null -> a
+            else -> Rect(
+                lerp(a.left, b.left, t), lerp(a.top, b.top, t),
+                lerp(a.right, b.right, t), lerp(a.bottom, b.bottom, t),
+            )
+        }
+    }
+
+    /**
+     * 几何重合度：替身封面与目标端点中心距离归一化到 [COINCIDE_FRACTION]×目标尺寸。
+     * 1 = 完全重合，0 = 相距超过阈值。**交叉淡变只发生在几何重合附近**，
+     * 取代旧的「按路径 t 固定百分比」窗口——后者在快起慢收缓动下会让两份空间错位的
+     * 封面/标题同时可见（录屏实证的进入/退出重影）。互补 alpha 只防亮度叠加、不防空间双影，
+     * 唯有把淡变窗口钉在几何重合点才能单影。
+     */
+    private fun coincidence(target: Rect?): Float {
+        val cur = flightCoverRect() ?: return 0f
+        if (target == null) return 0f
+        val d = Offset(cur.center.x - target.center.x, cur.center.y - target.center.y).getDistance()
+        val thr = (maxOf(target.width, target.height) * COINCIDE_FRACTION).coerceAtLeast(1f)
+        return (1f - d / thr).coerceIn(0f, 1f)
+    }
+
+    /** 替身与播放页封面端点的重合度（进入收尾 / 退出起飞的真身显隐依据） */
+    fun playerCoincidence(): Float = coincidence(snapshot?.get(FlightKeys.PlayerCover))
+
+    /** 替身与迷你条封面端点的重合度（退出落地的迷你真身显隐依据） */
+    fun miniCoincidence(): Float = coincidence(snapshot?.get(FlightKeys.MiniCover))
+
+    /**
+     * 播放页共享真身（大封面 / 控制台根层）：进入飞行期让位替身（等待期即隐身），
+     * 仅在替身几何重合播放页端点时渐入；退出在替身离开播放页端点时即渐出。
+     * 单影原则：任一时刻替身与真身只有一份主导，交叉淡变窗口钉在几何重合点（见 [coincidence]）。
+     */
+    fun playerSharedAlpha(): Float = when (phase) {
+        Phase.Idle -> 1f
+        Phase.Entering -> if (!started) 0f else playerCoincidence()
+        else -> playerCoincidence()
     }
 
     /**
      * 播放页控制台**共享子元素**（歌名/歌者/播放/下一首）的透明度：进入期与 [playerSharedAlpha]
-     * 同窗渐入；退出期恒 1——真身控制台根层已按 12% 窗渐出，子元素若再乘同一系数会平方衰减
-     * （中点 0.25），与替身交叉淡化时亮度凹陷加深，交给根层一层曲线即可。
+     * 同窗渐入；退出期恒 1——真身控制台根层已按重合窗渐出，子元素若再乘同一系数会平方衰减，
+     * 与替身交叉淡化时亮度凹陷加深，交给根层一层曲线即可。
      */
     fun playerSharedInnerAlpha(): Float = when {
-        phase == Phase.Entering && started -> ((displayT() - 0.88f) / 0.12f).coerceIn(0f, 1f)
+        phase == Phase.Entering && started -> playerCoincidence()
         else -> 1f
     }
 
-    /** 迷你条共享真身：进入期 Chrome 已卸载（不参与）；退出期最后 12% 淡入接位 */
-    fun miniSharedAlpha(): Float = when {
-        phase == Phase.Idle -> 1f
-        phase == Phase.Entering -> 0f
-        else -> if (!started) 0f else ((0.12f - displayT()) / 0.12f).coerceIn(0f, 1f)
+    /** 迷你条共享真身：进入期 Chrome 已卸载（不参与）；退出期替身重合迷你端点时淡入接位 */
+    fun miniSharedAlpha(): Float = when (phase) {
+        Phase.Idle -> 1f
+        Phase.Entering -> 0f
+        else -> if (!started) 0f else miniCoincidence()
     }
 
     /** 导航胶囊：进入期由覆盖层替身负责（Chrome 已卸载）；退出期与迷你条真身同窗淡入接位 */
     fun navAlpha(): Float = when (phase) {
         Phase.Idle -> 1f
         Phase.Entering -> 1f - displayT()
-        else -> ((0.12f - displayT()) / 0.12f).coerceIn(0f, 1f)
+        else -> miniCoincidence()
     }
 
     /**
-     * 下层内容在飞行期的透明度：进入 1→0（来源页让位给飞行替身），退出 0→1（先于播放页落定）。
-     *
-     * 为什么需要：播放页改为**覆盖层**后，下层恒渲染 playerOrigin 且不换屏 ——
-     * 旧结构靠 AnimatedContent 的 `fadeOut(tweenFlight)` 让来源页在飞行期淡出，
-     * 新结构没有换屏就不会触发。若不补这条曲线，飞行替身会一直画在**全不透明的来源页**
-     * 之上，收尾播放页变不透明时整屏内容一次性硬切。
-     *
-     * 退出段的 /0.6 对齐旧结构「库页以 0.6×Flight 时长淡入接管」的口径。
+     * 下层内容在飞行期的透明度：进入 1→0（来源页让位给飞行替身）；
+     * 退出推迟到替身接近迷你端点（t<0.25）才 reveal——旧 /0.6 让库页在退出中段就全显，
+     * 与仍在飞行的替身封面、播放页封面三层叠影（录屏实证）。压缩到落地前四分之一路径，
+     * 退出中段只余「替身 + 暗化背景」。
      */
     fun baseContentAlpha(): Float = when (phase) {
         Phase.Idle -> 1f
         Phase.Entering -> (1f - displayT()).coerceIn(0f, 1f)
-        else -> ((1f - displayT()) / 0.6f).coerceIn(0f, 1f)
+        else -> ((0.25f - displayT()) / 0.25f).coerceIn(0f, 1f)
     }
 
     /**
@@ -561,6 +598,13 @@ val LocalPlayerFlight = compositionLocalOf<PlayerFlight?> { null }
  * 起飞瞬间替身由这里起步回弹到 1，两端对齐才不会跳变。改一处必须改另一处。
  */
 private const val MINI_PRESS_SCALE = 0.97f
+
+/**
+ * 几何重合阈值占目标端点尺寸的比例（见 [PlayerFlight.coincidence]）。
+ * 取 4%：交叉淡变只在替身距端点 ≤4% 尺寸内发生（大封面约十几 dp、迷你封面约 2dp），
+ * 淡变期间的空间错位低于可辨阈值 → 单影；过大则重影回归，过小则淡变在慢尾里拖得过长。
+ */
+private const val COINCIDE_FRACTION = 0.04f
 
 /**
  * 自带 GlassChrome 的非 tab 屏：进入飞行时屏内真导航胶囊自己在淡出，

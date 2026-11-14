@@ -220,6 +220,13 @@ fun ReorderableColumn(
                                 val s = 1f + 0.02f * (1f - settleProgress)
                                 scaleX = s
                                 scaleY = s
+                            } else {
+                                // 必须无条件归位：graphicsLayer 的条件跳过会让上一次拖拽
+                                // 写进去的 1.02 永久留在图层上（放大 + 发虚直到滚出视口）。
+                                // 原位放下 / onDragCancel / 拖拽中切歌作废这三条路径都
+                                // 不启动 settle 补间，没有别的机会把 scale 写回 1。
+                                scaleX = 1f
+                                scaleY = 1f
                             }
                         }
                         .pointerInput(dataVersion, index, isDraggable(index)) {

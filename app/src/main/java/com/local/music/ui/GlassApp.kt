@@ -43,6 +43,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -79,6 +80,7 @@ import androidx.media3.session.SessionToken
 import com.local.music.crash.CrashHandler
 import com.local.music.core.ui.components.AuroraBackground
 import com.local.music.core.ui.components.BackgroundMode
+import com.local.music.core.ui.components.DesktopLyricsStyle
 import com.local.music.core.ui.components.GlassChrome
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSurface
@@ -145,7 +147,18 @@ import kotlinx.coroutines.withContext
  * - 所有页面共享一个极光背景；取色 = 当前歌曲封面主色（可被设置关闭）
  */
 @Composable
-fun GlassApp() {
+fun GlassApp(
+    /**
+     * A-4（本轮）：「用户点了媒体通知回到 App」的一次性事件，由 MainActivity 记录。
+     *
+     * 默认 false：单测/预览直接调用 `GlassApp()` 时不跳转，行为与改动前一致。
+     * 传 MutableState 而不是 Boolean 有两个原因：
+     * 1. 需要**读后置回 false**（一次性事件语义），不可变参数做不到；
+     * 2. MainActivity 在 onNewIntent 里写它，组合层要能在不重建 Activity 的前提下
+     *    感知到（普通 Boolean 参数在 Activity 复用后不会重新求值）。
+     */
+    openPlayerFromNotification: androidx.compose.runtime.MutableState<Boolean>? = null,
+) {
     val context = LocalContext.current
     // 导航态跨 Activity 重建保活（P2-26）。
     //
@@ -164,6 +177,28 @@ fun GlassApp() {
     }
     val scope = rememberCoroutineScope()
     val store = remember { SettingsStore(context) }
+
+    // ── A-4：从媒体通知回来 → 直接进播放页 ──
+    //
+    // 依赖 state.hasSongs：播放页在没有队列时是一个没有内容可渲染的空白页
+    // （stageBlock 的 pureMusic 要求 mediaUri != null，占位曲两者都不满足）。
+    // 也就是说「点通知进来」但队列还没恢复的窗口期里跳转，会把用户送到一屏空白。
+    //
+    // 等 hasSongs 变 true 再消费：这是唯一的正确时机。事件本身保留在
+    // openPlayerFromNotification 里，不会被「等太久」丢掉——除非用户中途自己
+    // 导航去了别处（下面的 screen 判据），那说明他的意图已经变了。
+    LaunchedEffect(openPlayerFromNotification, state.hasSongs) {
+        val flag = openPlayerFromNotification ?: return@LaunchedEffect
+        if (!flag.value) return@LaunchedEffect
+        if (!state.hasSongs) return@LaunchedEffect
+        flag.value = false // 消费掉：旋转/后续重组不再重复触发
+        // 已经在播放页就不动（用户可能正看着它，重复 openPlayer 会重置飞行态）
+        if (state.screen != GlassScreen.Player) {
+            // 不走共享元素飞行：从通知进来是**冷进入**，迷你条可能还没测量出 rect，
+            // 飞行会以 awaitRects 超时收场（600ms 后硬切）——那一段等待比直接进更糟。
+            state.openPlayer()
+        }
+    }
 
     // ── 照片背景解码（v11）──
     // 三种触发：(a) 启动时已有 uri；(b) 用户刚选了新图；(c) 用户切回「照片」模式。
@@ -363,6 +398,18 @@ fun GlassApp() {
                 // （librarySettled 已被置 true），一次 MediaStore 瞬时错误就把用户的恢复队列
                 // 永久丢掉 —— 正是那段注释（302-307 行）声称已修好的问题，实际从未生效。
                 if (scanOk) state.loadLibrary(songs)
+                // A-1（本轮）：扫描完成给一次性反馈。
+                //
+                // 为什么必须给：大曲库（数千首）扫描要数十秒，期间唯一的进度信号是设置页
+                // 那行「扫描中…」——而用户此刻多半停在曲库页，他看到的只是「还没有歌曲」，
+                // 无从判断「正在扫」「扫完了没找到」「扫描坏了」。一次明确的结束回执
+                // 是首次体验里成本最低、收益最高的一处补丁。
+                //
+                // 只在 scanOk 时上报：失败/中止已经有 TopBanner（reportEngineFailure）或者
+                // 静默保留旧曲库，再补一条「扫描完成」会与事实矛盾。
+                // 计数口径 = songs.size（全量，与 library 同源），不是 visibleLibrary()
+                // ——否则用户会看到「扫描完成，共 800 首」而曲库页只有 750 行。
+                if (scanOk) state.reportScanResult(songs.size)
                 // 缓存写回策略按「扫描是否成功」分流，而不是按「有没有歌」——
                 // 旧写法把「扫到 0 首」和「扫描失败」混在同一个 else 里，两种情况都不写缓存，
                 // 于是用户删空曲库后旧 library_cache.json 仍保留全部已删曲目：冷启动读回幽灵曲库，
@@ -624,16 +671,36 @@ fun GlassApp() {
     // （DesktopLyricsStore，注释里有完整取舍）。UI 持有状态，服务只做显示与进度驱动。
     var desktopLyricsOn by remember { mutableStateOf(false) }
 
+    // ── 桌面歌词外观档位（本轮新增）──
+    //
+    // 三个值都从独立 DataStore 读（与开关同库，见 DesktopLyricsStore 的取舍说明），
+    // 初值用 UI 侧默认档，读到真值后覆盖。
+    var desktopLyricsFontStep by remember { mutableIntStateOf(DesktopLyricsStyle.DEFAULT_FONT_STEP) }
+    var desktopLyricsOpacityStep by remember { mutableIntStateOf(DesktopLyricsStyle.DEFAULT_OPACITY_STEP) }
+    // 锁定位置（C-2）：默认不锁——首次使用应该能拖动，锁是用户主动加的保护
+    var desktopLyricsLocked by remember { mutableStateOf(false) }
+
     // 服务连接成功后的 MediaController 引用：开关命令的发送通道。
     // 为什么不走 PlayerEngine：那是 AppState 的封板接口，为显示层开关加方法不值得；
     // 直接握 controller.sendCustomCommand（一次性命令，无监听器，随 Activity 销毁释放，
     // 不与小部件的「短命 controller」模式冲突——App 主 controller 本就常驻）。
     var desktopLyricsController by remember { mutableStateOf<MediaController?>(null) }
 
-    /** 桌面歌词开关命令下发（见 [desktopLyricsController] 的通道说明）。controller 未连上时静默丢弃 */
+    /**
+     * 桌面歌词开关命令下发（见 [desktopLyricsController] 的通道说明）。controller 未连上时静默丢弃。
+     *
+     * 本轮起**一并携带外观参数**：服务端在那条命令上先 applyStyle 再 show（顺序见
+     * MusicPlaybackService 的 CMD_SET_DESKTOP_LYRICS 分支）。这样服务重连后的首次
+     * 重放就已经带上用户设定的字号/透明度，不需要额外一条命令。
+     */
     fun sendDesktopLyricsCommand(controller: MediaController?, on: Boolean) {
         if (controller == null) return
-        val args = Bundle().apply { putBoolean(MusicPlaybackService.KEY_DESKTOP_LYRICS_ON, on) }
+        val args = Bundle().apply {
+            putBoolean(MusicPlaybackService.KEY_DESKTOP_LYRICS_ON, on)
+            putInt(MusicPlaybackService.KEY_DESKTOP_LYRICS_FONT, desktopLyricsFontStep)
+            putInt(MusicPlaybackService.KEY_DESKTOP_LYRICS_OPACITY, desktopLyricsOpacityStep)
+            putBoolean(MusicPlaybackService.KEY_DESKTOP_LYRICS_LOCKED, desktopLyricsLocked)
+        }
         runCatching {
             controller.sendCustomCommand(
                 SessionCommand(MusicPlaybackService.CMD_SET_DESKTOP_LYRICS, Bundle.EMPTY),
@@ -642,10 +709,36 @@ fun GlassApp() {
         }.onFailure { Log.w("GlassApp", "send desktop lyrics command failed", it) }
     }
 
-    // 启动：读回持久化的开关值（只改本地状态，不发命令——此刻服务多半还没连上，
+    /**
+     * 只下发外观（字号/透明度/锁定），不动开关。
+     *
+     * 用户正在看悬浮窗时改这些值 → 必须**立刻**生效，所以单独一条命令，
+     * 不等下一次 show（理由见 MusicPlaybackService 的 CMD_SET_DESKTOP_LYRICS_STYLE 注释）。
+     */
+    fun sendDesktopLyricsStyle(controller: MediaController?) {
+        val c = controller ?: return
+        val args = Bundle().apply {
+            putInt(MusicPlaybackService.KEY_DESKTOP_LYRICS_FONT, desktopLyricsFontStep)
+            putInt(MusicPlaybackService.KEY_DESKTOP_LYRICS_OPACITY, desktopLyricsOpacityStep)
+            putBoolean(MusicPlaybackService.KEY_DESKTOP_LYRICS_LOCKED, desktopLyricsLocked)
+        }
+        runCatching {
+            c.sendCustomCommand(
+                SessionCommand(MusicPlaybackService.CMD_SET_DESKTOP_LYRICS_STYLE, Bundle.EMPTY),
+                args,
+            )
+        }.onFailure { Log.w("GlassApp", "send desktop lyrics style failed", it) }
+    }
+
+    // 启动：读回持久化的开关值 + 外观档位（只改本地状态，不发命令——此刻服务多半还没连上，
     // 真正的重放在下面「controller 变为非空」的 effect 里做）
     LaunchedEffect(Unit) {
         desktopLyricsOn = DesktopLyricsStore.read(context)
+        // 外观三项一次读完：三者同文件，分三次 read 会触发三轮 DataStore 读盘
+        val style = DesktopLyricsStore.readStyle(context)
+        desktopLyricsFontStep = style.fontStep
+        desktopLyricsOpacityStep = style.opacityStep
+        desktopLyricsLocked = DesktopLyricsStore.readLocked(context)
     }
     // 服务连上（controller 就绪）后按最新状态重放一次：覆盖「进程被杀 → 系统续播拉起
     // 服务 → 用户再打开 App」的场景。服务端不持久化开关（悬浮窗是显示瞬态，自动弹窗
@@ -653,6 +746,37 @@ fun GlassApp() {
     LaunchedEffect(desktopLyricsController) {
         val controller = desktopLyricsController ?: return@LaunchedEffect
         sendDesktopLyricsCommand(controller, desktopLyricsOn)
+    }
+
+    /**
+     * 本轮：桌面歌词外观变更的统一入口（字号 / 不透明度 / 锁定）。
+     *
+     * ## 三件事必须同时做，少一件都会让用户看到不一致
+     * 1. 改 Compose 状态 → 面板上的档位文字立刻更新；
+     * 2. 下发服务 → 悬浮窗（如果正在显示）立刻变样；
+     * 3. 落盘 → 下次启动仍是这个值。
+     *
+     * 顺序上「改状态 → 下发 → 落盘」：状态是同步的（UI 立刻正确），
+     * 下发与落盘都是异步/可能失败，放在后面且失败只记日志——它们是显示层偏好，
+     * 坏了不该打扰用户（与 DesktopLyricsStore.write 的既有取舍一致）。
+     *
+     * 服务端未连上时下发会被静默丢弃（sendDesktopLyricsStyle 内部 return），
+     * 但状态与磁盘已更新，服务连上后的重放会补上。
+     */
+    fun onDesktopLyricsStyleChange(
+        fontStep: Int = desktopLyricsFontStep,
+        opacityStep: Int = desktopLyricsOpacityStep,
+        locked: Boolean = desktopLyricsLocked,
+    ) {
+        desktopLyricsFontStep = fontStep.coerceIn(0, DesktopLyricsStyle.FontSteps.lastIndex)
+        desktopLyricsOpacityStep = opacityStep.coerceIn(0, DesktopLyricsStyle.OpacitySteps.lastIndex)
+        desktopLyricsLocked = locked
+        sendDesktopLyricsStyle(desktopLyricsController)
+        scope.launch {
+            DesktopLyricsStore.writeFontStep(context, desktopLyricsFontStep)
+            DesktopLyricsStore.writeOpacityStep(context, desktopLyricsOpacityStep)
+            DesktopLyricsStore.writeLocked(context, desktopLyricsLocked)
+        }
     }
 
     /**
@@ -958,6 +1082,27 @@ fun GlassApp() {
             sharePlaylist = { title, tracks ->
                 ioMessage = ShareActions.sharePlaylist(context, title, tracks).message
             },
+            // ── C-1（本轮）：桌面歌词提到播放选项面板 ──
+            //
+            // 六个 lambda 读/写的是本组合作用域里的 `desktopLyrics*` 状态。**注意这里
+            // 与上面三个不同：它们捕获了会变的状态**，所以严格说 `remember {}` 的
+            // 「零 key」前提不再成立——闭包会把**初次组合时**的 setter 引用固定下来。
+            //
+            // 为什么这样仍然正确：`onDesktopLyricsStyleChange` 与 `onDesktopLyricsChange`
+            // 是**函数**，而 Compose 的局部函数在被闭包捕获时读到的是可变的 state
+            // 访问器（`by remember { mutableStateOf }` 的委托对象），不是快照值。
+            // 也就是说闭包里每次调用都读到**当下**的 desktopLyricsFontStep 等值。
+            // 同理 `onDesktopLyricsStyleChange` 内部对它们的赋值也落到同一个委托对象上。
+            // （若这里捕获的是局部 val 快照值就会失效——这正是本注释存在的理由。）
+            desktopLyricsOn = { desktopLyricsOn },
+            toggleDesktopLyrics = {
+                // 关闭方向无权限门槛，直接走既有回调（内含权限引导与横幅提示）
+                onDesktopLyricsChange(!desktopLyricsOn)
+            },
+            desktopLyricsFontStep = { desktopLyricsFontStep },
+            setDesktopLyricsFontStep = { step -> onDesktopLyricsStyleChange(fontStep = step) },
+            desktopLyricsOpacity = { desktopLyricsOpacityStep },
+            setDesktopLyricsOpacity = { step -> onDesktopLyricsStyleChange(opacityStep = step) },
         )
     }
 
@@ -1057,7 +1202,14 @@ fun GlassApp() {
                     val photoActive = state.backgroundMode == BackgroundMode.Photo &&
                         state.photoBacking?.bitmap != null
                     if (rootAuroraVisible && !photoActive) {
-                        AuroraBackground()
+                        // 根极光纳入 app 级 haze 源：飞行替身玻璃（FlightGlassPanel 消费 appHaze）
+                        // 在飞行期始终有一份**活的**极光可模糊。旧结构 appHaze 只含内容 Box，
+                        // 而内容 Box 被 baseContentAlpha 随飞行淡出 → 替身 haze 失去输入退化为
+                        // 平灰 tint（录屏「灰板」），落定真控制台又透出活极光 → 灰→彩跳变。
+                        // 根极光在 recede<1（即整个进入/退出飞行期）恒在，补进源后替身全程带彩。
+                        Box(Modifier.fillMaxSize().hazeSource(appHazeState)) {
+                            AuroraBackground()
+                        }
                     }
 
                     // 后退层：内容 + chrome 一起随播放页升起而后退（缩放由 recede 驱动）。
@@ -1134,14 +1286,17 @@ fun GlassApp() {
                                 val to = order[targetState]
                                 if (from != null && to != null) {
                                     val forward = to > from
+                                    // 纯不透明 push（去掉 fadeIn/fadeOut）：旧 slide+fade 双向叠加
+                                    // 让中段两屏各 ~50% alpha 且水平错开半屏 → 中心区域双列表
+                                    // double-exposure（录屏 tab 切换叠影）。不透明滑动无叠影。
                                     (
                                         slideInHorizontally(GlassMotion.tweenPage()) { full ->
                                             if (forward) full else -full
-                                        } + fadeIn(GlassMotion.tweenPage())
+                                        }
                                         ).togetherWith(
                                         slideOutHorizontally(GlassMotion.tweenPage()) { full ->
                                             if (forward) -full else full
-                                        } + fadeOut(GlassMotion.tweenPage()),
+                                        },
                                     )
                                 } else {
                                     (fadeIn(GlassMotion.tweenPage()) +
@@ -1288,6 +1443,24 @@ fun GlassApp() {
                                         // 桌面歌词（P0-8）：哑开关 + 权限引导都在 app 层做（见 onDesktopLyricsChange）
                                         desktopLyricsEnabled = desktopLyricsOn,
                                         onDesktopLyricsEnabledChange = ::onDesktopLyricsChange,
+                                        // ── 桌面歌词外观（本轮）──
+                                        // 三行开关由 desktopLyricsOnChangeAvailable 门控：
+                                        // app 层已接线，所以恒 true。用参数而不是在 feature 模块里
+                                        // 硬编码 true，是为了保留「未接线即隐藏」这条能力
+                                        // （预览/单测直接调本屏时不会渲染点了没反应的行）。
+                                        desktopLyricsOnChangeAvailable = true,
+                                        desktopLyricsFontStep = desktopLyricsFontStep,
+                                        onDesktopLyricsFontStepChange = { step ->
+                                            onDesktopLyricsStyleChange(fontStep = step)
+                                        },
+                                        desktopLyricsOpacityStep = desktopLyricsOpacityStep,
+                                        onDesktopLyricsOpacityStepChange = { step ->
+                                            onDesktopLyricsStyleChange(opacityStep = step)
+                                        },
+                                        desktopLyricsLocked = desktopLyricsLocked,
+                                        onDesktopLyricsLockedChange = { locked ->
+                                            onDesktopLyricsStyleChange(locked = locked)
+                                        },
                                         onDesktopLyricsPermission = {
                                             // 副标题引导专用入口（开关回调内已含权限分支，这里保底给手动路径）
                                             if (!DesktopLyricsStore.openPermissionPage(context)) {
@@ -1397,6 +1570,13 @@ fun GlassApp() {
                         },
                     ) {
                         Box(Modifier.fillMaxSize()) {
+                            // 播放页 haze 源上收到此（原在 PlayerScreen 内创建）：控制台玻璃
+                            // 必须模糊「它背后」的背景，而背景（极光/照片）是本 Box 的子层、
+                            // 不在 PlayerScreen 子树内。旧结构 playerHaze 源只含顶栏+舞台，
+                            // 控制台区域采样为空 → 玻璃退化为奶白/黑平板、背后内容不糊（透字）。
+                            // 上收后背景与控制台消费同一状态，控制台真正糊到背后的极光/照片。
+                            val playerHaze = rememberHazeState()
+                            CompositionLocalProvider(LocalHazeState provides playerHaze) {
                             // 覆盖层自带背景（否则整屏透明会透视到下层曲库），
                             // 但**透明度必须跟播放页内容的揭示曲线同步**（softAlpha）：
                             // 飞行期播放页是「先不可见、随 t 渐显」的，极光若一上来就不透明，
@@ -1405,12 +1585,13 @@ fun GlassApp() {
                             // 随播放页内容一起显影；收起时反向淡出，下层曲库重新露出来。
                             //
                             // 照片模式（v11）：这里也换成同一张照片 —— 播放页的 haze 源是
-                            // **自己那套** playerHaze（PlayerScreen.kt:237），它采样的是本覆盖层
-                            // 子树。若这里仍画极光，播放页的控制台玻璃会模糊到极光而不是照片，
-                            // 出现「同一个 App 两块玻璃背后不是同一个世界」的断裂。
+                            // **自己那套** playerHaze，它采样的是本覆盖层子树。若这里仍画极光，
+                            // 播放页的控制台玻璃会模糊到极光而不是照片，出现「同一个 App
+                            // 两块玻璃背后不是同一个世界」的断裂。
                             Box(
                                 Modifier
                                     .fillMaxSize()
+                                    .hazeSource(playerHaze)
                                     .graphicsLayer { alpha = flight.softAlpha() },
                             ) {
                                 if (photoActive) {
@@ -1423,6 +1604,7 @@ fun GlassApp() {
                                 }
                             }
                             PlayerScreen(state)
+                            }
                         }
                     }
 
@@ -1451,6 +1633,28 @@ fun GlassApp() {
                             .padding(top = S.Gap8.dp)
                             .fillMaxWidth(),
                     ) {
+                        // A-1（本轮）：扫描完成回执。走与 IO 提示同一个纵向栈（同一时刻可能
+                        // 与「备份已导出」之类并存，同栈才不会互相盖住）。
+                        //
+                        // 停留 3s 而不是 IO 提示的 4s：这是一条**纯状态回执**（不需要用户
+                        // 行动、没有可读的细节），4s 会显得黏；而 2s 又不够从「盯着空曲库」
+                        // 的视线里被捕捉到。
+                        state.scanResultToast?.let { message ->
+                            LaunchedEffect(message) {
+                                delay(3_000)
+                                state.consumeScanResult()
+                            }
+                            if (ioMessage != null) Spacer(Modifier.height(6.dp))
+                            TopBanner(
+                                message,
+                                maxLines = 2,
+                                onClick = { state.consumeScanResult() },
+                                // 扫描完成不是错误：中性档。即便「没有找到音频文件」也只是
+                                // 事实陈述而非操作失败——用 Error 红条会把「手机里本来就没歌」
+                                // 渲染成一次故障。
+                                tone = BannerTone.Neutral,
+                            )
+                        }
                         // 文件 IO 结果提示（D2/D3：导出/导入/备份恢复）：4s 自动消退。
                         // 视觉审计 E2：按消息内容判档——失败类给 Error 色条，
                         // 成功类保持中性。判据用消息前缀（横幅的唯一数据源就是这一条 String，
