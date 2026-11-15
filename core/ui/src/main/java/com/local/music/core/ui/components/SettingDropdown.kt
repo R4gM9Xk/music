@@ -32,6 +32,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -103,6 +104,25 @@ fun <T> SettingDropdown(
     val accent = auroraAccentColor()
     var expanded by remember { mutableStateOf(false) }
     val interactionSource = remember { MutableInteractionSource() }
+    /**
+     * 触发器实测高度（px）：下拉浮层的纵向偏移**必须**由它推导，而不是写死一个 dp。
+     *
+     * ## 为什么不能沿用固定的 40dp（P2 修复）
+     *
+     * 旧实现写 `offsetY = 40.dp`，注释自述是「胶囊高约 28dp + 12dp 间隙」。但胶囊的
+     * 真实高度是**由内容撑出来的**：`GlassText.Body`（13sp/18 行高）+ 上下各 6dp padding
+     * → 正常字号约 30dp；而系统字体放大到 1.3×/2.0× 时，行高随 sp 增长，
+     * 胶囊会变成 34dp、40dp 甚至更高——浮层顶边就被压在触发器**身上**（遮住当前值），
+     * 或反过来离得太远。这正是「大字体下浮层压住触发器」那条反馈的成因。
+     *
+     * 取值用 `onGloballyPositioned` 的 `size.height`：它是**布局后**的真实高度，
+     * 天然跟着 fontScale / density / 主题排版走，不需要我们再复制一份推导式
+     * （复制推导 = 双源漂移，本仓已登记多起同型缺陷）。
+     *
+     * 初值给 0：首帧还没测量时浮层不可能已经展开（expanded 初值 false），
+     * 所以不存在「用 0 偏移闪一下」的窗口。
+     */
+    var triggerHeightPx by remember { mutableStateOf(0) }
 
     // 展开时箭头翻转：这是「可展开」这件事最轻的动效表达，不新增任何布局节点。
     // 时长走 tweenHover（250ms，tab/开关等微交互同档），自动被动效强度乘过。
@@ -139,6 +159,10 @@ fun <T> SettingDropdown(
                     this.contentDescription = label
                     this.stateDescription = value
                 }
+                // 实测触发器高度：浮层偏移由它推导（见 triggerHeightPx 的 KDoc）。
+                // 不用 onSizeChanged 是因为 Popup 的 offset 是 IntOffset(px)，
+                // 这里本来就要在 px 空间里算，绕一次 dp 再转回来只增加舍入误差。
+                .onGloballyPositioned { triggerHeightPx = it.size.height }
                 .padding(horizontal = S.Gap12.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(S.Gap4.dp),
@@ -161,7 +185,11 @@ fun <T> SettingDropdown(
         }
 
         if (listTransition.currentState || listTransition.targetState) {
-            val offsetY = with(androidx.compose.ui.platform.LocalDensity.current) { 40.dp.roundToPx() }
+            // 偏移 = 触发器实测高度 + 12dp 间隙（与触发器下缘贴齐再让 12dp 呼吸）。
+            // 间隙取 S.Gap12：它与胶囊内 padding 同档，是「这块控件自己留的缝」的量级。
+            // 见 triggerHeightPx 的 KDoc —— 这里绝不能写死总高度。
+            val gapPx = with(androidx.compose.ui.platform.LocalDensity.current) { S.Gap12.dp.roundToPx() }
+            val offsetY = triggerHeightPx + gapPx
             Popup(
                 // 对齐到胶囊的右下角向下偏移 40dp（胶囊高约 28dp + 12dp 间隙）：
                 // 贴着触发器长出来，而不是屏幕居中弹。Popup 的 offset 是 IntOffset（px），

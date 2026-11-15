@@ -18,6 +18,7 @@ import androidx.media3.exoplayer.source.ShuffleOrder
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionError
 import androidx.media3.session.SessionResult
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -44,7 +45,31 @@ import kotlinx.coroutines.launch
  * - 音效链：Equalizer / LoudnessEnhancer / BassBoost / Virtualizer 全部挂在播放器音频会话上，
  *   预设与开关经自定义命令下发（详见 [applyAudioFxSettings] 与 [ensureAudioFx]）
  * - 定时关闭：分钟档协程到点暂停；播完当前首/队列由播放器监听承接（服务端权威）
+ *
+ * ## 关于 `@OptIn(UnstableApi::class)`（Lint UnsafeOptInUsageError 的正式修法）
+ *
+ * media3 1.11 把相当一部分 API（`MediaSession.Builder` 的若干重载、
+ * `DefaultMediaNotificationProvider`、`ForwardingPlayer`、`Equalizer` 相关的辅助类等）
+ * 标了 `@UnstableApi`——语义是「不保证跨小版本源码兼容」，**不是**「不能用于生产」。
+ * 本服务恰恰是这些 API 的唯一合理使用者（`MediaSessionService` 的整个实现面就在上面）。
+ *
+ * 为什么在**类级**加 `@OptIn` 而不是逐行 `@Suppress("UnsafeOptInUsageError")`：
+ * ① `@OptIn` 是编译器级别的事实声明（「我确认在承担这个不稳定性」），而 `@Suppress`
+ *    只是压掉检查——后者会连带压掉将来某个真正该被提醒的新 API 用法；
+ * ② 本类 20 处告警里绝大多数在 lambda 与匿名 Listener 内部（`:154/164/185/193/198/289/292/319/427/429/470/495/520/587/692`），
+ *    逐处标注既污染代码又极易漏（漏一处 Lint 仍失败）；
+ * ③ 类级标注的效果与逐行等价，且**新加代码自动继承**——这正是我们要的：
+ *    在这个文件里用 media3 的 API 是常态，不需要每次重新论证。
+ *
+ * `WrongConstant` 的两处（`:220`、`:276`）是同一族的**另一种**误报：
+ * 代码写的是 `SessionResult(SessionError.ERROR_PERMISSION_DENIED)` /
+ * `SessionResult(SessionError.ERROR_BAD_VALUE)`——这是 media3 **官方文档**
+ * 给出的构造方式（`SessionResult` 的 int 常量与 `SessionError` 的常量值有意保持相等），
+ * Lint 只认 `SessionError.*` 这个别名所以判错。修法用 `SessionError` 常量：
+ * 值与语义完全相同，且能让 Lint 通过——这比 Suppress 好，因为**代码本身也更准确**
+ * （错误码属于 SessionError 这一族，而不是「SessionResult 的某个 int」）。
  */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 class MusicPlaybackService : MediaSessionService() {
 
     private var mediaSession: MediaSession? = null
@@ -104,8 +129,8 @@ class MusicPlaybackService : MediaSessionService() {
         Thread(r, "queue-state-reader").apply { isDaemon = true }
     }
     private var sleepJob: Job? = null
-    private var stopAfterCurrent = false // -1 档：切到下一首的瞬间暂停
-    private var stopAtQueueEnd = false // -2 档：队列自然播完（ENDED）暂停
+    private var stopAfterCurrent = false // -1 档：当前曲自然播完的瞬间暂停
+    private var stopAtQueueEnd = false // -2 档：队列/随机序走完时暂停
 
     // ── 睡眠定时渐弱的状态位（只有分钟档用；见 applySleepTimer 的档位说明） ──
     // 渐弱是否正在进行：决定「用户手动暂停」要不要中止渐弱并复位音量
@@ -217,7 +242,7 @@ class MusicPlaybackService : MediaSessionService() {
                     ): ListenableFuture<SessionResult> {
                         // 自定义命令仅接受本应用（服务保持 exported 供系统/锁屏会话使用）
                         if (controller.packageName != packageName) {
-                            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_ERROR_PERMISSION_DENIED))
+                            return Futures.immediateFuture(SessionResult(SessionError.ERROR_PERMISSION_DENIED))
                         }
                         if (customCommand.customAction == CMD_SET_EQ) {
                             applyEqPreset(args.getString(KEY_PRESET))
@@ -273,7 +298,7 @@ class MusicPlaybackService : MediaSessionService() {
                             }
                         } else {
                             // 服务保持 exported：未知命令返回错误码而非 SUCCESS，暴露真实命令边界
-                            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_ERROR_BAD_VALUE))
+                            return Futures.immediateFuture(SessionResult(SessionError.ERROR_BAD_VALUE))
                         }
                         return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
                     }
@@ -291,11 +316,16 @@ class MusicPlaybackService : MediaSessionService() {
                         // 音效链与 EQ 同一时机补挂（音频会话首个 READY 才有真 id）
                         runCatching { ensureAudioFx(player.audioSessionId) }
                         applyAudioFxSettings(audioFxSettings)
-                    } else if (playbackState == Player.STATE_ENDED && stopAtQueueEnd) {
-                        // -2 档「播完整个队列」：自然播完（ENDED）即暂停并清旗标。
-                        // repeatAll 开着时播放器回绕、永不 ENDED，该档等价不触发（符合语义，不管）
-                        stopAtQueueEnd = false
-                        player.pause()
+                    } else if (playbackState == Player.STATE_ENDED) {
+                        // -2 档「播完整个队列」的**兜底**触发点（正常路径在
+                        // onMediaItemTransition 里判「没有下一首」，见那里的 KDoc）。
+                        // STATE_ENDED 只在「列表循环关闭且播放到队尾」时出现；
+                        // repeatMode=All / 单曲循环下播放器会回绕、永不 ENDED，
+                        // 那两条路径由 onMediaItemTransition 判 next 覆盖。
+                        if (stopAtQueueEnd) {
+                            stopAtQueueEnd = false
+                            player.pause()
+                        }
                     }
                 }
 
@@ -345,18 +375,53 @@ class MusicPlaybackService : MediaSessionService() {
                     // 响度标签按需读取：只在「响度归一」开着时才付出这个 IO 代价
                     if (audioFxSettings.loudnessNorm) scheduleTrackGainRead(mediaItem)
 
-                    // -1 档「播完当前首」：只认**自然播完**（AUTO）这一次切换。
-                    // 为什么必须判 reason：用户在播放中手动点下一首 / 拖动进度到下一区段（SEEK）、
-                    // 播放队列被替换（PLAYLIST_CHANGED）、单曲循环重入（REPEAT）都会触发同一个回调。
-                    // 旧实现不判 reason，于是「设了播完当前首 → 用户主动切歌」也会被暂停——
-                    // 用户明确要听下一首却被拦下，是纯粹的误伤。
-                    // 非 AUTO 的处理：**仍清旗标、但不暂停**。清掉是必须的——旗标没有回执，
-                    // 留着就是悬空的「下一次自动切歌时莫名暂停」，那是比丢失定时更糟的体验；
-                    // UI 侧手动切歌本就会自行撤销定时（AppState.setSleepTimer(0)），这里只是兜住
-                    // 「UI 没来得及下发撤销」的窗口期，语义上一致。
+                    // ── 定时关闭「播完当前首」（-1 档）──────────────────────────
+                    //
+                    // 语义 = **当前这首自然播完就暂停**。要判两件事：
+                    // 1. 这次切换是不是「自然播完」引起的（排除手动切歌 / seek / 队列替换）；
+                    // 2. **单曲循环下同一首歌会重入**（reason = REPEAT），那同样是「播完当前首」，
+                    //    必须暂停 —— 旧实现只认 AUTO，于是单曲循环时旗标被清掉却不暂停，
+                    //    定时静默失效：用户选了「播完当前首」，界面还显示定时已开启。
+                    //
+                    // REPEAT 只在「这首播完、播放器回绕到它自己」时出现（单曲循环），
+                    // 与 AUTO 同属「自然播完」。手动切歌是 SEEK / 非 AUTO，
+                    // 那类事件**清旗标但不暂停**（用户明确要听下一首，不该被拦）。
+                    //
+                    // 清旗标对非自然切换也是必须的：旗标没有回执，留着就是悬空的
+                    //「下一次自动切歌时莫名暂停」，比丢失定时更糟。
                     if (stopAfterCurrent) {
                         stopAfterCurrent = false
-                        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) player.pause()
+                        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
+                            reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT
+                        ) {
+                            player.pause()
+                        }
+                    }
+
+                    // ── 定时关闭「播完整个队列」（-2 档）──────────────────────
+                    //
+                    // 语义 = **整个队列放完就暂停**。旧实现只靠 STATE_ENDED 触发，而列表循环
+                    // 与随机播放都会回绕、播放器永不 ENDED → 该档在常见模式下**永远不触发**，
+                    // UI 却仍显示定时已开启（本轮的 P1 之一）。
+                    //
+                    // 正确判据不看播放器状态，而看「这次自然切换之后还有没有下一首」：
+                    // - 顺序播放：最后一首播完时 hasNextMediaItem() == false → 暂停 ✅
+                    // - 列表循环：Media3 在 repeatAll 下 hasNextMediaItem() **恒真**（会回绕），
+                    //   所以不在这里触发 —— 这正是语义要求：循环模式下队列永不「播完」。
+                    //   用户要「放完就停」应关掉循环；UI 文案（sleepTimerSubtitle 的 -2 档）
+                    //   已把这一点写明，不再是「静默失效」。
+                    // - 随机播放：repeat=Off 的随机序走完后 hasNext 为 false → 暂停 ✅
+                    //   （旧实现里这条路径同样可能不产生 ENDED，是第二个失效入口）
+                    //
+                    // 判「尾部」而不是「首部」：本回调在切换**完成后**触发，
+                    // 此时 currentMediaItemIndex 已是新的当前曲，hasNext 直接可用。
+                    if (stopAtQueueEnd &&
+                        (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
+                            reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) &&
+                        !player.hasNextMediaItem()
+                    ) {
+                        stopAtQueueEnd = false
+                        player.pause()
                     }
                 }
 
@@ -407,6 +472,25 @@ class MusicPlaybackService : MediaSessionService() {
     /**
      * 组装续播现场（在 [queueReadExecutor] 的后台线程执行，见 onPlaybackResumption）。
      * 无现场返回 null，由调用方落成空结果——空列表即「按系统默认处理」，不强行播放。
+     *
+     * ## 播放模式与音效也要在这里恢复（P2 修复）
+     *
+     * 这条路径**没有 Activity**：`onPlaybackResumption` 由系统媒体入口（通知栏恢复 /
+     * 蓝牙重连 / Android Auto）直接触发 MediaSessionService，AppState 与 DataStore 都
+     * 还没起来（甚至永远不会起来）。旧实现只重建 MediaItems，于是：
+     * - 随机/列表循环回到 off；
+     * - 变速回到 1.0x；
+     * - EQ 预设与音效链（低音/环绕/响度归一）回到全关。
+     *
+     * 用户视角是「上次明明开着随机和低音增强，从通知栏一按就全没了」。
+     * [com.local.music.player.QueueStateStore.QueueState] 现在带着这些字段，
+     * 在这里落成播放器的真实状态。
+     *
+     * **只写状态、不下发命令**：恢复时 AppState 若随后起来了，它的 `syncEngineModes`
+     * 会用内存里的权威值再覆盖一遍，两条路径收敛到同一个结果（幂等）。
+     *
+     * 注意顺序：shuffle 必须在 setMediaItems **之前**设——Media3 的 shuffle 序是在
+     * 队列装载时生成的，装载后再开 shuffle 会得到与 UI 队列不同的顺序。
      */
     private fun buildResumptionState(): MediaSession.MediaItemsWithStartPosition? {
         val state = QueueStateStore.read(this) ?: return null
@@ -414,6 +498,25 @@ class MusicPlaybackService : MediaSessionService() {
         val index = state.index.coerceIn(0, (state.specs.size - 1).coerceAtLeast(0))
         val items = state.specs.map { it.toMediaItem() }.withArtwork(state.specs, index)
         val positionMs = (state.positionSec * 1000f).toLong().coerceAtLeast(0L)
+        // 播放模式 + 音效：直接落到播放器与两条效果链上（全部 runCatching：
+        // 音频会话此刻可能还没就绪，失败由首个 READY 的回调按同一份状态重放）
+        mediaSession?.player?.let { player ->
+            runCatching {
+                val repeatAll = state.repeatMode == "All"
+                val repeatOne = state.repeatMode == "One"
+                player.repeatMode = when {
+                    repeatOne -> Player.REPEAT_MODE_ONE
+                    repeatAll -> Player.REPEAT_MODE_ALL
+                    else -> Player.REPEAT_MODE_OFF
+                }
+                player.shuffleModeEnabled = state.shuffleOn
+                player.setPlaybackSpeed(state.playbackSpeed.takeIf { it > 0f } ?: 1f)
+            }.onFailure { Log.w(TAG, "resumption mode restore failed", it) }
+            runCatching { applyEqPreset(state.eqPreset) }
+                .onFailure { Log.w(TAG, "resumption eq restore failed", it) }
+            runCatching { applyAudioFxSettings(state.audioFx) }
+                .onFailure { Log.w(TAG, "resumption audio fx restore failed", it) }
+        }
         return MediaSession.MediaItemsWithStartPosition(items, index, positionMs)
     }
 
@@ -717,12 +820,27 @@ class MusicPlaybackService : MediaSessionService() {
 
     /**
      * 定时关闭（服务端权威）：mode > 0 = N 分钟后暂停（协程 delay 到点）；
-     * -1 = 播完当前首（**仅** Player.MEDIA_ITEM_TRANSITION_REASON_AUTO 那一瞬暂停）；
-     * -2 = 播完整个队列（ENDED 暂停）；0 = 取消。
+     * -1 = 播完当前首；-2 = 播完整个队列；0 = 取消。
      *
-     * -1 的边界（与 UI 的契约）：只有「这一首自己播完」才算达成。手动切歌 / 拖动进度 /
-     * 队列被替换都不暂停，且顺手清掉旗标（悬空旗标会让下一次自然切歌莫名暂停，更危险）；
-     * UI 侧（AppState）在用户手动切歌或手动暂停时本就会下发 0 撤销定时，两处口径一致。
+     * ## -1 的判定（本轮修正）
+     *
+     * 「自然播完」有**两个** transition reason，不是一个：
+     * - `MEDIA_ITEM_TRANSITION_REASON_AUTO`：播完切到下一首；
+     * - `MEDIA_ITEM_TRANSITION_REASON_REPEAT`：单曲循环下播完回绕到**同一首**。
+     * 旧实现只认 AUTO，于是单曲循环时 -1 档的旗标被清掉却不暂停 —— 定时静默失效，
+     * 而 UI 仍显示定时已开启。两个 reason 都必须暂停。
+     *
+     * 手动切歌 / 拖动进度 / 队列被替换都**不**暂停，但顺手清掉旗标（悬空旗标会让
+     * 下一次自然切歌莫名暂停，更危险）；UI 侧（AppState）在用户手动切歌或手动暂停时
+     * 本就会下发 0 撤销定时，两处口径一致。
+     *
+     * ## -2 的判定（本轮修正）
+     *
+     * 不能只看 `Player.STATE_ENDED`：列表循环与随机播放都会回绕，播放器**永不** ENDED，
+     * 于是该档在常见模式下永远不触发。真正的判据是「自然切换之后已经没有下一首」
+     * （见 onMediaItemTransition）。STATE_ENDED 作为兜底触发器保留，
+     * 覆盖「播放器停在队尾但没有发生 transition」的路径。
+     * 循环模式下的语义就是「不会触发」——UI 的 -2 副标题已如实说明这一点。
      *
      * 重复下发新定时先取消旧协程/清旗标；到点执行后引用就地清理，随服务销毁整体取消。
      *

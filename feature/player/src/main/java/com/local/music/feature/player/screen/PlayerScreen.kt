@@ -457,8 +457,22 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             // BodyMedium（13 Medium）同时守住字号与字重的从属关系。
                             Text("正在播放", color = LocalGlassColors.current.textPrimary, style = GlassText.BodyMedium,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            // 「来自…」是来源注脚：Micro（11/14）与播放页时间戳同档，不参与信息层级竞争
-                            Text("来自「${sourceName ?: "本地音乐"}」", color = LocalGlassColors.current.textSecondary, style = GlassText.Micro)
+                            // 「来自…」是来源注脚：Micro（11/14）与播放页时间戳同档，不参与信息层级竞争。
+                            //
+                            // **maxLines = 1 是必须的**（P2 修复）：歌单名完全由用户输入，长度不受控
+                            // （「通勤路上最爱听的那些歌」这种名字很常见）。缺了 maxLines 时它会
+                            // 自动换行，把整个顶栏 Column 撑高——而顶栏在**播放页最上方、舞台之上**，
+                            // 它每多一行，封面/歌词舞台就被往下挤一行。大字号（fontScale 1.3×）叠加长
+                            // 歌单名可以挤出 3 行，舞台被压缩得很明显，且不同歌单之间高度不一致。
+                            // 省略号是这里正确的降级：来源是注脚，不承载必须完整可读的信息，
+                            // 完整名字在「返回来源」的读屏描述里（上面那道 contentDescription）。
+                            Text(
+                                "来自「${sourceName ?: "本地音乐"}」",
+                                color = LocalGlassColors.current.textSecondary,
+                                style = GlassText.Micro,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
                         }
                         GlassIconButton(
                             onClick = {
@@ -1164,20 +1178,50 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                             .fillMaxHeight()
                             .hazeSource(playerHaze),
                     ) { stageBlock() }
-                    Column(
-                        Modifier
-                            .width(380.dp)
-                            .fillMaxHeight(),
-                        verticalArrangement = Arrangement.Center,
-                    ) {
-                        // 横屏右侧栏的顺序：歌名组 → 控制台 → 提示行。
-                        // **歌名组必须在横屏也保留**：它承载 PlayerTitle/PlayerArtist 两个飞行
-                        // 真身键，横屏下若直接不渲染，横屏进入播放页时 `awaitRects(playerKeys)`
-                        // 会等不到这两个键 → 600ms 超时 → 整个飞行被中止（退化成硬切）。
-                        // 也就是说「横屏不显示歌名」这条看似合理的省空间方案，实际会打断飞行。
-                        titleBlock()
-                        consoleBlock()
-                        hintBlock()
+                    /**
+                     * 右侧栏宽度：**按可用宽度自适应**，不是固定 380dp（P2 修复）。
+                     *
+                     * ## 为什么固定值会溢出
+                     * 380dp 是按「一加 13 横屏 ≈ 780dp 宽」标定的（舞台 + 工具区约 1:1）。
+                     * 而横屏宽度在三种常见情形下远小于 780dp：
+                     * - 分屏（上下分屏后每条只有约 500dp 宽）；
+                     * - 小折叠屏展开前 / 旧设备横屏（640dp）；
+                     * - 系统「显示大小」拉大后等效宽度变窄。
+                     * 此时 Row 里 `weight(1f)` 的舞台会被压到 380 以下，甚至压成负数——
+                     * 表现为舞台（封面/歌词）被挤成一条缝或完全消失，而右栏仍占满 380dp。
+                     *
+                     * ## 为什么用 42% 而不是「380dp 与剩余空间取小」
+                     * 取小会让舞台和右栏的比例随屏宽漂移：窄屏下舞台几乎归零（这正是病根），
+                     * 因为右栏抢的是**绝对像素**。按比例分配才是「两块各占多少」的正确表达。
+                     * 42% 来自目标几何：780dp 宽时右栏 ≈ 328dp（原 380dp 的 86%，留出舞台呼吸），
+                     * 而在 500dp 分屏下变成 210dp——仍然放得下歌名组/控制台/提示行三块
+                     * （控制台按钮 44dp + 间距，210dp 可容 3 个主控 + 2 个次控）。
+                     *
+                     * 上限 380dp：超宽屏（平板横屏 1200dp）上右栏不应继续膨胀，
+                     * 那会让歌名/控制台摊成一片，失去「工具区」的紧凑感。
+                     * 下限不设：极窄（<400dp）时 42% 已经是唯一合理值，再设下限会重新溢出。
+                     */
+                    // BoxWithConstraints 拿**本行实际可用宽度**，而不是屏幕宽度：
+                    // 分屏/自由窗口下 screenWidthDp 报的是物理屏宽，与这里真正能用的宽度
+                    // 无关（Lint 的 ConfigurationScreenWidthHeight 正是这条）。
+                    // maxWidth 是父级给本节点的约束上限，天然含分屏与窗口化。
+                    BoxWithConstraints {
+                        val rightPaneWidth = (maxWidth * 0.42f).coerceAtMost(380.dp)
+                        Column(
+                            Modifier
+                                .width(rightPaneWidth)
+                                .fillMaxHeight(),
+                            verticalArrangement = Arrangement.Center,
+                        ) {
+                            // 横屏右侧栏的顺序：歌名组 → 控制台 → 提示行。
+                            // **歌名组必须在横屏也保留**：它承载 PlayerTitle/PlayerArtist 两个飞行
+                            // 真身键，横屏下若直接不渲染，横屏进入播放页时 `awaitRects(playerKeys)`
+                            // 会等不到这两个键 → 600ms 超时 → 整个飞行被中止（退化成硬切）。
+                            // 也就是说「横屏不显示歌名」这条看似合理的省空间方案，实际会打断飞行。
+                            titleBlock()
+                            consoleBlock()
+                            hintBlock()
+                        }
                     }
                 }
             } else {
@@ -1818,8 +1862,20 @@ private fun PlaybackOptionsSheet(
             SheetAction(
                 icon = GlassIcons.Moon,
                 label = sleepTimerLabel(option),
-                // P3-47：「取消定时」只在真有定时时高亮；无定时时连「未开启」副标题也不给
-                subtitle = if (option == 0 && activeMode == 0) null else sleepTimerSubtitle(option, activeMode, remainingSec),
+                // P3-47：「取消定时」只在真有定时时高亮；无定时时连「未开启」副标题也不给。
+                // 传入当前循环/随机模式：-2 档在会回绕的模式下必须如实说明「不会生效」
+                // （见 sleepTimerSubtitle 的 KDoc——这是 P1「定时静默失效」的文案侧修复）。
+                subtitle = if (option == 0 && activeMode == 0) {
+                    null
+                } else {
+                    sleepTimerSubtitle(
+                        option = option,
+                        activeMode = activeMode,
+                        remainingSec = remainingSec,
+                        repeatMode = state.repeatMode,
+                        shuffleOn = state.shuffleOn,
+                    )
+                },
                 emphasized = option != 0 && option == activeMode,
                 onClick = {
                     state.setSleepTimer(option)

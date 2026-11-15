@@ -16,8 +16,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -26,8 +26,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -82,20 +82,58 @@ fun LibraryScreen(
     audioDenied: Boolean = false,
     onRequestAudioPermission: () -> Unit = {},
 ) {
-    // P3-39：tab 与滚动位置改 rememberSaveable（进程内重建可恢复）。注意 AnimatedContent 换屏
-    // 会销毁内容、rememberSaveable 不保留——真正跨屏保留需把这两个状态提到 AppState，属后续项
-    var tab by rememberSaveable { mutableIntStateOf(0) }
-    val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
+    // ── tab 与滚动位置：提升到 AppState（P2 修复）──
+    //
+    // ## 为什么不能再放在屏内 rememberSaveable
+    //
+    // `GlassApp` 用 `AnimatedContent` 切换 `GlassScreen`，而 AnimatedContent 在动画结束后
+    // **销毁旧内容组合**——屏内 `rememberSaveable` 随之一起消失（它只在 Activity 重建时
+    // 通过 SavedStateRegistry 存活，管不了「同一个 Activity 内换屏」）。
+    //
+    // 于是两个日常动作都会丢状态：
+    // 1. 曲库「专辑」tab → 点进专辑详情 → 返回：回到的是「歌曲」tab
+    //    （`detailReturn` 只记 `GlassScreen.Library`，记不到 tab）；
+    // 2. 底部导航切到设置再切回：tab 与滚动位置全部回到顶部。
+    //
+    // 现在读写 AppState 上的 `libraryTab` / `libraryScrollIndex` / `libraryScrollOffset`：
+    // 那是跨屏存活的唯一单源，换屏期间值留在那里，屏重建时读回来。
+    // 域上它们仍是**瞬态导航态**（不进 DataStore 快照，重启 App 不该回到上次的滚动位置），
+    // 所以放 AppState 而不是 SnapshotStore——与 `screen` / `detail` 同级。
+    val tab = state.libraryTab
+    fun selectTab(next: Int) {
+        if (next == tab) return
+        state.libraryTab = next
+    }
+    // 初始化位置来自 AppState（跨屏/重建都由此复原）。用 rememberLazyListState 的
+    // initial* 参数而不是 rememberSaveable：Saver 会把值写进 Bundle，而真正的单源是
+    // AppState——两个来源并存时「谁赢」会随重建时机变化，是双源漂移的温床。
+    //
+    // 注意 initial* 只在**首组合**生效（remember 的初值语义）：这正是要的——
+    // 后续滚动由用户驱动，回写经下面的 snapshotFlow 走 AppState。
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = state.libraryScrollIndex,
+        initialFirstVisibleItemScrollOffset = state.libraryScrollOffset,
+    )
     // A2-07：六个 tab 共用一份 LazyListState——在「歌曲」滚到深处后切「专辑」，item 数变少时
-    // firstVisibleItemIndex 被 clamp、视口跳到列表尾部，切回也不复原。tab 变化即归零（跳过
-    // 首组合：rememberSaveable 恢复的滚动位置不被冲掉）；lastTab 用普通 remember——本组合实例
-    // 内比较前后值，换屏重进后从零起算正好不误伤恢复
+    // firstVisibleItemIndex 被 clamp、视口跳到列表尾部，切回也不复原。tab 变化即归零。
+    //
+    // 这里必须**同时把 AppState 里的滚动位置写回 0**：否则「切到专辑（列表归零）→ 切回歌曲」
+    // 时，屏重建会从 AppState 里读回歌曲 tab 的旧位置，与「切 tab 归零」这条既有决定矛盾。
+    // lastTab 用普通 remember：本组合实例内比较前后值，屏重建后从当前 tab 起算正好不误伤。
     var lastTab by remember { mutableIntStateOf(tab) }
     LaunchedEffect(tab) {
         if (tab != lastTab) {
             lastTab = tab
             listState.scrollToItem(0)
+            state.rememberLibraryScroll(0, 0)
         }
+    }
+    // 滚动位置回写：用 snapshotFlow 而不是「每次重组写一次」——后者会让 AppState 的
+    // snapshot 状态随滚动每帧变化，从而触发所有读它的组合（含曲库整棵 LazyColumn）。
+    // snapshotFlow 只在值真的变了才发，且 collect 挂在组合作用域里，屏销毁即自动取消。
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+            .collect { (index, offset) -> state.rememberLibraryScroll(index, offset) }
     }
     // 模态面板宿主（GlassApp 根层）：排序/单曲/集合面板经 show 挂载
     val modal = LocalModalState.current
@@ -122,7 +160,16 @@ fun LibraryScreen(
             )
         }
     }
-    // 集合操作面板（目标/标题/曲目锁定长按时刻值，播放行为与旧实现一致：入队后进播放页）
+    // 集合操作面板（目标/标题/曲目锁定长按时刻值；播放行为 = 入队后进播放页）
+    //
+    // ## 来源目标与空集合守卫（P2 / P1 修复）
+    //
+    // - **来源目标**：与详情页/搜索页同口径传 `target`。不传的话播放页顶栏
+    //   「来自『xx』」不可点——同一个「播放全部」动作从详情页发起能回跳、从曲库卡片
+    //   发起不能，用户无法理解这个差别。
+    // - **空集合**：`CollectionActionsSheet` 现在自己对 `tracks.isEmpty()` 隐藏四行播放动作
+    //   （见该组件），所以这里不会收到 0 首的播放请求；但**仍要判 openPlayer 的返回值**——
+    //   队列可能因别的路径变空（例如用户先清空了「接下来」），此时不该静默什么都不做。
     fun collectionActions(target: DetailTarget, title: String, tracks: List<DemoSong>) {
         modal.show {
             CollectionActionsSheet(
@@ -133,7 +180,7 @@ fun LibraryScreen(
                 title = title,
                 tracks = tracks,
                 onPlayAll = { shuffle ->
-                    state.playCollection(tracks, title, shuffle)
+                    state.playCollection(tracks, title, shuffle, sourceTarget = target)
                     state.openPlayer()
                 },
             )
@@ -195,7 +242,7 @@ fun LibraryScreen(
             item {
                 GlassTabs(
                     tabs = listOf("歌曲", "专辑", "艺术家", "文件夹", "流派", "歌单"),
-                    selected = tab, onSelect = { tab = it },
+                    selected = tab, onSelect = ::selectTab,
                 )
             }
             when (tab) {
@@ -385,7 +432,15 @@ fun LibraryScreen(
                         item(key = "tab-empty-5") {
                             // 图标：新画的 NoteList（双音符 + 符杠）。刻意不用「清单」构图——
                             // 那与既有 Queue（播放队列）撞形，会让两个不同概念在图标层混淆
-                            TabEmptyState(GlassIcons.NoteList, "还没有歌单", "点右上角 ＋ 可以新建歌单")
+                            // 空态文案必须与事实一致（P2 修复）：旧文案写「点右上角 ＋ 可以新建歌单」，
+                            // 而**曲库页头没有 ＋**——新建歌单的唯一入口在「歌单」页（PlaylistScreen）
+                            // 的页头。用户在曲库歌单 tab 找不到那个 ＋，只会以为界面坏了。
+                            // 这里如实指向真正的入口，并给出可执行的下一步（底部导航「歌单」）。
+                            TabEmptyState(
+                                GlassIcons.NoteList,
+                                "还没有歌单",
+                                "到「歌单」页点右上角 ＋ 新建",
+                            )
                         }
                     } else {
                         wallPlaylists.chunked(2).forEach { pair ->

@@ -249,6 +249,20 @@ class DesktopLyricsController(private val appContext: Context) {
                 setPadding(dp(18), dp(10), dp(18), dp(10))
                 // 拖动 + 位置持久化：松手/拖动中把 x/y 写回应用私有目录的小 JSON
                 //（DesktopLyricsPrefs），下次 show 恢复到用户拖后的位置（见 restorePosition）
+                //
+                // ## 为什么这里抑制 ClickableViewAccessibility（P2）
+                //
+                // Lint 的判据是「挂了 setOnTouchListener 的 View 必须 override performClick」，
+                // 但它看的是**调用点**，而 performClick 的实现被放在了 `DragTouchListener`
+                // 内部（见该类 ACTION_UP 分支的注释）——那是正确的位置：
+                // 触摸语义属于侦听器，让每个调用点各自 override performClick 是重复实现。
+                // 也就是说：**这张告警描述的状态并不存在**，抑制它不会掩盖真实缺陷。
+                //
+                // 为什么不改成自定义 View 子类去 override performClick：
+                // 这一行创建的是 `TextView(appContext)`（一个普通实例，不是子类）。
+                // 为一个「补 performClick」的目的引入新类，会让「这个 TextView 是什么」
+                // 在文件里多一层跳转，而实际行为完全相同。抑制 + 注释更诚实。
+                @Suppress("ClickableViewAccessibility")
                 setOnTouchListener(
                     DragTouchListener(wm) { lp ->
                         DesktopLyricsPrefs.savePosition(appContext, lp.x, lp.y)

@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -28,7 +29,10 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,12 +47,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.local.music.core.ui.components.AddSongsSheet
 import com.local.music.core.ui.components.ArtThumb
+import com.local.music.core.ui.components.ChromeBottomInset
 import com.local.music.core.ui.components.CollectionActionsSheet
 import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoSong
 import com.local.music.core.ui.components.DetailData
 import com.local.music.core.ui.components.DetailTarget
 import com.local.music.core.ui.components.GlassChrome
+import com.local.music.core.ui.components.GlassEmptyState
 import com.local.music.core.ui.components.GlassIconButton
 import com.local.music.core.ui.components.GlassLevel
 import com.local.music.core.ui.components.GlassSurface
@@ -71,6 +77,7 @@ import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.onSeedColor
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
+import kotlinx.coroutines.delay
 
 /**
  * 详情页（歌单 / 专辑 / 艺术家 / 文件夹 / 流派 共用模板）：
@@ -118,14 +125,107 @@ fun PlaylistDetailScreen(
         return
     }
 
+    // ── 空集合点「播放 / 随机」的可见反馈 ──
+    //
+    // 为什么**不**复用 `state.reportEngineFailure`：那条通道的消费端是 GlassApp 的
+    // `TopBanner(..., tone = BannerTone.Error)`，注释写死「这条通道只有错误语义
+    // （引擎失败 / 读取媒体库失败），恒 Error」。而「这张歌单还没有歌曲」是**事实陈述**，
+    // 把一个空歌单说成红色故障条，等于告诉用户「播放出错了，去查播放服务」——
+    // 用户会去找问题，而实际上他只需要先去加歌。
+    // `scanResultToast` 同理不可用：它的语义是「扫描回执」，且 `reportScanResult` 的
+    // 文案模板由扫描链路独占，塞歌单提示会让「扫描完成」这条回执失真。
+    //
+    // 所以用屏内短提示：2 秒自动消失（`LaunchedEffect(tip)` 的 key 是文案本身，
+    // 连点两次「播放」时第二次不会重启计时——与 PlayerScreen 的 modeLabel 同一套写法）。
+    // 屏在换走时组合销毁，提示随之消失，不需要任何清理。
+    //
+    // 为什么用 token 而不是纯 String：短提示可能**连续两次**给出同一句话
+    // （空歌单点「播放」→ 再点「随机」），纯 String 作 key 时第二次数值没变 →
+    // LaunchedEffect 不重启 → 提示会在第一次的 2 秒末消失，看起来像「第二次没反应」。
+    var tip by remember { mutableStateOf<String?>(null) }
+    var tipToken by remember { mutableIntStateOf(0) }
+    LaunchedEffect(tipToken) {
+        if (tip == null) return@LaunchedEffect
+        delay(2_000)
+        tip = null
+    }
+    fun showTip(message: String) {
+        tip = message
+        tipToken++
+    }
+
+    /**
+     * 集合播放（「播放」胶囊 /「随机」胶囊 / 集合面板的「全部播放」「随机播放」三处共用）。
+     *
+     * ## A. 来源目标必须一起带进来（本轮修复）
+     *
+     * 单曲行播放走 [DetailTrackRow] 的 onClick，它传 `sourceTarget = state.detail`
+     * （见该处注释：不传的话播放页顶栏「来自『xx』」永远点不动）。
+     * 而集合播放过去只传 `source = data.title` 这个名字——于是**同一个歌单里**，
+     * 点单曲能回跳、点「播放全部」不能，同一入口两种行为。
+     *
+     * 注意 `data` 是 [DetailData]，**没有** kind/id 字段（它只有 header/title/meta/art/
+     * tracks/cover/coverUri），所以来源目标只能从 `state.detail`（[DetailTarget]）取，
+     * 且必须现读 `state.detail.kind` / `state.detail.id`——不能缓存进 `data`：
+     * `detailData()` 是按 target 解析出来的展示快照，导航目标属于**导航态**不属于展示数据。
+     * 这与单曲行传 `state.detail` 的口径完全一致，两条入口从此同源。
+     *
+     * ## B. 空集合不再进「占位播放页」
+     *
+     * 旧实现无条件 `playCollection(...)` + `openPlayer()`：
+     * - `playCollection` 内部 `if (tracks.isEmpty()) return` 静默返回；
+     * - `openPlayer()` 在旧版本无条件切屏 → 用户落进一个「暂无歌曲」的占位播放页，
+     *   播放/上一首/下一首/收藏/进度条全部点了没反应。
+     *
+     * 现在 `openPlayer()` 自己返回 Boolean（队列为空时 false 且不切屏），但**守卫仍然
+     * 要写在这里**，理由有两条：
+     * 1. 空表时给出的反馈不该是「什么都没发生」，而应是一句解释（见 [showTip]）；
+     * 2. `openPlayer()` 的守卫判据是 `hasSongs`（**队列**非空），而队列可能还留着上一次
+     *    播放的内容——那时 openPlayer 会返回 true，用户被送进一个**没有换歌**的播放页，
+     *    观感是「点了播放全部，放的是上一首」。所以本屏必须以 `data.tracks` 为准先拦。
+     *
+     * 返回值也判：跳转失败（真的一首都没有可播内容）时不静默，给同一句提示。
+     */
     fun playAll(shuffle: Boolean) {
-        state.playCollection(data.tracks, data.title, shuffle)
-        state.openPlayer()
+        if (data.tracks.isEmpty()) {
+            showTip(
+                when (state.detail.kind) {
+                    DetailTarget.Kind.Playlist -> "这张歌单还没有歌曲"
+                    DetailTarget.Kind.Album -> "这张专辑还没有可播放的歌曲"
+                    DetailTarget.Kind.Artist -> "这位艺术家还没有可播放的歌曲"
+                    DetailTarget.Kind.Folder -> "这个文件夹里还没有歌曲"
+                    DetailTarget.Kind.Genre -> "这个流派下还没有歌曲"
+                },
+            )
+            return
+        }
+        state.playCollection(
+            tracks = data.tracks,
+            source = data.title,
+            shuffle = shuffle,
+            // A：与单曲行播放同源——顶栏「来自『xx』」据此可点回本页
+            sourceTarget = DetailTarget(state.detail.kind, state.detail.id),
+        )
+        if (!state.openPlayer()) {
+            // 兜底：playCollection 已经把队列换成本集合，正常不会走到这里
+            // （队列非空 → openPlayer 必然成功）。留判是为了不静默。
+            showTip("暂时无法打开播放页，请稍后再试")
+        }
     }
     val flight = LocalPlayerFlight.current
 
     val hazeState = rememberHazeState()
     val pageScroll = rememberScrollState()
+    // 不可重排分支的滚动状态：`rememberSaveable(LazyListState.Saver)` 而不是普通
+    // `rememberLazyListState()`——详情页不在 AnimatedContent 的 tab 三屏里，
+    // 换屏时它作为 `GlassScreen.Detail` 的内容被销毁，但**进程内重建**（改系统字号 /
+    // 显示大小，fontScale 不在 manifest 的 configChanges 里，必重建）会把组合整个丢掉。
+    // 没有 Saver 时重建会把用户送回列表顶部，而详情页恰恰是最长的列表（文件夹/流派
+    // 可达上千行）。跨屏（进播放页再回来）不需要额外处理：播放页是覆盖层，
+    // 详情页内容始终在组合里（见 GlassApp 的 playerOpen 结构），LazyListState 原样存活。
+    val detailListState = androidx.compose.runtime.saveable.rememberSaveable(
+        saver = LazyListState.Saver,
+    ) { LazyListState() }
     // 可重排判定：自建歌单且展示序与 addedTracks 一一对应（拖拽提交的索引才有意义）
     val reorderable = state.detail.kind == DetailTarget.Kind.Playlist &&
         state.canReorderPlaylist(state.detail.id)
@@ -194,8 +294,13 @@ fun PlaylistDetailScreen(
                 // P3-40：LazyColumn 的 key 必须唯一，数据异常出现重复 id 会直接崩溃——
                 // 展示序列先按 id 去重（可重排分支不去重：行索引要与 addedTracks 一一对应）；
                 // 去重序列同时作为表头计数、isFirst/isLast 判定与播放队列的口径，避免错位
+                //
+                // 批量多选管理（P2 功能缺口）：曲库/歌单此前只有「添加歌曲」面板支持多选，
+                // 详情页要一首首长按 → 面板 → 移除。这一项**本轮未做**——它需要一套
+                // 选中态、顶部批量操作条与二次确认，且与拖拽重排（可重排分支）的
+                // 手势域冲突需要重新设计。这里如实记录为后续项，不假装已支持。
                 val listedTracks = remember(data.tracks) { data.tracks.distinctBy { it.id } }
-                LazyColumn(Modifier.weight(1f).hazeSource(hazeState)) {
+                LazyColumn(Modifier.weight(1f).hazeSource(hazeState), state = detailListState) {
                     item(key = "detail-header") {
                         DetailHeader(state, data, onPlayAll = { playAll(it) }, onExportM3u = onExportM3u)
                     }

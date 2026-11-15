@@ -35,7 +35,7 @@
         android:layout_height="48dp"
         android:layout_marginEnd="10dp"
         android:scaleType="centerCrop"
-        android:contentDescription="专辑封面"
+        android:contentDescription="@string/widget_desc_cover"
         android:src="@drawable/widget_art_placeholder" />
 
     <!-- 文字区：占满剩余宽度，weight=1 -->
@@ -115,7 +115,7 @@
             android:padding="9dp"
             android:src="@drawable/widget_ic_prev"
             android:background="@android:color/transparent"
-            android:contentDescription="上一首" />
+            android:contentDescription="@string/widget_desc_prev" />
 
         <ImageView
             android:id="@+id/widget_play"
@@ -124,7 +124,7 @@
             android:padding="10dp"
             android:src="@drawable/widget_ic_play"
             android:background="@android:color/transparent"
-            android:contentDescription="播放或暂停" />
+            android:contentDescription="@string/widget_desc_play_pause" />
 
         <ImageView
             android:id="@+id/widget_next"
@@ -133,6 +133,6 @@
             android:padding="9dp"
             android:src="@drawable/widget_ic_next"
             android:background="@android:color/transparent"
-            android:contentDescription="下一首" />
+            android:contentDescription="@string/widget_desc_next" />
     </LinearLayout>
 </LinearLayout>

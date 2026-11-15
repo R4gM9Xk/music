@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -174,7 +175,18 @@ fun ProgressTrack(
     Box(
         modifier
             .fillMaxWidth()
-            .height(24.dp) // 触摸热区（视觉轨道仍 4dp 居中）
+            // 触摸热区 24dp → 44dp（P2 无障碍修复）。视觉轨道仍是 4dp、绘制期居中，
+            // 热区只影响命中范围，不改任何像素。
+            //
+            // 为什么 24dp 不够：这是全曲唯一的 seek 入口，也是一条**横向细条**——
+            // 纵向只有 24dp 可容错，而用户在播放页/迷你条上滑动的方向本来就不稳定，
+            // 手指稍偏就落到轨道外的空白，表现为「拖了没反应」。44dp 与全 App
+            // 其它可点目标的下限同档（GlassIconButton / SongRow 尾槽按钮 / 迷你条按钮）。
+            //
+            // 副作用（如实记录）：44dp 比原来的 24dp 多占 20dp 竖向空间。调用点若在
+            // 密集布局里（播放页控制台）需要自己控 gap——那里本来就有 S.Gap 间距，
+            // 实测不会挤，但改这一行时要知道它会影响**所有**调用点的占位。
+            .height(44.dp)
             // 链式里按开关拼接：enabled = false 时整段手势不存在（不是"挂了但忽略"）
             .then(
                 if (enabled) {
@@ -467,6 +479,17 @@ private fun MiniBarButton(
     Box(
         modifier
             .pressScale(interactionSource, pressed = 0.88f)
+            // 触控目标：图标 22dp + 4dp padding ×2 = 30dp（P2 无障碍修复）。
+            //
+            // 这是全 App 最常被点的两个按钮（迷你条常驻在每一屏底部），而 30dp 的命中区
+            // 在拇指操作下明显偏小——迷你条本身只有 62dp 高，用户还在移动中按它。
+            // 用 `.sizeIn(minWidth/minHeight = 44.dp)` 而**不是**加大 padding：
+            // padding 会把 22dp 图标与相邻元素的间距一起推开，62dp 高的迷你条里
+            // 两个按钮 + 封面 + 文本列会挤在一起；sizeIn 只保证布局尺寸下限，
+            // 图标仍居中，视觉间距不变。
+            //
+            // 44dp 与 GlassIconButton / SongRow 行内按钮同档（全 App 统一的下限）。
+            .sizeIn(minWidth = 44.dp, minHeight = 44.dp)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
             // 语义挂 clickable 节点本身；子 Icon 传 null（避免重复播报），见 PlayPauseButton 同款说明
             .semantics {
@@ -475,6 +498,7 @@ private fun MiniBarButton(
                 if (stateDescription != null) this.stateDescription = stateDescription
             }
             .padding(4.dp),
+        contentAlignment = Alignment.Center,
     ) { content() }
 }
 

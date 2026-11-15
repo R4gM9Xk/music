@@ -108,6 +108,27 @@ import com.local.music.core.ui.theme.onSeedColor
  * `GlassType.BodyEmph` / `GlassType.Caption`，这里必须同步——否则又会重新裂成
  * 「token 是 15sp、行高数学按 14sp 算」的隐性失配。行高系数 1.35× 是刻意的保守估计
  * （token 的 lineHeight 是 21/16sp，即 1.4/1.33×），取大值可保证不算矮。
+ *
+ * ## 上下内边距：**必须由 [S.Gap8] 的双倍表达，不能写 18dp**（P2 修复）
+ *
+ * 旧推导式写死 `18.dp + maxOf(48.dp, textColumn)`，注释说「9dp 上下内边距」。而
+ * [SongRow] 真实用的是 `.padding(horizontal = S.Gap12.dp, vertical = S.Gap8.dp)` ——
+ * 上下各 **8dp，合计 16dp**。18 与 16 差 2dp/行，这就是本仓那条「拖拽落位偏差随队列
+ * 长度累积」的根因：
+ * - 队列面板的拖拽靠 `列表偏移 = 首可见下标 × 行高 + 项内偏移` 推算目标槽位
+ *   （见 [ReorderableLazyState.fingerListY]），行高偏大 2dp 会让**每一行**的估算
+ *   往下漂 2dp，几十行后偏差达到一行以上，松手就落到相邻的错误行——
+ *   而队列重排**不可撤销**，这比滚动偏移严重得多；
+ * - 「定位到当前曲」的 scrollToItem 不受影响（它按 item 下标定位，不用像素），
+ *   但段首偏移与自动滚动边界都用同一个值，一起偏。
+ *
+ * 修法不是把 18 改成 16 这个数字，而是**从同一个 token 推导**：
+ * `S.Gap8 * 2`。这样将来谁调了 SongRow 的竖直 padding，只要改的是 token 或改的是
+ * 同一个表达式，两边都不会再各自漂一次——这正是本函数存在的全部意义
+ * （「视觉一种高度、数学另一种高度」的双源漂移）。
+ *
+ * ⚠️ 若某天 [SongRow] 的竖直 padding 不再等于 `S.Gap8`，**必须同步改这一行**，
+ * 并在两处互相引用（`SongRow` 的 `.padding(...)` 注释里指回本函数）。
  */
 val SongRowHeight: Dp
     @Composable get() {
@@ -116,9 +137,10 @@ val SongRowHeight: Dp
         val textColumn = with(density) {
             (15.sp.toDp() * 1.35f) + 2.dp + (12.sp.toDp() * 1.35f)
         }
-        // 内容高度取缩略图与文本列的较大者：正常字号下缩略图 48dp 占优（行高 66dp 不变），
-        // 大字号下文本列反超，行高随之上浮——这正是我们要的行为
-        return 18.dp + maxOf(48.dp, textColumn)
+        // 内容高度取缩略图与文本列的较大者：正常字号下缩略图 48dp 占优（行高 64dp），
+        // 大字号下文本列反超，行高随之上浮——这正是我们要的行为。
+        // 上下内边距由 S.Gap8 双倍推导（见上方 KDoc），不再写死 18dp。
+        return (S.Gap8 * 2).dp + maxOf(48.dp, textColumn)
     }
 
 /**
@@ -416,6 +438,9 @@ fun SongRow(
                 this.role = Role.Button
                 if (selected) this.selected = true
             }
+            // ⚠️ 竖直 padding 必须与 [SongRowHeight] 的推导同源（那里写的是 `S.Gap8 * 2`）。
+            // 队列面板的拖拽行数学与滚动定位都以那个值为基准，改这里不改那里会让
+            // 长队列的落位偏差逐行累积——队列重排不可撤销，代价很高。
             .padding(horizontal = S.Gap12.dp, vertical = S.Gap8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
@@ -466,8 +491,19 @@ fun SongRow(
                 }
                 "remove" -> {
                     Box(
+                        // 触控目标 36dp → 44dp（P2 无障碍修复）。
+                        //
+                        // 视觉仍是 16dp 图标，但**热区**必须够大：WCAG 2.2 / Android 无障碍
+                        // 指南的下限是 48dp，Material 允许 44dp + 8dp 间距；而 36dp 在这个
+                        // 位置尤其危险——它紧邻「整行点击 = 播放」，误触的代价是从队列里
+                        // 移除一首歌（且这里没有撤销，撤销条只覆盖「清空接下来」）。
+                        // 44dp 与 GlassIconButton 的既有取值同档，不再另造一个数。
+                        //
+                        // 为什么不是 48dp：行高只有 64dp（S.Gap8×2 + 48 缩略图），
+                        // 48dp 热区会与行的上下边界贴死，相邻队列行的移除热区首尾相接，
+                        // 反而更容易串到上一行/下一行。44dp 留出 10dp 的天然分割带。
                         Modifier
-                            .size(36.dp)
+                            .size(44.dp)
                             .clip(RoundedCornerShape(R.Thumb10.dp))
                             .clickable(
                                 interactionSource = actionInteractionSource,
@@ -497,8 +533,12 @@ fun SongRow(
                 }
                 "more" -> {
                     Box(
+                        // 触控目标 36dp → 44dp：与 remove 分支同一理由（见上）。
+                        // 「更多」点错只是弹出面板，代价比移除小，但两个相邻尾槽按钮
+                        // **必须同尺寸**——一收一放会让右侧图标基线错位，也让人怀疑
+                        // 哪个才是"真"按钮。
                         Modifier
-                            .size(36.dp)
+                            .size(44.dp)
                             .clip(RoundedCornerShape(R.Thumb10.dp))
                             .clickable(
                                 interactionSource = actionInteractionSource,

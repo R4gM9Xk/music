@@ -15,16 +15,18 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -68,9 +70,22 @@ import com.local.music.core.ui.theme.S
 fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
     // 命名草稿：remember 于本屏，面板 show 后经闭包活读写（重开保留上次草稿，同旧行为）
     var newName by remember { mutableStateOf("") }
-    // P3-39：滚动位置改 rememberSaveable（进程内重建可恢复）。注意 AnimatedContent 换屏
-    // 会销毁内容、rememberSaveable 不保留——真正跨屏保留需把该状态提到 AppState，属后续项
-    val scrollState = rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
+    // ── 滚动位置：提升到 AppState（P2 修复）──
+    //
+    // 旧实现是屏内 `rememberSaveable(ScrollState.Saver)`。它在 **Activity 重建**
+    // （改字号/显示大小）时能恢复，但管不了 `GlassApp` 的 `AnimatedContent` 换屏：
+    // 换屏会销毁内容组合，而 rememberSaveable 只在 SavedStateRegistry 那一侧存活，
+    // 同一次 Activity 内的换屏它拿不到值。于是「底部导航切到设置再切回歌单」
+    // 会回到顶部——而歌单页是卡片墙，滚到下面看某个歌单时被弹回顶部很烦。
+    //
+    // 现在读写 AppState.playlistScroll：那是跨屏存活的唯一单源（与 libraryTab 同级，
+    // 同属瞬态导航态、不进 DataStore 快照）。
+    val scrollState = rememberScrollState(initial = state.playlistScroll)
+    // 回写：snapshotFlow 而不是每帧写。后者会让 AppState 的 snapshot 状态随滚动每帧变化，
+    // 从而触发所有读它的组合（含歌单墙整棵 LazyColumn / Column）。
+    LaunchedEffect(scrollState) {
+        snapshotFlow { scrollState.value }.collect { state.playlistScroll = it }
+    }
     // 模态面板宿主（GlassApp 根层）：新建歌单/集合面板经 show 挂载
     val modal = LocalModalState.current
 

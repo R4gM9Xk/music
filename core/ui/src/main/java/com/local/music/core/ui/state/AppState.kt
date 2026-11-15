@@ -31,6 +31,32 @@ import com.local.music.core.ui.theme.MotionIntensity
 /** 6 屏路由（设计稿 7 屏去掉「流体云/小部件」展示页：系统级流体云已由媒体会话承担） */
 enum class GlassScreen { Player, Library, Playlist, Detail, Search, Settings }
 
+/**
+ * 视觉风格（快照 v12）：全 App 的**材质语言**二选一。
+ *
+ * ## 为什么是「材质」而不是「配色」
+ * 项目已有的可配置维度共四个（主题色 / 深浅 / 玻璃强度 / 动效强度），它们都在调
+ * **同一套液态玻璃语言**的参数。而拟物（skeuomorphism）不是「更浓的玻璃」——它是
+ * 另一套视觉语法：
+ * - 玻璃：半透明、模糊、无边界的悬浮感（light passes through）
+ * - 拟物：**不透明**、有物理厚度、明确的凸/凹边界与投影（light falls on it）
+ *
+ * 因此它与「玻璃强度三档」正交，必须是独立维度。取值存**名字**（同 glassLevel /
+ * backgroundMode 的口径），增删成员时不会让用户已存的档位静默错位。
+ *
+ * ## 两条语言的边界（实现时不得越界）
+ * 拟物档**不允许**复用玻璃档的半透明填充公式：只要仍然透出背景，"像玻璃"的观感
+ * 就无法被压掉。所以拟物档走自己的 [com.local.music.core.ui.theme.Skeuomorph]
+ * token 集，GlassSurface 在其下改画斜面/投影而不是描边/顶光线。
+ */
+enum class VisualStyle(val label: String) {
+    /** 液态玻璃（默认，设计与历史基线） */
+    Glass("液态玻璃"),
+
+    /** 拟物：不透明贴面 + 斜面 + 投影 */
+    Skeuomorph("拟物"),
+}
+
 /** 循环模式：关 / 列表循环 / 单曲循环 */
 enum class RepeatMode { Off, All, One }
 
@@ -109,6 +135,16 @@ data class AppStateSnapshot(
      * 旧版本（≤v10）没有这两个字段 → 解码走默认值（极光），用户升级后观感不变。
      */
     val backgroundPhotoUri: String? = null,
+    /**
+     * 视觉风格（v12 起编码）：液态玻璃 / 拟物。
+     *
+     * 存名字而不是序号（同 glassLevel / motionLevel / backgroundMode 的口径）：
+     * 序号会在增删枚举成员时静默错位，用户的前一档会变成另一档。
+     *
+     * 默认 [VisualStyle.Glass]：旧版本（≤v11）没有这个字段 → 解码走默认值，
+     * 老用户升级后**观感逐像素不变**，这是加这个字段的硬约束。
+     */
+    val visualStyle: String = VisualStyle.Glass.name,
 )
 
 /** 持久化桥接：AppState 只面向它，实现在 app 模块（DataStore） */
@@ -132,15 +168,45 @@ fun sleepTimerLabel(option: Int): String = when {
     else -> "取消定时"
 }
 
-/** 定时关闭选项副标题：生效中项显示进行中语义（分钟档带秒级倒计时），其余无副标题 */
-fun sleepTimerSubtitle(option: Int, activeMode: Int, remainingSec: Int): String? = when {
+/**
+ * 定时关闭选项副标题：生效中项显示进行中语义（分钟档带秒级倒计时），其余无副标题。
+ *
+ * ## 为什么 -2 档的文案必须随播放模式变化（P1 修复的文案侧）
+ *
+ * 「播完整个队列」的判据是「自然切换之后没有下一首」（见 MusicPlaybackService 的
+ * onMediaItemTransition）。这条判据在**列表循环 / 随机播放**下恒不成立——播放器会回绕，
+ * 队列永远不会「播完」。旧实现让这个组合**静默失效**：用户选了「播完整个队列」，
+ * 界面显示定时已开启，然后它永远不触发，用户只能等到睡醒发现整夜在放。
+ *
+ * 服务端侧的行为是**对的**（循环模式下队列确实不会播完），所以修复的重心在
+ * **如实告知**：当 -2 档落在会回绕的模式下时，副标题必须说清「当前循环模式会回绕，
+ * 要生效需先关闭循环」。这不是免责声明——它给出的是用户能立刻执行的动作。
+ *
+ * @param repeatMode 当前循环模式（null = 调用方不关心，退化为旧文案）
+ * @param shuffleOn 当前是否随机
+ */
+fun sleepTimerSubtitle(
+    option: Int,
+    activeMode: Int,
+    remainingSec: Int,
+    repeatMode: RepeatMode? = null,
+    shuffleOn: Boolean = false,
+): String? = when {
     option != activeMode -> null
     option > 0 -> "剩余 ${remainingSec.asTime()}"
-    // 文案必须与服务端语义一致：「播完当前首」只认自然完播，用户手动切歌/拖动进度都不暂停
-    // （服务端只对 REASON_AUTO 暂停；UI 侧手动切歌还会把定时撤销）。
+    // 文案必须与服务端语义一致：「播完当前首」只认自然完播（含单曲循环重入），
+    // 用户手动切歌/拖动进度都不暂停（服务端只对 AUTO / REPEAT 暂停；
+    // UI 侧手动切歌还会把定时撤销）。
     // 原副标题「当前曲播完后暂停」会让用户以为手动切歌也会停 —— 用户视角这就是个 bug。
     option == -1 -> "当前曲自然播完后暂停 · 手动切歌不触发"
-    option == -2 -> "整个队列播完后暂停"
+    // -2 档：会回绕的模式下明说不会生效（见上方 KDoc）
+    option == -2 -> when {
+        shuffleOn -> "整个队列播完后暂停 · 随机播放会重新开始，要生效请先关随机"
+        repeatMode == RepeatMode.All -> "整个队列播完后暂停 · 列表循环会重新开始，要生效请先关循环"
+        // 单曲循环下队列同样不会推进到「播完」，但用户选 -2 时通常不是这个意图，
+        // 这里不额外提示（-1 才是单曲循环的常见搭配）；交给循环模式的按钮自解释。
+        else -> "整个队列播完后暂停"
+    }
     else -> "未开启"
 }
 
@@ -157,6 +223,30 @@ data class SongSpec(
     val album: String,
     val artworkUri: String?,
     val durationMs: Long,
+) : java.io.Serializable
+
+/**
+ * 续播现场里「播放器参数」那一半（P2 修复的载体）。
+ *
+ * ## 为什么单独一个类型而不是给 queueStateWriter 加四个形参
+ * 四个散参数在调用点极易漏传/换序（`shuffleOn` 与 `repeatMode` 都是「模式」语义，
+ * 位置一错就静默出错），而这里是**整组一起下发、一起重放**的语义——与
+ * [AudioFxSettings] 打包 5 个音效字段同一理由（见该类的 KDoc）。
+ *
+ * ## 为什么不直接传 AppStateSnapshot
+ * 快照里有歌单/收藏/播放次数等**服务端完全用不到**的用户数据，且 :app 的
+ * QueueStateStore 只需要播放参数。传整份快照等于让服务端接触不必要的状态面，
+ * 也让这个桥的类型耦合到快照 schema 的每一次演进。
+ *
+ * @property repeatMode RepeatMode 的**名字**（存名字不存序号：枚举增删不会静默错位）
+ * @property eqPreset EqPreset 的名字
+ */
+data class QueueResumptionSettings(
+    val shuffleOn: Boolean = false,
+    val repeatMode: String = RepeatMode.Off.name,
+    val playbackSpeed: Float = 1f,
+    val eqPreset: String = "Off",
+    val audioFx: AudioFxSettings = AudioFxSettings(),
 ) : java.io.Serializable
 
 /** 播放中实时音频参数（ExoPlayer Format，最权威；null = 未在播放/取不到） */
@@ -355,11 +445,32 @@ class AppState(
     /**
      * 打开播放页：记下来源页供收起时原路落回。
      * 已在播放页时直接返回 —— 不能把 playerOrigin 覆盖成 Player（否则收起无处可回）。
+     *
+     * ## 空队列守卫（P1 修复）
+     *
+     * **没有任何可播曲目时不允许进入播放页**。旧实现无条件切屏，于是两条日常路径会
+     * 把用户送进一个「占位播放页」——页面标题是「暂无歌曲」，舞台上却是占位封面，
+     * 播放/上一首/下一首/收藏/进度条全部点了没反应（它们各自内部都有 `hasSongs` 守卫）：
+     *
+     * 1. 音频权限被拒 / 曲库为空时点悬浮迷你条（`Chrome.kt` 的整体点击当时无门控）；
+     * 2. 空歌单详情页点「播放 / 随机」——`PlaylistDetailScreen.playAll` 先调
+     *    `playCollection(空表)`（内部 `if (tracks.isEmpty()) return` 静默什么都不做），
+     *    再无条件 `openPlayer()`。
+     *
+     * 守卫放在这里而不是逐个调用点：这是**唯一**的切屏入口，散在 UI 侧的补丁只要
+     * 漏一处就复发（本仓历史上的「改一处漏同类另一处」模式）。返回 Boolean 让调用方
+     * 能给出反馈（例如空歌单点播放时提示「这张歌单还没有歌曲」），而不是静默不动。
+     *
+     * @return true = 已进入播放页；false = 队列为空，未切屏
      */
-    fun openPlayer() {
-        if (screen == GlassScreen.Player) return
+    fun openPlayer(): Boolean {
+        if (screen == GlassScreen.Player) return true
+        // hasSongs = 队列非空。曲库已装载但队列为空（用户清空了接下来 / 刚启动还没点播）
+        // 同样是「没有可播内容」，一并拒绝 —— 播放页的控制项全部依赖当前曲。
+        if (!hasSongs) return false
         playerOrigin = screen
         screen = GlassScreen.Player
+        return true
     }
 
     /** 收起播放页：落回来源页。非播放页态调用为 no-op（防止误改导航） */
@@ -381,6 +492,18 @@ class AppState(
      * 真机后果（P2-26）：在播放页改一下字号 → 被弹回曲库首页，正在看的详情/搜索词
      * 一并丢失，用户毫无心理准备。
      *
+     * ## 为什么曲库 tab 与滚动位置必须也在这份快照里（P2 修复）
+     *
+     * 过去它们只是各屏内的 `rememberSaveable`，而 `GlassApp` 用 `AnimatedContent` 换屏，
+     * **换屏即销毁内容**——`rememberSaveable` 随组合一起没了。于是两个日常动作都会丢状态：
+     * 1. 曲库「专辑」tab → 进专辑详情 → 返回：回到的是「歌曲」tab（`detailReturn` 只记
+     *    `GlassScreen.Library`，记不到 tab）；
+     * 2. 底部导航切到设置再切回：曲库 tab 与滚动位置全部回到顶部。
+     *
+     * 状态提升到 AppState（跨屏存活的唯一单源）之后这两条一起修好：值在换屏期间留在
+     * AppState 上，屏重建时读回来。域上它们仍是**瞬态导航态**（不进 DataStore 快照），
+     * 所以放这里而不是 SnapshotStore，语义一致。
+     *
      * 返回纯可序列化的基本类型集合（String + 下标），宿主侧无需给 GlassScreen/DetailTarget
      * 写 Saver，也不会因为将来枚举增删而让恢复逻辑编译不过：解析失败一律回落默认值。
      */
@@ -394,6 +517,11 @@ class AppState(
         // 输入框读的就是 state.searchQuery（SearchScreen.kt:66）。只恢复 screen=Search
         // 而词是空串，用户看到的仍是一个空搜索页 —— 症状没修掉一半。
         searchQuery,
+        // 曲库 tab + 两个主列表的滚动位置（见上方 KDoc 的 P2 说明）
+        libraryTab.toString(),
+        libraryScrollIndex.toString(),
+        libraryScrollOffset.toString(),
+        playlistScroll.toString(),
     )
 
     /**
@@ -414,10 +542,90 @@ class AppState(
         saved[3].toScreenOrNull()?.let { detailReturn = it }
         saved[4].toScreenOrNull()?.let { playerOrigin = it }
         saved.getOrNull(5)?.let { searchQuery = it }
+        saved.getOrNull(6)?.toIntOrNull()?.let { libraryTab = it.coerceAtLeast(0) }
+        saved.getOrNull(7)?.toIntOrNull()?.let { libraryScrollIndex = it.coerceAtLeast(0) }
+        saved.getOrNull(8)?.toIntOrNull()?.let { libraryScrollOffset = it.coerceAtLeast(0) }
+        saved.getOrNull(9)?.toIntOrNull()?.let { playlistScroll = it.coerceAtLeast(0) }
         // 恢复到播放页时 playerOrigin 必须是个「能退出去」的页：历史上它是 Player 的坏数据
         // 会让 closePlayer 原地打转。还原时兜一刀，代价为零。
         if (playerOrigin == GlassScreen.Player) playerOrigin = GlassScreen.Library
         screen = target
+    }
+
+    // ── 主屏选中/滚动态（跨屏存活，见 navigationState 的 KDoc）────────────────
+    //
+    // 这几个值的存在理由是同一个：**AnimatedContent 换屏会销毁内容**，任何只活在屏内的
+    // rememberSaveable 都无法跨屏存活。而「从专辑详情返回该回到专辑 tab」「切走再切回
+    // 不该回顶部」是用户对导航最基础的预期，所以它们必须提升到 AppState。
+    //
+    // 为什么**不**进 DataStore 快照：那是「跨进程持久化」的语义，重启 App 后回到上次
+    // 滚动到一半的列表反而是骚扰。它们只活在这一次任务栈里，与 screen/detail 同级。
+
+    /** 曲库 tab 下标（0=歌曲 1=专辑 2=艺术家 3=文件夹 4=流派 5=歌单） */
+    var libraryTab by mutableIntStateOf(0)
+
+    /** 曲库列表首可见项下标（六个 tab 共用一份 LazyListState，切 tab 时归零） */
+    var libraryScrollIndex by mutableIntStateOf(0)
+
+    /** 曲库列表首可见项内部偏移（px）：只存下标会让高行列表回位差半屏 */
+    var libraryScrollOffset by mutableIntStateOf(0)
+
+    /** 歌单页滚动位置（px，ScrollState.value） */
+    var playlistScroll by mutableIntStateOf(0)
+
+    /** 记录曲库滚动位置（库屏在滚动停止时回写） */
+    fun rememberLibraryScroll(index: Int, offset: Int) {
+        libraryScrollIndex = index.coerceAtLeast(0)
+        libraryScrollOffset = offset.coerceAtLeast(0)
+    }
+
+    // ── 设置页二级分组（P1 修复：系统返回键必须回设置首页，而不是一路弹回曲库）──
+    //
+    // ## 为什么必须提升到 AppState
+    //
+    // 设置页的分组层级过去是**屏内** `rememberSaveable` 的 `openGroup`，而决定「返回键
+    // 去哪」的 BackHandler 在 `GlassApp`（:app 模块）——它看不到 feature:settings 内部的
+    // 局部状态。于是系统返回键只能落到全局兜底分支 `state.screen = Library`：
+    // 用户「设置 → 外观 → 系统返回」直接被弹回曲库，跳过了设置首页这一层。
+    //
+    // 修法是把这一层导航态提到唯一的跨屏单源（AppState）：BackHandler 现在可以
+    // 「有二级页就先退二级页」。这与 libraryTab 的提升是同一类修复（见 navigationState
+    // 的 KDoc），域上也一致——瞬态导航态，不进 DataStore 快照。
+    //
+    // 存组名（String）而不是序号：枚举/分组顺序一变，已存的序号就指向错误的组。
+
+    /** 当前打开的设置分组名；null = 设置首页导航 */
+    var settingsGroup by mutableStateOf<String?>(null)
+
+    /**
+     * 从二级页再进深层页（如「支持开发者」）时记下的**返回目标分组**。
+     *
+     * 为什么需要：设置存在「首页 → 分组 → 更深一层」的第三级（支持开发者页从「关于」
+     * 里的入口进去）。返回时应当回到**进入它的那一组**，而不是设置首页——否则用户
+     * 从「关于」进开发者页、返回却落在首页，还得再点一次「关于」。
+     * null = 直接返回设置首页。
+     */
+    var settingsReturnGroup by mutableStateOf<String?>(null)
+
+    /**
+     * 设置页返回一层：返回 true = 已消费（有二级/三级页可退），false = 已在设置首页。
+     *
+     * `GlassApp` 的 BackHandler 调它决定「返回键归谁」。返回 false 时由宿主继续走
+     * 「设置 → 曲库」的既有链路。
+     */
+    fun backInSettings(): Boolean {
+        val group = settingsGroup ?: return false
+        // 三级页（支持开发者）→ 回它被打开时的那一组
+        settingsGroup = settingsReturnGroup
+        settingsReturnGroup = null
+        if (settingsGroup == group) settingsGroup = null // 防御：自指时回首页，不死循环
+        return true
+    }
+
+    /** 打开设置分组（首页卡片 / 入口行统一走这里） */
+    fun openSettingsGroup(group: String, returnGroup: String? = null) {
+        settingsGroup = group
+        settingsReturnGroup = returnGroup
     }
 
     private fun String.toScreenOrNull(): GlassScreen? =
@@ -641,6 +849,24 @@ class AppState(
 
     var glassLevel by mutableStateOf(GlassIntensity.Standard)
     var motionLevel by mutableStateOf(MotionIntensity.Standard)
+
+    /**
+     * 视觉风格（快照 v12）：液态玻璃 / 拟物。见 [VisualStyle] 的 KDoc。
+     *
+     * 与 [glassLevel] 的关系是**正交**的：玻璃强度调的是「液态玻璃有多浓」，
+     * 本字段决定「用的是不是液态玻璃」。拟物档下 glassLevel 仍被持久化并继续生效
+     * （用户切回玻璃档时不会丢掉原来的浓度偏好），只是拟物渲染不读它。
+     */
+    var visualStyle by mutableStateOf(VisualStyle.Glass)
+        private set
+
+    /** 切换视觉风格（持久化）。命名避开 `setVisualStyle` 与属性 setter 撞名（同 selectBackgroundMode） */
+    fun selectVisualStyle(style: VisualStyle) {
+        if (visualStyle == style) return
+        visualStyle = style
+        scheduleSave()
+    }
+
     /**
      * 音效设置（外部视图）：委托给 [fx] 持有者。
      *
@@ -1100,7 +1326,21 @@ class AppState(
             } else {
                 specs.indexOfFirst { it.id == currentSong.id }.coerceAtLeast(0)
             }
-            queueStateWriter?.invoke(specs, specIndex, snap.progressSec)
+            queueStateWriter?.invoke(
+                specs,
+                specIndex,
+                snap.progressSec,
+                // 播放模式 + 音效（P2 修复）：服务端在没有 Activity 的续播路径上
+                // 必须能自己重建这些，否则随机/循环/变速/EQ/音效链全回默认值。
+                // 与 specs 同一次写出 → 两者不会分叉（见 QueueStateStore 的 KDoc）。
+                QueueResumptionSettings(
+                    shuffleOn = shuffleOn,
+                    repeatMode = repeatMode.name,
+                    playbackSpeed = playbackSpeed,
+                    eqPreset = eqPreset.name,
+                    audioFx = audioFx,
+                ),
+            )
             lastQueueStateQueue = queue
             lastQueueStateIndex = snap.queueIndex
             lastQueueStateAtMs = clock()
@@ -1139,7 +1379,12 @@ class AppState(
     /** 服务端可读的播放现场写出器（实现在 app 模块：写 files/queue_state.json）。
      *  与快照同一触发点，避免两套存盘时机不一致。
      *  注意：实现方必须自行切到 IO 线程——本函数在 UI tick 里被调（每 5s）。 */
-    var queueStateWriter: ((specs: List<SongSpec>, index: Int, positionSec: Float) -> Unit)? = null
+    var queueStateWriter: ((
+        specs: List<SongSpec>,
+        index: Int,
+        positionSec: Float,
+        settings: QueueResumptionSettings,
+    ) -> Unit)? = null
 
     // ── 备份换机 re-match（P0-5 B）────────────────────────
     //
@@ -1439,6 +1684,7 @@ class AppState(
                 trackRefs = trackRefsSnapshot(),
                 backgroundMode = backgroundMode.name,
                 backgroundPhotoUri = backgroundPhotoUri,
+                visualStyle = visualStyle.name,
             )
         } else {
             AppStateSnapshot(
@@ -1475,6 +1721,7 @@ class AppState(
                 trackRefs = trackRefsSnapshot(),
                 backgroundMode = backgroundMode.name,
                 backgroundPhotoUri = backgroundPhotoUri,
+                visualStyle = visualStyle.name,
             )
         }
     }
@@ -1498,6 +1745,10 @@ class AppState(
         backgroundMode = runCatching { BackgroundMode.valueOf(snapshot.backgroundMode) }
             .getOrDefault(BackgroundMode.Aurora)
         backgroundPhotoUri = snapshot.backgroundPhotoUri
+        // 视觉风格（v12）：旧版本（≤v11）无此字段 → 默认液态玻璃，老用户升级观感逐像素不变。
+        // 枚举名容错：坏数据回落玻璃而不是让整份快照解码失败（风格是装饰，不是用户数据）。
+        visualStyle = runCatching { VisualStyle.valueOf(snapshot.visualStyle) }
+            .getOrDefault(VisualStyle.Glass)
         songSort = runCatching { SongSort.valueOf(snapshot.songSort) }.getOrDefault(SongSort.Title)
         shuffleOn = snapshot.shuffleOn
         repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeatMode) }.getOrDefault(RepeatMode.Off)
@@ -2621,11 +2872,75 @@ class AppState(
         scheduleSave()
     }
 
-    /** 集合播放（详情页 / 卡片菜单统一入口）：随机 = 从随机一首开始；无曲目忽略 */
-    fun playCollection(tracks: List<DemoSong>, source: String?, shuffle: Boolean) {
+    /** 删除单条搜索历史（P2：历史过去只能被动积累到 8 条顶掉，无法主动清理） */
+    fun removeSearchHistory(query: String) {
+        if (searchHistory.remove(query)) scheduleSave()
+    }
+
+    /**
+     * 清空全部搜索历史（P2 修复）。
+     *
+     * 为什么值得单独开一个动作：搜索历史是**唯一**会自己增长的用户数据，
+     * 而它承载的往往是「不想被别人看到搜过什么」的隐私语义（在手机上搜歌名
+     * 经常等于暴露心事/意图）。没有清空入口时，用户只能连搜 8 个无意义词把它顶掉
+     * ——一个功能缺口被用户用「污染自己的数据」绕过，是明确的产品欠账。
+     */
+    fun clearSearchHistory() {
+        if (searchHistory.isEmpty()) return
+        searchHistory.clear()
+        scheduleSave()
+    }
+
+    /**
+     * 集合播放（详情页 / 卡片菜单 / 搜索结果统一入口）：随机 = 从随机一首开始；无曲目忽略。
+     *
+     * ## 本轮修复两处语义缺口
+     *
+     * ### ① 来源目标（sourceTarget）以前取不到
+     *
+     * 单曲行播放会传 `sourceTarget`（`PlaylistDetailScreen` 的 SongRow onClick），
+     * 所以从歌单里点某一首进播放页后，顶栏「来自『通勤』」**可点**回详情。
+     * 但「播放全部 / 随机播放」走的是本函数，而本函数过去只有 `source: String?`——
+     * 于是从同一个入口进来，那行字变成**不可点**。同一入口两种行为，用户无法预期。
+     *
+     * 现在本函数接受并透传 [sourceTarget]，两条入口一致。
+     *
+     * ### ② 随机播放入口不统一 repeatMode
+     *
+     * 四态播放模式按钮里「随机播放」的定义是 `shuffleOn = true` **且** `repeatMode = All`
+     * （见 [cyclePlayMode] 的 KDoc：随机 + Off 的真实行为是「打散后播到尽头静默停下」，
+     * 而用户点随机的意图几乎总是「一直随机放下去」）。
+     *
+     * 旧实现 `shuffleOn = shuffle` 只改随机开关，直接从「顺序播放」点「随机播放全部」
+     * 会得到 shuffle=true + repeat=Off 的组合 —— 显示侧把它归一成「随机播放」，
+     * 但播到队尾就停，与按钮宣称的语义不符。这里按 [cyclePlayMode] 的同一张表收敛。
+     *
+     * 反向（非法到合法方向）同样处理：`shuffle = false` 时**不动** repeatMode。
+     * 「播放全部」在列表循环下应当继续循环（用户已有的循环偏好不该被一次播放抹掉）。
+     *
+     * @param sourceTarget 这次播放的来源详情页目标（null = 没有可回去的详情页）
+     */
+    fun playCollection(
+        tracks: List<DemoSong>,
+        source: String?,
+        shuffle: Boolean,
+        sourceTarget: DetailTarget? = null,
+    ) {
         if (tracks.isEmpty()) return
         shuffleOn = shuffle
-        playSong(if (shuffle) tracks.random() else tracks.first(), tracks, source)
+        // 随机 = 列表循环的随机版（与 cyclePlayMode 的四态表同源）。见上方 KDoc ②
+        if (shuffle && repeatMode != RepeatMode.All) {
+            repeatMode = RepeatMode.All
+            engine?.setRepeatMode(repeatAll = true, repeatOne = false)
+        }
+        engine?.setShuffleMode(shuffle)
+        playSong(
+            song = if (shuffle) tracks.random() else tracks.first(),
+            context = tracks,
+            source = source,
+            sourceTarget = sourceTarget,
+        )
+        scheduleSave()
     }
 
     // ── 歌单编辑（移除 / 重排 / 重命名）──
@@ -2892,6 +3207,35 @@ class AppState(
 
     /** 艺术家 → 专辑数（曲库艺术家 tab 与艺术家详情页 meta 共用同一份缓存） */
     fun albumCountByArtist(): Map<String, Int> = groups().albumCountByArtist
+
+    /**
+     * 搜索范围的**艺术家分组**（P2 修复：搜索框承诺了「艺术家」但没有对应结果区）。
+     *
+     * ## 为什么必须在状态层提供，而不是让搜索页自己从 songs 里 groupBy
+     * 1. 艺术家分组口径（含排序 Collator）只在 [groups] 一处权威；搜索页自算一份
+     *    就会出现「同一位艺术家在艺术家 tab 和搜索结果里排序不同」这类漂移。
+     * 2. 结果页每击键都要算一次，必须先过滤**分组缓存**（与 [searchAlbumGroups]
+     *    完全同一手法），而不是对整库重新 groupBy。
+     *
+     * 匹配口径与 [searchAlbumGroups] 对齐：艺术家名本身命中；**任一所属曲目的标题**
+     * 命中时该艺术家也出现（用户搜到某首歌时，顺着「这些是谁唱的」进入艺术家详情
+     * 是常见意图）。只按艺术家名匹配会让「搜索框说支持艺术家」形同虚设——
+     * 用户搜歌手名得到的仍是散落的歌曲行。
+     */
+    fun searchArtistGroups(query: String): List<LibraryGroup> {
+        val q = query.trim()
+        if (q.isEmpty()) return emptyList()
+        return artistGroups().filter { g ->
+            g.key.contains(q, true) || g.songs.any { it.title.contains(q, true) }
+        }
+    }
+
+    /** 艺术家分组 id 的编码点（DetailTarget(Kind.Artist, ...) 用）：与 [groups] 的分组键同源 */
+    fun artistIdOf(artist: String): String = artist
+
+    /** 由一首歌反查它所属艺术家的详情目标（长按歌曲 → 查看艺术家） */
+    fun artistTargetOf(song: DemoSong): DetailTarget =
+        DetailTarget(DetailTarget.Kind.Artist, artistIdOf(song.artist))
 
     fun albumGroups(): List<LibraryGroup> = groups().album
 

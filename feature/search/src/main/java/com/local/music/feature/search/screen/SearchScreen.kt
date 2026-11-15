@@ -3,6 +3,7 @@ package com.local.music.feature.search.screen
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
@@ -12,12 +13,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -28,9 +34,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
@@ -48,9 +57,11 @@ import com.local.music.core.ui.components.SongActionsSheet
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.components.SongRow
 import com.local.music.core.ui.components.pressScale
+import com.local.music.core.ui.components.rowPressFeedback
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.LibraryGroup
+import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
@@ -77,6 +88,9 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
     // 另两个派生函数都自带 query 空判，空串直接返回空表，不会退化成整库拷贝。
     val results = remember(state.library, query, state.scanFilterShort) { state.searchSongs(query) }
     val albums = remember(state.library, query, state.scanFilterShort) { state.searchAlbumGroups(query) }
+    // 艺术家分组（P2）：「搜索歌曲、专辑、艺术家」这个承诺的第三项。与 albums 同款缓存键
+    // （曲库引用 + 查询词 + 过滤开关）——改词/重扫/拨过滤才重算，切歌高亮不重跑。
+    val artists = remember(state.library, query, state.scanFilterShort) { state.searchArtistGroups(query) }
     // P3-40：LazyColumn 的 key 必须唯一，数据异常出现重复 id 会直接崩溃——
     // 展示序列先按 id 去重（索引仍是连续的，不影响任何按位判定）；
     // 去重序列同时作为表头计数与播放队列的口径，避免「看到的条数」与「实际入队」错位
@@ -154,7 +168,50 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                             )
                         }
                     } else {
-                        item(key = "history-header") { SectionHeader("最近搜索") }
+                        // ── 历史标题行 + 清空入口（P2 修复）──
+                        //
+                        // 搜索历史是**唯一**会自己增长的用户数据，而它承载的往往是
+                        // 「不想被别人看到搜过什么」的隐私语义（在手机上搜歌名经常等于
+                        // 暴露心事/意图）。旧实现没有任何清理入口：用户只能连搜 8 个
+                        // 无意义词把它顶掉——一个功能缺口被用户用「污染自己的数据」绕过。
+                        //
+                        // 清空放在标题行右侧而不是每条 chip 上：单条删除需要长按或 × 号，
+                        // 8 个 chip 各挂一个 × 会让这一片变吵（芯片本来是最安静的元素）。
+                        // 而本屏是**唯一的**历史消费场景，「一次清空」覆盖绝大多数意图。
+                        item(key = "history-header") {
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                // SectionHeader 自带左右边距与整行宽度，这里用 weight 让它占满剩余。
+                                // 注意 SectionHeader 内部是 fillMaxWidth 的，所以它必须 weight(1f)
+                                // 而不是裸调用——否则会把右侧的「清空」挤出屏幕。
+                                Box(Modifier.weight(1f)) { SectionHeader("最近搜索") }
+                                val clearInteraction = remember { MutableInteractionSource() }
+                                Text(
+                                    "清空",
+                                    color = LocalGlassColors.current.textTertiary,
+                                    style = GlassText.CaptionMedium,
+                                    modifier = Modifier
+                                        // 44dp 热区（全 App 统一下限）：纯文字「清空」只有约 24×16dp，
+                                        // 而它的后果是删数据——不能让它又小又好误触。
+                                        // sizeIn 保证热区，视觉文字位置不变（内容居中）。
+                                        .sizeIn(minWidth = 44.dp, minHeight = 44.dp)
+                                        .clickable(
+                                            interactionSource = clearInteraction,
+                                            indication = null,
+                                        ) { state.clearSearchHistory() }
+                                        // 读屏：可见文字只有「清空」，脱离上下文有歧义（清空什么？）。
+                                        // 用 contentDescription 补作用域，并补 role = Button
+                                        // （纯 Text + clickable 不会自动获得按钮角色）。
+                                        .semantics {
+                                            this.role = Role.Button
+                                            this.contentDescription = "清空搜索历史"
+                                        }
+                                        .padding(horizontal = S.Gap20.dp),
+                                )
+                            }
+                        }
                         // FlowRow 自动换行：长历史词不再挤出屏幕。
                         // P3-11：历史存 8 条，原先只 take(4) 展示——去掉截断，8 条 FlowRow 换行后并不长；
                         // 点击 chip 写回历史（addSearchHistory 会去重并移到最前）
@@ -171,7 +228,9 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                         }
                     }
                 } else {
-                    val empty = listedSongs.isEmpty() && albums.isEmpty()
+                    // 空态判据必须包含艺术家（P2）：漏了的话，只命中艺术家的查询
+                    // 会同时显示「没有找到相关内容」**和**下面的艺术家分组——自相矛盾。
+                    val empty = listedSongs.isEmpty() && albums.isEmpty() && artists.isEmpty()
                     if (empty) {
                         item(key = "search-empty") {
                             Text(
@@ -259,6 +318,40 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                             }
                         }
                     }
+                    // ── 艺术家分组（P2 修复）──
+                    //
+                    // 搜索框的 hint 写「搜索歌曲、专辑、艺术家」——承诺了三类结果，
+                    // 而旧实现只渲染歌曲与专辑。用户搜「周杰伦」得到的是一屏**散落的歌曲行**，
+                    // 没有任何入口进「周杰伦」这个艺术家本身（他在曲库里有整块艺术家页：
+                    // 专辑数、全部曲目、按专辑分组）。承诺与交付不一致，是明确的功能缺口。
+                    //
+                    // 顺序放在专辑之后：用户搜歌手名时最想看的通常是「这个人」，
+                    // 但歌名/专辑命中率更高、也更常是精确意图，所以「歌曲 → 专辑 → 艺术家」
+                    // 的降序符合「从具体到集合」的阅读习惯。不折叠（艺术家数量天然远小于歌曲，
+                    // 且每位一行，不像专辑卡那样占高度）。
+                    if (artists.isNotEmpty()) {
+                        item(key = "artists-header") { SectionHeader("艺术家 · ${artists.size} 位") }
+                        artists.forEach { group ->
+                            // key 用艺术家分组 id（= 艺术家名，与 DetailTarget 编码同源）：
+                            // 展示名与 id 在这里恰好相同，但仍走 id——将来若分组键加上
+                            // 「艺术家 + 专辑艺术家」之类的复合口径，这里不需要改。
+                            item(key = "artist-${group.id}") {
+                                ArtistResultRow(
+                                    name = group.key,
+                                    // 专辑数走状态层的分组缓存（与曲库艺术家 tab / 详情页
+                                    // meta 同源同口径），不在屏内自行 groupBy
+                                    albumCount = state.albumCountByArtist()[group.key] ?: 0,
+                                    songCount = group.songs.size,
+                                    onClick = {
+                                        state.addSearchHistory(query)
+                                        // 直接进艺术家详情。不先播放：用户点的是「这个人」这个
+                                        // 上下文，进详情才能看到他的全部专辑与曲目。
+                                        state.openDetail(state.artistTargetOf(group.songs.first()))
+                                    },
+                                )
+                            }
+                        }
+                    }
                 }
                 item(key = "search-bottom-inset") { Spacer(Modifier.height(S.Gap16.dp)) } // 原 18，归 16 刻度
             }
@@ -309,6 +402,78 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                 hasSongs = state.hasSongs,
             )
         }
+    }
+}
+
+/**
+ * 艺术家搜索结果的一行：圆形首字母徽标 + 艺术家名 + 「N 张专辑 · M 首」。
+ *
+ * ## 为什么不复用 LibraryScreen 的 GroupRow
+ * `GroupRow` 是 private 的，且它带 `ArtStyle` 渐变封面（那是给文件夹/流派这种
+ * 「有颜色分组」用的）。艺术家在曲库里**没有封面**——真实曲库里 `albumGroups` 的
+ * `ArtStyle` 是给专辑卡兜底用的设计稿遗留；给艺术家配一个假渐变封面会读成
+ * 「这个歌手有张图没加载出来」。所以这里用**首字母徽标**：它是中性的、
+ * 不假装有图，而且对中文名（取首字）与英文名（取首字母）都成立。
+ *
+ * ## 为什么无头像位而不是占位图
+ * 本地曲库没有任何艺术家图片数据源（MediaStore 不提供）。放一个灰色圆占位会让用户
+ * 长期等待一个永远不会来的图；首字母徽标本身就是**完整**的呈现，不是降级。
+ */
+@Composable
+private fun ArtistResultRow(
+    name: String,
+    albumCount: Int,
+    songCount: Int,
+    onClick: () -> Unit,
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val glass = LocalGlassColors.current
+    val accent = auroraAccentColor()
+    Row(
+        Modifier
+            .fillMaxWidth()
+            // 与 SongRow 同款外边距节奏：6dp 让按压底色落在圆角内，12dp 内边距 = PageMargin
+            .padding(horizontal = 6.dp)
+            .clip(RoundedCornerShape(R.Card14.dp))
+            .rowPressFeedback(interactionSource)
+            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+            // 读屏：clickable 不带 role，补 Button 让读屏念「周杰伦，3 张专辑 · 42 首，按钮」
+            .semantics { this.role = Role.Button }
+            .padding(horizontal = S.Gap12.dp, vertical = S.Gap8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(S.Gap12.dp),
+    ) {
+        // 首字母徽标：44dp（与 GlassIconButton 同档，保证触控与视觉重量一致）。
+        // 取 firstOrNull 而不是 first()：空串艺术家名不该崩（扫描可能给出空 artist）。
+        Box(
+            Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(accent.copy(alpha = 0.16f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                // 取首个「字」（对中文）或首字母（对英文）。trim 后取，避免空格开头拿到空白
+                name.trim().take(1).ifEmpty { "?" },
+                style = GlassText.RowStrong,
+                color = accent,
+            )
+        }
+        Column(Modifier.weight(1f)) {
+            Text(
+                name, style = GlassText.Row, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                color = glass.textPrimary,
+            )
+            Spacer(Modifier.height(2.dp))
+            // 两个计数都用真值：专辑数为 0 时只说「M 首」（单曲艺人没有专辑），
+            // 不要写「0 张专辑」——那读起来像个错误
+            Text(
+                if (albumCount > 0) "$albumCount 张专辑 · $songCount 首" else "$songCount 首",
+                style = GlassText.Caption, color = glass.textTertiary,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Icon(GlassIcons.ChevronRight, null, Modifier.size(16.dp), tint = glass.textTertiary)
     }
 }
 

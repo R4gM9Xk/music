@@ -1,6 +1,7 @@
 package com.local.music.feature.settings.screen
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
@@ -26,12 +28,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.semantics.Role
@@ -39,6 +41,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -73,6 +76,7 @@ import com.local.music.core.ui.state.ThemeMode
 import com.local.music.core.ui.state.UpdateUiState
 import com.local.music.core.ui.state.VirtualizerLevelLabels
 import com.local.music.core.ui.state.VirtualizerStrengths
+import com.local.music.core.ui.state.VisualStyle
 import com.local.music.core.ui.state.bassBoostSubtitle
 import com.local.music.core.ui.state.loudnessNormSubtitle
 import com.local.music.core.ui.state.sleepTimerLabel
@@ -86,6 +90,7 @@ import com.local.music.core.ui.theme.MotionIntensity
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.S
+import com.local.music.core.ui.theme.auroraAccentColor
 import kotlinx.coroutines.delay
 
 /**
@@ -122,8 +127,32 @@ import kotlinx.coroutines.delay
  * ## 为什么不用二级路由（GlassScreen.Settings / Settings.Appearance 之类）
  * 那要给 `AppState.screen` 加枚举、给 GlassApp 的 AnimatedContent 加分支、
  * 并处理「从播放页/详情页返回时该回到哪一层」的语义——影响面远超本功能收益。
- * 分组页是**设置模块内部**的导航，用 `rememberSaveable` 存在屏内即可：
- * 它只活在「用户正在看设置」这段时间里，退出设置页再进来回到首页是合理行为。
+ * 分组页是**设置模块内部**的导航，因此不需要独立的 GlassScreen。
+ *
+ * ## 但也不能存在屏内（本轮改写：原实现是 `var openGroup by rememberSaveable`）
+ *
+ * 上一轮的结论是「屏内 rememberSaveable 即可，退出设置页再进来回到首页是合理行为」。
+ * 这句话只对了一半——**系统返回键不归本屏管**。决定返回键去向的 BackHandler 在
+ * `GlassApp`（:app 模块），它看不到 feature:settings 内部的局部状态，于是
+ * 「设置 → 外观 → 系统返回」一路落到全局兜底分支，把 screen 打回 Library：
+ * 用户被弹出设置页，跳过了设置首页这一层（旋转/分屏保得住，返回键保不住，
+ * 这种「只坏一条路」的缺陷读代码极难发现，只有按返回键时才暴露）。
+ *
+ * 修法是把这一层导航态提到唯一的跨屏单源 `AppState.settingsGroup`——瞬态导航态，
+ * 与 `libraryTab` 同一口径，**不进 DataStore 快照**（下次冷启动应当从首页开始）。
+ * BackHandler 因此可以问一句「设置页还有下级可退吗」（[AppState.backInSettings]）。
+ * 本屏从此只**读写** state，不再自己持有这一层。
+ *
+ * ### 代价（如实记录，不要当成回归）
+ * 这一层现在活在进程级：切到别的 tab 再回设置页会停在上次的分组页，而不是回到首页。
+ * 这与底部导航各 tab 各自保留位置是同一种预期（曲库的 tab/滚动位置本轮做了同样的提升），
+ * 用户不会觉得停在原地更怪。真正丢掉的只有「每次进设置都是首页」这一条旧行为。
+ *
+ * ## 三级页（首页 → 关于 → 支持开发者）
+ * 「支持开发者」是**三级页**：从「关于」里的入口进去，返回要回到「关于」而不是首页。
+ * 所以进入时记 `state.settingsReturnGroup = 关于`（经 `openSettingsGroup(..., returnGroup)`），
+ * 返回统一走 `state.backInSettings()`——它先退到 returnGroup，没有时才退首页。
+ * 二级页与三级页共用同一个 [SettingsSubPageHeader]，组名只定义一次（见文件末尾的分组名常量）。
  */
 @Composable
 fun SettingsScreen(
@@ -210,27 +239,50 @@ fun SettingsScreen(
     backgroundPhotoSelected: Boolean = false,
     // 悬浮窗权限未授予时的引导跳转（去系统「显示在其他应用上层」页）
     onDesktopLyricsPermission: () -> Unit = {},
+    /**
+     * 「到发布页手动下载安装」的唯一出口（P2 修复：验签失败死行）。
+     *
+     * ## 为什么需要这个形参
+     * `UpdateUiState.FailStage.Verify` 意味着「下载到的 APK 与本机已装应用的签名不一致」，
+     * 应用内更新这条路**必然**失败（同一份坏字节再下一次还是失败），所以不能给「重试」。
+     * 正确的出口是去发布页手动下载安装（需先卸载旧版）。但「打开浏览器」是
+     * framework 细节（Intent / Uri），`feature:settings` 不该知道——与
+     * [onExportCrashLogs] / [onPickBackgroundPhoto] 同一套解耦模式。
+     *
+     * ## 为什么是可空的
+     * 这个回调由 :app 的 GlassApp 接线。可空 + `null` 默认值的语义是
+     * **「宿主没接线 ⇒ 我不假装有出口」**：此时那一行传 `SettingRow(onClick = null)`，
+     * 变成纯说明行（无按压反馈、不挂 role = Button、读屏不念「双击激活」）。
+     *
+     * 这条区分是本轮的要害：改造前该行在 Verify 态**有按压反馈、有按钮语义，
+     * 点了却什么都不做**（when 的 Verify 分支是空实现）——一个承诺了出口却没有出口
+     * 的死行，比没有这一行更伤。宁可让它读起来是一段**说明**，也不要让它读起来
+     * 像一个**坏掉的按钮**。这与 [desktopLyricsOnChangeAvailable] 的取舍同源
+     * （「未接线即不渲染假行」），只是这里文案本身有价值，所以退一档成「不可点的说明行」。
+     */
+    onOpenReleasePage: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     var scanning by remember { mutableStateOf(false) }
     // 模态面板宿主（GlassApp 根层）
     val modal = LocalModalState.current
 
-    // ── 三级分类：当前所在分组（null = 首页导航）──
+    // ── 分组层级：读写 AppState.settingsGroup（null = 首页导航）──
     //
-    // 用 rememberSaveable 而不是 remember：本屏是 LazyColumn/Column 的直接子级，
-    // 旋转/分屏/改字号会重建组合，分组页应该保持不变（用户正在看「播放」组，
-    // 不该被弹回首页）。存 String（组名）而不是枚举序号：枚举顺序一变，
-    // 已存的序号就指向错误的组。
-    var openGroup by rememberSaveable { mutableStateOf<String?>(null) }
+    // **本屏不再持有这一层状态**（本轮改写，原实现是 `var openGroup by rememberSaveable`）。
+    // 原因见文件头 KDoc「但也不能存在屏内」：决定系统返回键去向的 BackHandler 在
+    // :app 模块，看不到 feature:settings 的局部状态，于是「设置 → 外观 → 返回」
+    // 会被打回曲库、跳过设置首页。提升到 AppState 后，返回键与页头返回箭头
+    // 走**同一条**通路（state.backInSettings()），两条入口不可能再分叉。
+    //
+    // 读法注意：`state.settingsGroup` 是普通 `var`（mutableStateOf 委托），**不是**本函数
+    // 的 `by` 委托属性。因此下面统一用本地 `openGroup` 做**只读**镜像
+    // （少改几十处读点、也让 condition 读起来和改造前一致），
+    // 而所有**写**处必须调 `state.openSettingsGroup(...)` / `state.backInSettings()`
+    // ——写成 `openGroup = "x"` 只改这个局部 val 的副本，编译器会直接报错（val 不可赋值），
+    // 这是刻意让「忘了提升写点」变成编译错误而不是静默失效。
+    val openGroup: String? = state.settingsGroup
 
-    // 二级页的返回拦截：用户点了分组后，按返回键应回首页而不是退出设置页。
-    // **只在子页启用**（openGroup != null）：首页时不拦截，让 GlassApp 的
-    // 全局 BackHandler 把「设置 → 曲库」这条既有链路照旧跑通。
-    // 用 androidx BackHandler 需要 activity-compose 依赖，而 feature:settings 目前没有。
-    // 替代方案：在页头给返回箭头（见下方 SettingsSubPageHeader），并依靠 GlassApp 的
-    // 全局 BackHandler——它会把 screen 打回曲库，用户再点底部导航「设置」回到首页，
-    // 体验上等价于「返回两级」。这是本模块不加依赖的取舍（见 SettingsScreen 的 KDoc）。
     // 更新面板的可见语义组已下沉为 UpdateUiState.keepsSheetOpen（见该属性的 KDoc）：
     // 「哪些状态算正在进行中」属于领域知识，与 Status 定义放在一起才不会漏改。
 
@@ -324,22 +376,44 @@ fun SettingsScreen(
                         // 摘要要写真话，不能在模块内凭空猜
                         desktopLyricsEnabled = desktopLyricsEnabled,
                     ),
-                    onOpen = { openGroup = it },
+                    // 首页卡片 → 二级页。必须走 state.openSettingsGroup（不能写局部变量），
+                    // 且**显式传 returnGroup = null**：从首页进来的一律回首页，
+                    // 不能继承上一次三级页留下的返回目标（否则「关于 → 支持开发者 → 返回 →
+                    // 外观 → 返回」会落回关于，用户会以为返回键坏了）。
+                    onOpen = { state.openSettingsGroup(it, returnGroup = null) },
                 )
             } else {
-                // 二级页头：返回箭头 + 组名。返回箭头是唯一的出口（见 KDoc 关于不加
-                // BackHandler 依赖的说明），所以它必须显眼：用 GlassIconButton 而非纯文本。
+                // 二级页头：返回箭头 + 组名。返回箭头是页内**主**出口，所以它必须显眼：
+                // 用 GlassIconButton 而非纯文本（读屏与触摸都有明确边界）。
                 //
-                // 取成局部 val：openGroup 是 `by rememberSaveable` 委托属性，
-                // 编译器无法对它做 smart cast（null 分支已排除也不认）。
-                // 局部 val 是可空 String?，settingsGroupTitle 接受 String，
-                // 这里用 orEmpty 兜住——该分支下它必然非空（else 是 `!= null`），
-                // 但用 orEmpty 比 `!!` 更安全：真出现意外时空标题不会崩溃。
+                // onBack 直接调 `state.backInSettings()`，与 GlassApp 的系统返回键
+                // **同一条通路**。这不是省事：两条返回路径各写一份实现时必然出现
+                // 「箭头能回、返回键不能回」（上一轮就是这么坏的）。同理**不要**在这里
+                // 写 `state.settingsGroup = null`——那会跳过 settingsReturnGroup，
+                // 把三级页（支持开发者）的返回直接扔回设置首页，用户在关于页和
+                // 开发者页之间往返时会被踢出两层。
                 val title = settingsGroupTitle(openGroup.orEmpty())
                 SettingsSubPageHeader(
                     title = title,
-                    onBack = { openGroup = null },
+                    onBack = { state.backInSettings() },
                 )
+            }
+
+            // ── 三级页：支持开发者（从「关于」的入口进来，返回回「关于」）──
+            //
+            // 判据用组名而不是另外加一个布尔：`settingsGroup` 已经是「当前在设置的第几层」
+            // 的唯一真相，再加一个屏内标志就是第二个真相，返回时两者迟早不同步。
+            // 注意「支持开发者」**不在** settingsGroups(...) 的 5 张导航卡里——
+            // 它是三级页，首页不该列出它（首页只列 5 个分组，见该函数的 KDoc）。
+            //
+            // **这里不画页头**：上面那个 `if (openGroup == null) ... else ...` 已经给
+            // 所有非首页分组统一画了「返回 + 组名」头（组名就是「支持开发者」）。
+            // 第一版在这里又画了一次 SettingsSubPageHeader —— 一屏两行同样的标题，
+            // 正是文件头 KDoc 记过的那类「必须二选一」错误。三级页与二级页的页头
+            // 视觉上本来就应当完全一致，区别只在**返回落点**（由 settingsReturnGroup 承载，
+            // 见 `AppState.backInSettings` 的 KDoc），不在页头样式。
+            if (openGroup == SupportDeveloperGroup) {
+                SettingsSupportPage()
             }
 
             if (openGroup == "外观") {
@@ -349,8 +423,15 @@ fun SettingsScreen(
                 SettingRow(
                     // A5 图标语义：取色这件事的**来源是封面**——唱片（Disc）一眼指向「封面」，
                     // 而 Wave 已被整组音效占用，取色再用它等于两件不同的事共用一个符号
-                    GlassIcons.Disc, "跟随封面取色",                    // P2-6：副标题必须与三态真相一致——自定义色存在时封面取色被短路，开关说了不算
-                    if (state.customSeedArgb != null) "已被自定义主题色覆盖（点上方主题色可恢复）" else "极光背景取自当前专辑封面",
+                    GlassIcons.Disc, "跟随封面取色",
+                    // P2-6：副标题必须与三态真相一致——自定义色存在时封面取色被短路，开关说了不算
+                    //
+                    // P2 文案修复（本轮）：旧文案写「点上方主题色可恢复」，但「主题色」这一行
+                    // 在**本行下方**（顺序：跟随封面取色 → 背景来源 → 主题色 → 玻璃强度）。
+                    // 用户按「上方」抬头找不到出口，而这一行又正处在「开关拨了没反应」的
+                    // 最容易上火的状态（被短路的是它自己）。方位词写错不是错别字级别的问题：
+                    // 它是这一行唯一的可行动指引。写「下方」后与界面事实一致。
+                    if (state.customSeedArgb != null) "已被自定义主题色覆盖（点下方主题色可恢复）" else "极光背景取自当前专辑封面",
                     onClick = { state.applyFollowCover(!state.followCover) },
                     trailing = { GlassToggle(state.followCover, onToggle = state::applyFollowCover) },
                 )
@@ -477,15 +558,93 @@ fun SettingsScreen(
                     },
                 )
                 RowDivider()
+                // ── 视觉风格（v12，本轮新增）：全 App 的**材质语言**二选一 ──
+                //
+                // ## 为什么放在「玻璃强度」**之前**
+                // 这两行是「先选语言，再调浓度」的关系：视觉风格决定用的是不是液态玻璃，
+                // 玻璃强度只调液态玻璃本身的浓淡。放反了会读成「浓度档下面还有一个浓度档」，
+                // 而实际上切到拟物档后下面那行只剩「你切回玻璃时会用到」的预备作用。
+                //
+                // ## 为什么图标用 Tag（以及为什么**不能**用 Sun）
+                //
+                // 图标集里没有一枚「材质 / 表面」语义的符号（本任务不能改 core/ui 去新画一枚），
+                // 所以只能在既有集里找语义最不误导的那枚：Tag = **分类标签**，
+                // 「选哪一种视觉语言」正是一次分类选择，不夸大也不误导。
+                //
+                // **Sun 是看着最像、但必须排除的那一枚**：本工程里 Sun/Moon 是成对的
+                // 「切换深浅色」符号（曲库页头用 Sun 切主题），而「深色模式」那一行就在
+                // 本组下方第 4 行、用的正是 Moon。把 Sun 放在这里会让两枚相邻的
+                // 太阳/月亮读成同一对亮度控制，用户会以为「视觉风格」也是调明暗的
+                // ——这正是本轮 A5 在清算的那类跨语义复用（Gear 被当太阳用的翻版）。
+                // 「拟物 vs 玻璃确实是光的行为」这个联想不足以抵消这个误读。
+                SettingRow(
+                    GlassIcons.Tag, "视觉风格",
+                    when (state.visualStyle) {
+                        VisualStyle.Glass -> "液态玻璃 · 半透明模糊，背景会透过来"
+                        VisualStyle.Skeuomorph -> "拟物 · 不透明贴面 + 斜面 + 投影，背景不透"
+                    },
+                    // 整行点击 = 在两个语言之间直接对切（与下方的下拉双通道，同既有各行口径）。
+                    // 二选一时这是最省事的路径：不必展开下拉再点一次。
+                    onClick = {
+                        state.selectVisualStyle(
+                            if (state.visualStyle == VisualStyle.Glass) {
+                                VisualStyle.Skeuomorph
+                            } else {
+                                VisualStyle.Glass
+                            },
+                        )
+                    },
+                    trailing = {
+                        SettingDropdown(
+                            value = state.visualStyle.label,
+                            label = "视觉风格",
+                            selected = state.visualStyle,
+                            options = VisualStyle.entries.map { style ->
+                                DropdownOption(
+                                    label = style.label,
+                                    // 副标题必须说清「这不是同一套东西的另一档」：
+                                    // 用户看到两个并列选项时的默认预期是「浓度/强弱差异」，
+                                    // 而这里是两套互不兼容的材质语法（见 AppState.VisualStyle 的 KDoc）。
+                                    subtitle = when (style) {
+                                        VisualStyle.Glass -> "半透明 + 背景模糊，界面浮在内容之上"
+                                        VisualStyle.Skeuomorph -> "不透明贴面 + 斜面高光 + 投影，像真实的物理面板"
+                                    },
+                                    payload = style,
+                                )
+                            },
+                            onSelect = { state.selectVisualStyle(it) },
+                        )
+                    },
+                )
+                RowDivider()
                 SettingRow(
                     // A5（本轮修正）：玻璃强度是**外观/材质**档位，用 Wave 表达「浓度曲线」——
                     // 三档玻璃差异本质是填充与描边的浓淡变化，与音效那条频响曲线同属
                     // 「程度」语义。原 Gear（且当时其实是太阳形）与下方「动效强度」完全同形，
                     // 相邻两行看起来是同一个功能，是这三行里最严重的一处混淆。
-                    GlassIcons.Wave, "玻璃强度", "填充与描边浓淡，影响全部玻璃表面",
+                    GlassIcons.Wave, "玻璃强度",
+                    // ## 副标题必须**按档位**分支（本轮修复「看起来像死控件」）
+                    //
+                    // 拟物档下 glassLevel 仍然被持久化、切回玻璃档立刻生效（见
+                    // AppState.visualStyle 的 KDoc），但拟物**渲染不读它**。若副标题
+                    // 仍然恒写「填充与描边浓淡，影响全部玻璃表面」，用户切到拟物档后
+                    // 拖这一行会发现屏幕毫无变化——他会判定「这个控件坏了」，
+                    // 而不是「这一档不用它」。**不生效 ≠ 失效**，这句差别只能靠文案说清。
+                    //
+                    // 也不用「更浓/更强」这类词（那些是同一套材质内部的程度差异），
+                    // 拟物是另一种材质语言，两者不构成程度关系。
+                    when (state.visualStyle) {
+                        VisualStyle.Glass -> "填充与描边浓淡，影响全部玻璃表面"
+                        VisualStyle.Skeuomorph ->
+                            "拟物档不读取此项 · 切回液态玻璃后立即生效（当前档位会被记住）"
+                    },
                     // 真机反馈改为**行内下拉**（系统设置「自动息屏」同款）：
                     // 三选一的档位不值得付一次模态转场 + 整屏遮挡的代价。
                     // 回调在选中瞬间生效，没有「确定」——单选没有可失败的提交。
+                    //
+                    // 拟物档下**不禁用**这个下拉：禁用会让用户以为「拟物下不能设玻璃浓度」，
+                    // 而事实是他可以提前设好、切回玻璃时正好是想要的那档。文案已经说明
+                    // 「不读取此项」，控制本身保持可操作是诚实的。
                     trailing = {
                         SettingDropdown(
                             value = state.glassLevel.label,
@@ -947,13 +1106,21 @@ fun SettingsScreen(
 
             }
 
-            if (openGroup == "关于") {
+            if (openGroup == AboutGroup) {
             SectionHeader("关于")
             SettingsCard {
                 // P3-59：版本号常驻（旧实现挂在检查更新行的 Idle 分支里，检查中/失败后版本号就消失）
                 SettingRow(GlassIcons.Book, "当前版本", "v$currentVersionName")
                 RowDivider()
                 val updateState = update()
+                // 验签失败态的两个局部判据（提到副标题**之前**：副标题、onClick、trailing
+                // 三处必须读同一对变量——若各判一次，某个中间态会出现「可点但没箭头」
+                // 或「有箭头但不可点」的撕裂，正是本轮要消灭的那类不一致）。
+                val verifying = updateState.status == UpdateUiState.Status.Failed &&
+                    updateState.failStage == UpdateUiState.FailStage.Verify
+                // 取成本地 val：可空函数类型在 `if` 分支里直接被 smart cast 时不稳（它是形参、
+                // 不是局部不可变量做法的一部分），显式取样让「有没有出口」这个判断只有一处。
+                val releaseAction = onOpenReleasePage
                 val updateSubtitle = when (updateState.status) {
                     UpdateUiState.Status.Idle -> "检查新版本"
                     UpdateUiState.Status.Checking -> "正在检查…"
@@ -969,8 +1136,15 @@ fun SettingsScreen(
                         // P2-25：按失败阶段给准确文案——过去一律「下载失败」，检查失败也不例外；
                         // 验签失败再给重试是死循环（同一份坏字节必然再失败），文案改引导发布页
                         when (updateState.failStage) {
+                            // 引导文案分两档，但**「到发布页手动下载安装」这句必须保留**：
+                            // 有出口时补一个「点击」把出路口语化；没出口时不给动词——
+                            // 副标题里出现「点击」而整行不可点，就是一句新的假承诺。
                             UpdateUiState.FailStage.Verify ->
-                                "安装包签名与本机不一致，无法应用内更新，请到发布页手动下载安装（需先卸载旧版）"
+                                if (releaseAction != null) {
+                                    "安装包签名与本机不一致，无法应用内更新，点击到发布页手动下载安装（需先卸载旧版）"
+                                } else {
+                                    "安装包签名与本机不一致，无法应用内更新，请到发布页手动下载安装（需先卸载旧版）"
+                                }
                             UpdateUiState.FailStage.Install -> "安装包已丢失，请重新下载"
                             UpdateUiState.FailStage.Download ->
                                 "下载失败（${updateState.message ?: "网络异常"}），点击重试"
@@ -980,92 +1154,170 @@ fun SettingsScreen(
                                 else "检查失败（${updateState.message ?: "网络异常"}），点击重试"
                         }
                 }
+                // ── 检查更新：onClick 必须与「这一行承诺了什么」严格一致 ──
+                //
+                // ## 验签失败态的修法（P2：可点但无动作的死行）
+                //
+                // 改造前：`onClick` 恒非 null，而 when 的 Verify 分支是**空实现**。
+                // 于是这一行有 role = Button、有按压缩放、读屏念「双击激活」，
+                // 点下去屏幕毫无变化——用户会重复点，然后把「应用内更新坏了」升级成
+                // 「这个 App 一堆东西点了没反应」。
+                //
+                // 本轮把「这一行到底是不是一个动作」交给**状态**决定：
+                // - 可退出的失败（Download / Install / 未细分 / 检查失败）：与以前一样可点重试。
+                // - Verify：不可重试（同一份坏字节必然再失败），唯一出路是去发布页手动安装。
+                //   宿主接线了 [onOpenReleasePage] → 点这里打开浏览器；
+                //   宿主没接线（回调为 null）→ **整行不可点**（onClick = null，
+                //   由 SettingRow 移除按压反馈与 role = Button，尾部箭头也必须去掉，
+                //   否则与「能进去」的视觉承诺矛盾）。
+                //
+                // 副标题在两种情况下都保留「到发布页手动下载安装」的引导文案：
+                // 即使这一行不可点，它仍然告诉用户出口在哪（这句话本身就是一次信息传递，
+                // 不依赖点击能力）。有出口时才加「点击」二字（见 updateSubtitle 的分支）。
                 SettingRow(
                     GlassIcons.Down, "检查更新", updateSubtitle,
-                    onClick = {
-                        when (update().status) {
-                            UpdateUiState.Status.Available, UpdateUiState.Status.Downloading,
-                            UpdateUiState.Status.ReadyToInstall,
-                            -> modal.show {
-                                val current = update()
-                                // 状态滑出面板语义组（下载失败转 Failed 等）自动收起：
-                                // 与旧「visible 条件出组即关」的时序等价（退场动画照常播放）
-                                LaunchedEffect(current.status) {
-                                    if (!current.keepsSheetOpen) modal.requestDismiss()
-                                }
-                                ModalSheet(
-                                    modal,
-                                    if (current.versionName != null) "更新到 v${current.versionName}" else "更新",
-                                ) {
-                                    // 取成局部 val：changelog 是**跨模块**的公开属性，
-                                    // 编译器不能对它做 smart cast（跨模块的属性可能是计算属性，
-                                    // 多读一次未必同值）。这是 UpdateUiState 迁到 :core:ui 后
-                                    // 才出现的编译错误——同一模块内是可以 smart cast 的。
-                                    val changelog = current.changelog
-                                    if (changelog != null) {
-                                        Text(
-                                            changelog,
-                                            color = LocalGlassColors.current.textSecondary,
-                                            style = GlassText.Body,
-                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = S.Gap8.dp),
-                                        )
-                                    }
-                                    Spacer(Modifier.height(6.dp))
-                                    if (current.status == UpdateUiState.Status.Downloading) {
-                                        // P3-58：进度由外部（下载协程）驱动、onSeek 是空实现 →
-                                        // **必须传 enabled = false**，否则用户拖动会立刻被真实进度弹回，
-                                        // 看起来像 bug。旧实现漏传，取了默认 true。
-                                        // P3-50：不定长（代理丢 Content-Length）时 progress 恒 0，
-                                        // 画一条空轨道会被读成「卡住不动」；此时整条隐藏，
-                                        // 只留下面那句「总大小未知，完成后自动打开安装程序」表达仍在进行。
-                                        if (!current.indeterminate) {
-                                            ProgressTrack(
-                                                progress = current.progress,
-                                                onSeek = {},
-                                                enabled = false,
-                                            )
+                    // 三元表达式的三档：验签失败且已接线 → 打开发布页；
+                    // 验签失败且未接线 → null（纯说明行，无按压反馈、无按钮语义）；
+                    // 其余 → 原有的重试/更新/安装分流。
+                    onClick = if (verifying) {
+                        releaseAction
+                    } else {
+                        {
+                            when (update().status) {
+                                    UpdateUiState.Status.Available, UpdateUiState.Status.Downloading,
+                                    UpdateUiState.Status.ReadyToInstall,
+                                    -> modal.show {
+                                        val current = update()
+                                        // 状态滑出面板语义组（下载失败转 Failed 等）自动收起：
+                                        // 与旧「visible 条件出组即关」的时序等价（退场动画照常播放）
+                                        LaunchedEffect(current.status) {
+                                            if (!current.keepsSheetOpen) modal.requestDismiss()
                                         }
-                                        Text(
-                                            if (current.indeterminate) {
-                                                "下载中，总大小未知，完成后自动打开安装程序"
-                                            } else {
-                                                "下载中 ${(current.progress * 100).toInt()}%，完成后自动打开安装程序"
-                                            },
-                                            color = LocalGlassColors.current.textTertiary,
-                                            style = GlassText.Micro,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = S.Gap8.dp),
-                                        )
-                                    } else {
-                                        SheetAction(
-                                            icon = GlassIcons.Down,
-                                            label = when (current.status) {
-                                                UpdateUiState.Status.ReadyToInstall -> "安装已下载的更新"
-                                                else -> "立即更新"
-                                            },
-                                            subtitle = when (current.status) {
-                                                UpdateUiState.Status.ReadyToInstall -> "无需重新下载"
-                                                else -> "下载完成后自动打开安装程序"
-                                            },
-                                            onClick = {
-                                                if (current.status == UpdateUiState.Status.ReadyToInstall) {
-                                                    onInstallUpdate()
-                                                } else {
-                                                    onStartUpdate()
+                                        ModalSheet(
+                                            modal,
+                                            if (current.versionName != null) "更新到 v${current.versionName}" else "更新",
+                                        ) {
+                                            // 取成局部 val：changelog 是**跨模块**的公开属性，
+                                            // 编译器不能对它做 smart cast（跨模块的属性可能是计算属性，
+                                            // 多读一次未必同值）。这是 UpdateUiState 迁到 :core:ui 后
+                                            // 才出现的编译错误——同一模块内是可以 smart cast 的。
+                                            val changelog = current.changelog
+                                            if (changelog != null) {
+                                                Text(
+                                                    changelog,
+                                                    color = LocalGlassColors.current.textSecondary,
+                                                    style = GlassText.Body,
+                                                    modifier = Modifier.fillMaxWidth()
+                                                        .padding(horizontal = 6.dp, vertical = S.Gap8.dp),
+                                                )
+                                            }
+                                            Spacer(Modifier.height(6.dp))
+                                            if (current.status == UpdateUiState.Status.Downloading) {
+                                                // P3-58：进度由外部（下载协程）驱动、onSeek 是空实现 →
+                                                // **必须传 enabled = false**，否则用户拖动会立刻被真实进度弹回，
+                                                // 看起来像 bug。旧实现漏传，取了默认 true。
+                                                // P3-50：不定长（代理丢 Content-Length）时 progress 恒 0，
+                                                // 画一条空轨道会被读成「卡住不动」；此时整条隐藏，
+                                                // 只留下面那句「总大小未知，完成后自动打开安装程序」表达仍在进行。
+                                                if (!current.indeterminate) {
+                                                    ProgressTrack(
+                                                        progress = current.progress,
+                                                        onSeek = {},
+                                                        enabled = false,
+                                                    )
                                                 }
-                                            },
-                                        )
+                                                Text(
+                                                    if (current.indeterminate) {
+                                                        "下载中，总大小未知，完成后自动打开安装程序"
+                                                    } else {
+                                                        "下载中 ${(current.progress * 100).toInt()}%，完成后自动打开安装程序"
+                                                    },
+                                                    color = LocalGlassColors.current.textTertiary,
+                                                    style = GlassText.Micro,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = S.Gap8.dp),
+                                                )
+                                            } else {
+                                                SheetAction(
+                                                    icon = GlassIcons.Down,
+                                                    label = when (current.status) {
+                                                        UpdateUiState.Status.ReadyToInstall -> "安装已下载的更新"
+                                                        else -> "立即更新"
+                                                    },
+                                                    subtitle = when (current.status) {
+                                                        UpdateUiState.Status.ReadyToInstall -> "无需重新下载"
+                                                        else -> "下载完成后自动打开安装程序"
+                                                    },
+                                                    onClick = {
+                                                        if (current.status == UpdateUiState.Status.ReadyToInstall) {
+                                                            onInstallUpdate()
+                                                        } else {
+                                                            onStartUpdate()
+                                                        }
+                                                    },
+                                                )
+                                            }
+                                        }
                                     }
+                                    // P2-25：Failed 的重试行为按阶段定——验签失败**不给重试**（重下同一份
+                                    // 坏字节必然再失败）；其余沿用旧分流
+                                    // （进过下载阶段的失败 versionName 已带上新版本：直接重新下载，不再重新检查）
+                                    //
+                                    // 注意这里**必须仍然判一次** Verify：虽然上面已经把 Verify 态
+                                    // 分流到 onClick = null / 发布页，但 update() 是**活读**的
+                                    // snapshot 态（getter 形参），点下的瞬间状态可能已经变了
+                                    // （例如此行在手势未结束时被重组）。不判就会在验证失败态里
+                                    // 落进「什么都没发生」——正是本轮要消灭的那个行为。
+                                    UpdateUiState.Status.Failed ->
+                                        if (update().failStage != UpdateUiState.FailStage.Verify) {
+                                            if (update().versionName != null) onStartUpdate() else onCheckUpdate()
+                                        }
+                                    else -> onCheckUpdate()
                                 }
                             }
-                            // P2-25：Failed 的重试行为按阶段定——验签失败**不给重试**（重下同一份
-                            // 坏字节必然再失败），交给上面的引导文案；其余沿用旧分流
-                            // （进过下载阶段的失败 versionName 已带上新版本：直接重新下载，不再重新检查）
-                            UpdateUiState.Status.Failed ->
-                                if (update().failStage != UpdateUiState.FailStage.Verify) {
-                                    if (update().versionName != null) onStartUpdate() else onCheckUpdate()
-                                }
-                            else -> onCheckUpdate()
-                        }
+                        },
+                        // 尾部箭头只在真能点上时画：它是「这里可以进去」的视觉承诺，
+                        // 与 role = Button 必须同步（理由见 SettingRow 的 KDoc）。
+                        trailing = if (verifying && releaseAction == null) {
+                            {}
+                        } else {
+                            {
+                                Icon(
+                                    GlassIcons.ChevronRight, null, Modifier.size(16.dp),
+                                    tint = LocalGlassColors.current.textTertiary,
+                                )
+                            }
+                        },
+                    )
+                // ── 支持开发者（本轮新增，三级页入口）──
+                //
+                // 用户的原始需求是「在设置页新增支持开发者页面的入口（把页面先做，先不放内容）」。
+                // 所以这一行**必须真的能进去**——一个点了没反应、或点了只弹个占位 toast 的
+                // 入口，比没有入口更糟（用户会以为 App 坏了）。进去之后那个页面本身可以空，
+                // 但「能进、能回」这两件事必须是完整真实的。
+                //
+                // ## 为什么放在「关于」分组的**最末**
+                // 「支持开发者」不是设置项，它是这个 App 的**作者信息**的一部分，与
+                // 版本 / 更新 / 崩溃日志同组；但它又不是任何人日常要改的配置，
+                // 所以压在组尾，不打断「检查更新」这类真正会被反复用的行。
+                // 放组首会让每次进「关于」都先看到它，是典型的「开发者视角排序」。
+                //
+                // ## 为什么图标用 Heart
+                // Heart 在图标集里的既有语义是「表达喜欢」（ActionsSheet 的收藏动作），
+                // 而「支持开发者」的本质正是「如果你喜欢这个 App、愿意让它继续」——
+                // 同一枚符号在这里指向同一件事（表达喜欢），不是跨语义复用。
+                // 备选里 Book 已被版本 / 崩溃日志 / 恢复内置歌单这一族占满，
+                // Gear 是全 App 的「系统设置」符号，都不适合。
+                //
+                // ## 为什么 returnGroup 传「关于」
+                // 这是三级页：首页 → 关于 → 支持开发者。返回必须回到「关于」而不是设置首页，
+                // 否则用户从关于页进去看一眼、返回就落到首页，还得再点一次「关于」。
+                // 该返回目标由 `state.settingsReturnGroup` 承载（见 AppState 的 KDoc），
+                // 本屏**不自己记**——屏内再记一份就是第二个真相。
+                RowDivider()
+                SettingRow(
+                    GlassIcons.Heart, "支持开发者", "了解与支持这个小项目",
+                    onClick = {
+                        state.openSettingsGroup(SupportDeveloperGroup, returnGroup = AboutGroup)
                     },
                 )
             }
@@ -1079,6 +1331,28 @@ fun SettingsScreen(
 }
 
 // ── 三级分类：分组导航（本轮新增）────────────────────────────────
+
+/**
+ * 分组名的**唯一来源**（本轮抽出）。
+ *
+ * 这些字符串同时出现在三处：首页导航卡的 title、二级页页头的标题、以及
+ * `openGroup == "…"` 的分支判据。以前它们是散落的字面量——把「外观」写错成
+ * 「外覌」不会编译报错，只会让那一段**整块不渲染**，而且只有手动点进去才看得见。
+ *
+ * 只抽出**被多处引用**的那几个（关于 / 支持开发者）：其余组名目前仍只在
+ * settingsGroups 与分支里各出现一次，抽出来只会增加间接层。
+ * 将来若某个组名要在第四处出现，先在这里登记，不要复制字面量。
+ */
+private const val AboutGroup = "关于"
+
+/**
+ * 三级页「支持开发者」的组名。
+ *
+ * 它**不是**首页导航卡（`settingsGroups(...)` 只返回 5 个分组），而是从「关于」
+ * 里的入口行进入的第三级页面。因此它不会出现在首页列表里，但会出现在
+ * `state.settingsGroup` 中——这正是三级页的判据（见 SettingsScreen 主体里的分支）。
+ */
+private const val SupportDeveloperGroup = "支持开发者"
 
 /**
  * 一个设置分组在首页导航卡上的展示信息。
@@ -1101,6 +1375,9 @@ private data class SettingsGroup(
  * 为什么在最外层构造而不是让 SettingsGroupNav 自己读 state：导航卡只需要
  * `title/subtitle/icon` 三元组，把「摘要怎么算」留在 SettingsScreen 里，
  * 组件本身就可以是纯展示、无依赖（便于将来单独预览）。
+ *
+ * **只返回 5 个分组**：三级页（支持开发者）不在这里——首页列出它等于让用户
+ * 跳过「关于」这一层，而它本来就是关于页里的一个入口。这一条不要顺手「补全」。
  */
 @Composable
 private fun settingsGroups(
@@ -1109,7 +1386,12 @@ private fun settingsGroups(
     backgroundPhotoSelected: Boolean,
     desktopLyricsEnabled: Boolean,
 ): List<SettingsGroup> {
-    // 外观摘要：主题色三态（自定义 > 跟随封面 > 品牌）+ 深浅 + 强度档
+    // 外观摘要：材质语言 + 主题色三态（自定义 > 跟随封面 > 品牌）+ 深浅 + 强度档。
+    //
+    // 材质语言（液态玻璃 / 拟物）放在**最前**：它是这一组里最顶层的一个选择
+    // （决定用的哪套语法），也是本轮唯一新增的可见配置。摘要里不带它的话，
+    // 用户切到拟物档后首页那张卡的摘要仍然只在说主题色，看不出「我已经换过材质」。
+    val styleSummary = state.visualStyle.label
     val themeSummary = when {
         state.customSeedArgb != null -> "自定义主题色"
         state.followCover -> "跟随封面取色"
@@ -1140,7 +1422,7 @@ private fun settingsGroups(
     return listOf(
         SettingsGroup(
             "外观",
-            "$themeSummary · $darkSummary · $bgSummary",
+            "$styleSummary · $themeSummary · $darkSummary · $bgSummary",
             GlassIcons.Edit,
         ),
         SettingsGroup(
@@ -1159,8 +1441,11 @@ private fun settingsGroups(
             GlassIcons.Down,
         ),
         SettingsGroup(
-            "关于",
-            "版本 / 更新 / 崩溃日志",
+            // 摘要里补上「支持开发者」的存在感：它是关于组里新增的一行，
+            // 而摘要的作用正是「不进去也能确认这一组里有什么」（见本函数 KDoc）。
+            // 不写进摘要的话，用户想知道「支持开发者去哪了」只能挨个组点进去。
+            AboutGroup,
+            "版本 / 更新 / 崩溃日志 / 支持开发者",
             GlassIcons.Book,
         ),
     )
@@ -1248,6 +1533,166 @@ private fun SettingsGroupNav(
                 )
             }
         }
+    }
+}
+
+/**
+ * 「支持开发者」页的**空壳**（用户原话：「把页面先做，先不放内容」）。
+ *
+ * ## 这一版为什么什么都没有，却仍然要认真设计
+ *
+ * 需求是先把**页面**做出来，内容以后填。这类「先占位」的页面最容易掉进两个坑：
+ * 1. **白屏**——用户点进来看到一片空白，第一反应是「加载失败 / 这个 App 有 bug」；
+ * 2. **假按钮**——放几个「赞助 / 反馈 / 关注」按钮，因为还没有落地页，点了只能弹个
+ *    toast 或者干脆没反应。**这比白屏更糟**：白屏只是「没东西」，假按钮是
+ *    「它承诺了事情，然后骗了你」。
+ *
+ * 所以这一页只做两件事，且两件都是**真的**：
+ * - 用一个视觉语言完整的头图（强调色徽章 + 标题 + 一段实话）说清「还在筹备」，
+ *   让「空」读起来是**刻意的留白**而不是故障；
+ * - 把「之后会有什么」做成三行**纯说明行**（`onClick = null`、`trailing = {}`）——
+ *   既传达了规划，又不提供任何可点的假入口。理由见 SettingRow 的 KDoc：
+ *   不可点的行不该被念成按钮，也不该带「可以进去」的右箭头。
+ *
+ * ## 为什么没有「返回」按钮
+ *
+ * 返回头由调用方（SettingsScreen 主体）统一画：二级页与三级页共用
+ * [SettingsSubPageHeader]，差别只在返回落点（settingsReturnGroup）。
+ * 本函数只负责**内容区**，不重复画头——第一版在这里画过一次，结果是
+ * 一屏两行同样的「支持开发者」标题（文件头 KDoc 记过同类错误）。
+ *
+ * ## 为什么用强调色徽章（而不是灰色占位图标）
+ *
+ * 这一页在灰度上与「设置快照读取失败」那类**故障提示**必须拉开距离：后者是
+ * 警告，用中性色 + 说明行；前者是**邀请**，用 auroraAccentColor（全 App
+ * 「值得看一眼」的唯一强调色来源）。同一套材质、同一档圆角，只换颜色——不新造任何 token。
+ *
+ * ## 内容规划的措辞口径（写在这里，避免下一个人以为我在乱许诺）
+ *
+ * 下面三段文案刻意都用了「之后会放 / 还在筹备」的**将来时**，没有一处写成
+ * 「点击这里可以…」。这一页目前**没有任何功能**，任何现在时的动作描述都会立刻变成谎言。
+ */
+@Composable
+private fun SettingsSupportPage() {
+    val glass = LocalGlassColors.current
+    // 强调色只在这里出现一次（徽章）；标题正文仍走 textPrimary/secondary，
+    // 否则整块会被读成「一个警告」而不是「一段邀请」
+    val accent = auroraAccentColor()
+    // 入场：与 GlassEmptyState 同一条语言（淡入 + 上移 8dp，tweenPage 已含动效强度乘数）。
+    // 值只在 graphicsLayer 的绘制期读——不为了 8dp 位移每帧重组整棵子树。
+    val appear = remember { androidx.compose.animation.core.Animatable(0f) }
+    LaunchedEffect(Unit) { appear.animateTo(1f, GlassMotion.tweenPage()) }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            // **横向不留内边距**：本页末段要用 SectionHeader + SettingsCard，这两个组件
+            // 自身已经各带一份 S.Gap20 横向边距（见它们的定义）。外层再包一层 20dp 会变成
+            // 40dp 缩进——卡片比页头窄一截，与所有二级页的分组卡左缘对不齐。
+            // 只有标题/正文那一段需要自己的横向边距，见下方内层 Column。
+            .padding(top = S.Gap8.dp)
+            .graphicsLayer {
+                val p = appear.value
+                alpha = p
+                translationY = (1f - p) * 8.dp.toPx()
+            },
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        // ── 头图 + 文案：这一段是「裸文字」，没有卡片外壳，所以要自己带页面边距 ──
+        Column(
+            Modifier.padding(horizontal = S.Gap20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            // ── 头图：强调色徽章（72dp 圆盘 + 同色细描边）──
+            //
+            // 72dp 与 GlassEmptyState 的图标盘（64/48）同量级：这一页只有一个视觉焦点，
+            // 比空态的盘大 8dp 是为了让「这是一整页的主角」成立，而不是某个列表的空态。
+            Box(
+                Modifier
+                    .size(72.dp)
+                    .clip(CircleShape)
+                    // 14% 填充 + 28% 描边：同色两档，与 GlassIconButton（lo 填充 + strokeSoft 描边）
+                    // 同一套「可识别边界」的构造法，只是把中性白换成强调色
+                    .background(accent.copy(alpha = 0.14f))
+                    .border(1.dp, accent.copy(alpha = 0.28f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                // 有意 null：装饰性图形，语义由下方标题承担（同 GlassEmptyState 的纪律）
+                Icon(GlassIcons.Heart, null, Modifier.size(28.dp), tint = accent)
+            }
+            Spacer(Modifier.height(S.Gap20.dp))
+            Text(
+                "这一页还在筹备",
+                // Title（20 Bold）而不是 Heading：这是**一页**的标题，不是区块标题。
+                // 页头已经用 Display 显示了「支持开发者」，此处是内容区的第二层，
+                // 用 Title 形成「页名 → 章节」的层级，不会与页头抢。
+                style = GlassText.Title,
+                color = glass.textPrimary,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(S.Gap8.dp))
+            Text(
+                "先把入口留下，内容慢慢来。这里之后会放：自愿支持的方式、反馈与建议的入口，" +
+                    "以及开发者想对你说的一段话。",
+                // Body + textSecondary：这是需要被读完的一段话（同 GlassEmptyState 副标题的取向），
+                // 不是注脚。textTertiary 在这个位置会被读成「不重要的小字」而直接跳过。
+                style = GlassText.Body,
+                color = glass.textSecondary,
+                textAlign = TextAlign.Center,
+            )
+        }
+
+        // ── 之后会有什么：三行纯说明行（不可点、无箭头）──
+        //
+        // 刻意**不**用 SheetAction / 胶囊按钮：那两个组件天生带按压反馈与按钮语义，
+        // 而这里没有任何动作可做。必须让读屏与视觉同时读作「说明」而非「入口」。
+        Spacer(Modifier.height(S.Gap8.dp))
+        SectionHeader("之后会有什么")
+        SettingsCard {
+            SettingRow(
+                GlassIcons.Heart, "自愿支持",
+                "不改变任何功能，也不解锁任何东西 —— 只是如果你愿意",
+                onClick = null,
+                // 尾部落空：右箭头是「可以进去」的视觉承诺（见 SettingRow 的 KDoc），
+                // 不可点的行绝不能带它
+                trailing = {},
+            )
+            RowDivider()
+            SettingRow(
+                // Edit（铅笔）=「写点什么」，语义是**写消息**而不是跳转；
+                // 与「主题色 / 桌面歌词字号」那两行的「手动指定某个值」同属
+                // 「用户亲手写/定的东西」这一族，不构成跨语义复用
+                GlassIcons.Edit, "反馈与建议",
+                "发现问题、想要某个功能，都可以在那时告诉我",
+                onClick = null,
+                trailing = {},
+            )
+            RowDivider()
+            SettingRow(
+                // User（人）：这一行说的是**开发者本人**，同一枚符号在「查看艺术家」
+                // 那里的语义也是「一个人」，属于同一族。Book 已被版本/日志占满。
+                GlassIcons.User, "开发者的话",
+                "关于这个小项目的来历，以及为什么它是现在这个样子",
+                onClick = null,
+                trailing = {},
+            )
+        }
+
+        // ── 页脚：把「为什么现在还不能点」说明白 ──
+        //
+        // 这一段不是凑数：用户看到三行「之后」之后，最自然的疑问就是「那我现在能干嘛」。
+        // 与其让他去戳那三行然后发现没反应，不如直接把答案写在这里——
+        // 这也是整页唯一一句「现在时」的承诺，而它承诺的是**没有假动作**。
+        Text(
+            "在内容准备好之前，这一页不会有任何可点的按钮 —— " +
+                "一个点了没反应的按钮，比一段诚实的留白更让人失望。",
+            style = GlassText.Micro,
+            color = glass.textTertiary,
+            textAlign = TextAlign.Center,
+            // 这里**不用** SettingsCard 的 bottom 20dp，而是负回一点：它接在卡片后面，
+            // 属于卡片的注脚而不是新的一段；再加一行 20dp 会让页脚显得被孤立。
+            modifier = Modifier.padding(horizontal = S.Gap20.dp, vertical = S.Gap8.dp),
+        )
     }
 }
 

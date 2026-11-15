@@ -59,7 +59,11 @@ internal object DesktopLyricsLoader {
             .firstNotNullOfOrNull { file ->
                 // 解析全程 runCatching：坏歌词文件绝不能把调用线程搞崩（控制器在读盘线程调它）
                 runCatching {
-                    val text = file.readText()
+                    // 编码判据与 MediaLibrary.readLrc 共享同一实现（UTF-8 → GBK 兜底）。
+                    // **不能**在这里写 `file.readText()`：国内大量旧 .lrc 是 GBK，
+                    // 裸 UTF-8 解出来是一屏乱码，但有时间戳的行仍能被 parseLrc 命中 →
+                    // 乱码歌词被当成正常歌词显示。详见 readLrcText 的 KDoc。
+                    val text = MediaLibrary.readLrcText(file)
                     val lines = MediaLibrary.parseLrc(text)
                     if (lines.isNotEmpty()) {
                         lines

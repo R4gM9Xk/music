@@ -476,7 +476,7 @@ class AppStateQueueTest {
         val engine = FakePlayerEngine()
         state.attachPlayer(engine)
         val writes = mutableListOf<Int>()
-        state.queueStateWriter = { _, index, _ -> writes += index }
+        state.queueStateWriter = { _, index, _, _ -> writes += index }
 
         val a = song("A")
         val b = song("B")
@@ -501,7 +501,7 @@ class AppStateQueueTest {
         val engine = FakePlayerEngine()
         state.attachPlayer(engine)
         val writes = mutableListOf<Int>()
-        state.queueStateWriter = { _, index, _ -> writes += index }
+        state.queueStateWriter = { _, index, _, _ -> writes += index }
 
         val a = song("A")
         state.loadLibrary(listOf(a))

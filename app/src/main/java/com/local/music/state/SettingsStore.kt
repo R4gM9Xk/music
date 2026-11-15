@@ -348,7 +348,7 @@ class SettingsStore(context: Context) : SnapshotStore {
          * 哪个字段够重要更不容易出错。代价：v10 及更早的 App 读不了 v11 备份
          * （提示「来自更新版本」，用户升级即可）。
          */
-        private const val VERSION = 11
+        private const val VERSION = 12
 
         /** P2-27：损坏快照留档份数上限（见 [dumpCorrupt]），够人工排查即可 */
         private const val CORRUPT_KEEP = 3
@@ -493,6 +493,9 @@ class SettingsStore(context: Context) : SnapshotStore {
             // 解码侧返回 null，渲染回落极光——这条路径必须有，不能假定 uri 永远可读。
             put("backgroundMode", s.backgroundMode)
             put("backgroundPhotoUri", s.backgroundPhotoUri ?: JSONObject.NULL)
+            // 视觉风格（v12）：全 App 的材质语言（液态玻璃 / 拟物）。
+            // 存名字而不是序号——序号会在增删枚举成员时静默错位（同 glassLevel 口径）。
+            put("visualStyle", s.visualStyle)
         }.toString()
 
         /**
@@ -608,6 +611,10 @@ class SettingsStore(context: Context) : SnapshotStore {
             backgroundMode = o.optString("backgroundMode", "Aurora"),
             backgroundPhotoUri = o.takeIf { it.has("backgroundPhotoUri") && !it.isNull("backgroundPhotoUri") }
                 ?.optString("backgroundPhotoUri"),
+            // 视觉风格（v12）：旧版本（≤v11）无此字段 → 默认液态玻璃，老用户升级观感逐像素不变。
+            // 合法性由 AppState.restore 的 valueOf 容错兜住（坏值回落玻璃），这里不重复校验——
+            // 风格是装饰，不能因为它让整份快照解码失败。
+            visualStyle = o.optString("visualStyle", "Glass"),
         )
 
         /**

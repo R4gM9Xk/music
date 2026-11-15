@@ -974,12 +974,62 @@ object MediaLibrary {
      * 文本截断到 2000 字符：整文件作为单行歌词渲染会撑爆布局/纹理。
      */
     private fun parseLrcOrPlainText(file: java.io.File): List<LyricLine> {
-        val text = file.readText()
+        val text = readLrcText(file)
         val parsed = parseLrc(text)
         if (parsed.isNotEmpty()) return parsed
         val plain = text.trim()
         if (plain.isEmpty()) return emptyList()
         return listOf(LyricLine(plain.take(2000), 0f))
+    }
+
+    /**
+     * 读 .lrc 文本：UTF-8 优先，检出替换符 U+FFFD 时按 GBK 重解（P2 修复）。
+     *
+     * ## 为什么必须补这条兜底
+     *
+     * 旧实现是裸 `file.readText()`（默认 UTF-8）。而国内大量旧歌词文件是 GBK/GB18030
+     * 编码（尤其是千千静听、早年酷狗导出的那一批，以及 Windows 记事本默认存盘的
+     * 中文 txt 改后缀）。GBK 的中文字节序列在 UTF-8 下几乎必然非法 → 解出一片 U+FFFD
+     * 或乱码字形：
+     * - 有 `[mm:ss]` 时间戳的行仍能被正则命中 → 走 parseLrc 成功返回，
+     *   于是**乱码歌词被当成正常歌词显示**（这比整份失败更糟：用户看到的是一屏问号，
+     *   而不是「暂无歌词」这个诚实的兜底）；
+     * - 无时间戳的纯文本歌词则整体变成乱码串。
+     *
+     * ## 判据与 M3U 同源
+     *
+     * `M3uPlaylistIO.import` 已有完全相同的判定（先 UTF-8、出现 U+FFFD 则按 GBK 重解），
+     * 这里沿用同一判据而不是另造一套：编码探测是一个「社区共识远强于自研」的问题，
+     * 两份不同口径只会在同一台机器上给出两种结果（同目录歌单正常、歌词乱码）。
+     *
+     * **不做 GB18030**：它是 GBK 的超集，但 Android 的 `Charset.forName("GB18030")`
+     * 需要 ICU 数据、在极小内存配置上未必可用；而实际歌词文件几乎全是 GBK 覆盖范围。
+     * GB18030 特有的生僻字/emoji 会落到替换符——与「整篇乱码」相比是可接受的降级。
+     *
+     * 全程 runCatching：编码不支持的极端情况下退回 UTF-8 结果，**绝不抛**
+     * （调用点在上面的 `firstNotNullOfOrNull` 里虽然有 runCatching 兜着，
+     * 但让它抛就等于放弃这个候选，而 UTF-8 的结果至少可能是正确的）。
+     *
+     * **本函数是 internal 可见性**而不是 private：`DesktopLyricsLoader` 也要读 .lrc，
+     * 两处必须同一套编码判据（否则同一首歌在主播放页正常、桌面歌词乱码，
+     * 而用户无法理解这种分叉）。它在同一个 :app 模块内，不构成跨模块 API。
+     */
+    internal fun readLrcText(file: java.io.File): String {
+        val bytes = file.readBytes()
+        // UTF-8 严格解码：与 String(bytes, UTF_8) 不同，它能区分「非法序列」与
+        // 「恰好含 U+FFFD 字面字符」——后者在歌词里不会出现，但既然能精确判，
+        // 就不该用一个可能误判的 contains 检查。
+        val decoder = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+            .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+        return runCatching {
+            decoder.decode(java.nio.ByteBuffer.wrap(bytes)).toString()
+        }.getOrElse {
+            // UTF-8 严格解码失败 = 确定不是 UTF-8：按 GBK 重解；GBK 也不支持则退回
+            // 宽松 UTF-8（替换符乱码，但至少不崩、且时间戳仍可解析）
+            runCatching { bytes.toString(charset("GBK")) }
+                .getOrElse { bytes.toString(Charsets.UTF_8) }
+        }
     }
 
     private val lrcRegex = Regex("\\[(\\d{1,3}):(\\d{1,2})(?:[.:](\\d{1,3}))?\\]")
@@ -1001,7 +1051,10 @@ object MediaLibrary {
             ?.groupValues[1]?.toIntOrNull() ?: 0
         val out = mutableListOf<LyricLine>()
         text.lineSequence().forEach { rawLine ->
-            val line = rawLine.trim().removePrefix("﻿") // UTF-8 BOM
+            // UTF-8 BOM：**必须写成转义 `\uFEFF` 而不是字面 BOM 字符**——
+            // 字面 BOM 在编辑器/差异工具里不可见，会触发 Lint 的 ByteOrderMark 检查
+            // （告警："Byte order mark found"），也让 grep/审查完全看不到这一行在做什么。
+            val line = rawLine.trim().removePrefix("\uFEFF")
             val stamps = lrcRegex.findAll(line).toList()
             if (stamps.isEmpty()) return@forEach // 标签行/纯文本行：时间戳解析阶段一律跳过（纯文本降级见 parseLrcOrPlainText）
             // P3-28 收尾：行内 [offset:] 文本也要从 content 剥离——第二趟 stamps-first 意味着

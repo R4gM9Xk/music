@@ -13,19 +13,39 @@
 
   **所有 id 必须与 widget_music_wide.xml 完全一致**：MusicWidgetViews 用同一套
   bindCommon 绑定两个布局，少一个 id 就是运行期 IllegalArgumentException。
+
+  ## tools:ignore="NestedWeights"（P2 判定：此处**不修**，只抑制）
+  Lint 报「Nested weights are bad for performance」。本条在这个布局里是有意保留的：
+  - 嵌套只有两层，且**方向不同**（外层 vertical 的 weight 分高度、内层 horizontal 的
+    weight 分宽度）——这正是 Lint 文档里「最坏情况需要指数级测量」都不成立的那一类；
+  - 小部件是 static 布局，只在 bind 时测一次（不像 Compose 每帧测量），
+    二次测量的成本在小部件生命周期里是常数级；
+  - 真正去掉它会写死宽度（例如给文字列固定 dp），而这与文件头「所有横向元素用
+    weight 分配、不写死测量尺寸」的设计前提直接冲突——那个前提是为「4x1 被拖窄后
+    退化形态」服务的，比 Lint 的通用性能建议更重要。
+  换句话说：这里 Lint 的规则本身没错，但它的收益前提（频繁测量）不成立，
+  而修复代价（放弃自适应宽度）是实打实的。所以抑制并写明判断依据。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/widget_root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
     android:background="@drawable/widget_bg"
-    android:padding="12dp">
+    android:padding="12dp"
+    tools:ignore="NestedWeights">
 
-    <!-- 上半：大封面 + 右侧文字（横向） -->
+    <!-- 上半：大封面 + 右侧文字（横向）
+         高度 0dp + weight=1（P2 修 Lint InefficientWeight）：
+         LinearLayout 里**唯一**带 weight 的子项应声明 0dp 高度，让它按剩余空间分配；
+         写 wrap_content 会让系统先按内容测一次、再按剩余空间分配一次（双重测量），
+         而这正是 RemoteViews 里最该省的：小部件布局在 launcher 进程里被测量，
+         多一次测量在大表格/长按拖拽缩放时是可见的掉帧。
+         语义也更准确——它的高度本来就**由剩余空间决定**，不是由内容决定。 -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="0dp"
         android:layout_weight="1"
         android:orientation="horizontal"
         android:gravity="center_vertical">
@@ -36,7 +56,7 @@
             android:layout_height="64dp"
             android:layout_marginEnd="12dp"
             android:scaleType="centerCrop"
-            android:contentDescription="专辑封面"
+            android:contentDescription="@string/widget_desc_cover"
             android:src="@drawable/widget_art_placeholder" />
 
         <LinearLayout
@@ -121,7 +141,7 @@
             android:layout_height="44dp"
             android:padding="10dp"
             android:src="@drawable/widget_ic_prev"
-            android:contentDescription="上一首" />
+            android:contentDescription="@string/widget_desc_prev" />
 
         <ImageView
             android:id="@+id/widget_play"
@@ -131,7 +151,7 @@
             android:layout_marginEnd="8dp"
             android:padding="11dp"
             android:src="@drawable/widget_ic_play"
-            android:contentDescription="播放或暂停" />
+            android:contentDescription="@string/widget_desc_play_pause" />
 
         <ImageView
             android:id="@+id/widget_next"
@@ -139,6 +159,6 @@
             android:layout_height="44dp"
             android:padding="10dp"
             android:src="@drawable/widget_ic_next"
-            android:contentDescription="下一首" />
+            android:contentDescription="@string/widget_desc_next" />
     </LinearLayout>
 </LinearLayout>

@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
@@ -37,7 +38,11 @@ import androidx.compose.ui.unit.dp
 import com.local.music.core.ui.theme.GlassColors
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.LocalSkeuomorphColors
+import com.local.music.core.ui.theme.LocalVisualStyle
 import com.local.music.core.ui.theme.R
+import com.local.music.core.ui.theme.SkeuoElevation
+import com.local.music.core.ui.theme.SkeuomorphColors
 import com.local.music.core.ui.theme.onSeedColor
 
 /**
@@ -406,6 +411,38 @@ fun GlassSurface(
 ) {
     val glass = LocalGlassColors.current
     val interactionSource = remember { MutableInteractionSource() }
+
+    // ── 材质语言分流（快照 v12）──
+    //
+    // 拟物档在这里**整条换路径**，不是在半透明公式上叠东西。理由见 Skeuomorph 的 KDoc：
+    // 拟物的定义就是「不透背景」，而下面所有玻璃笔（haze tint / fill / scrim / border /
+    // 顶线）都在表达「我透出你并压住你」——它们与拟物是互斥的两套语言，混在一起会得到
+    // 一块「不透明但还在采样背景」的怪面板（性能白付、观感也不对）。
+    //
+    // **只有点击手势是两条路径共享的**（combinedClickable 在下面统一挂）：
+    // 语义与命中区与材质无关，分流不能把可点性分掉。
+    val skeuoStyle = LocalVisualStyle.current
+    if (skeuoStyle == com.local.music.core.ui.state.VisualStyle.Skeuomorph) {
+        val skeuo = LocalSkeuomorphColors.current
+        // **投影挂在 clip 之前**：它要画到节点边界以外（这是「厚度」信号），
+        // 而 clip 会裁掉越界部分。这也是本仓「clip 是内部链第一笔」规则的唯一例外，
+        // 见 skeuomorphShadow 的 KDoc。
+        var sm = modifier
+            .skeuomorphShadow(skeuo, shape)
+            .clip(shape)
+            .skeuomorphFace(skeuo, raised = level != GlassLevel.Lo)
+        if (onClick != null || onLongClick != null) {
+            sm = sm.combinedClickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick ?: {},
+                onLongClick = onLongClick,
+            )
+        }
+        Box(sm, content = content)
+        return
+    }
+
     // A6：容器不再缩放（旧 pressScale(0.97) 见下）。这里**直接**从 modifier 接到 clip(shape)，
     // 层序与改前逐节点等价：clip 仍是内部链的第一笔，haze/fill/scrim/描边全部在它之内。
     var m = modifier.clip(shape)
@@ -497,6 +534,88 @@ fun GlassSurface(
     Box(m, content = content)
 }
 
+/**
+ * 拟物贴面的绘制修饰符：不透明面 + 面内高光渐变 + 方向性斜面。
+ *
+ * ## 为什么在 `drawWithCache` 里建 Brush
+ *
+ * 本仓红线：绘制期零 Shader 分配（见 [com.local.music.core.ui.components.AuroraBackground]
+ * 与 glassTopLine 的同款说明）。这里所有笔刷只依赖 (skeuo, size)，尺寸/配色变化才重算，
+ * 帧间复用——与液态档的 liquidGlassDecor 完全同一套手法，只是画的东西不同。
+ *
+ * ## 层序（从下到上，不可颠倒）
+ *
+ * 1. **面**：不透明填充，覆盖一切背后内容。这一笔是拟物与玻璃的分水岭——
+ *    只要它不透明，背后有没有内容、糊没糊都不重要了。
+ * 2. **面内高光**：自顶部向下衰减的竖向渐变。真实物体的表面反射是**面状**的，
+ *    只画边缘会读成「描了一圈线」而不是「有厚度的材质」。
+ * 3. **斜面**：上沿 + 下沿各一笔（**凸起**：上亮下弱亮；**凹陷**：上暗下亮）。
+ *    2dp 宽而不是 1dp：拟物的倒角是有宽度的，1dp 会读成描边。
+ *
+ * 投影**不在这里**画：它必须画在贴面**之外**（节点边界以远），而 drawBehind 会被
+ * clip 裁掉。投影由调用方在 clip 之前挂（见 [skeuomorphShadow]）。
+ *
+ * @param raised true = 凸起（按钮/卡片）；false = 凹陷（凹槽/输入框内底/轨道）
+ */
+private fun Modifier.skeuomorphFace(
+    skeuo: SkeuomorphColors,
+    raised: Boolean,
+): Modifier = drawWithCache {
+    val h = size.height.coerceAtLeast(1f)
+    val w = size.width.coerceAtLeast(1f)
+    val bevelPx = 2.dp.toPx()
+    // 面内高光：从顶部衰减到透明，只覆盖上半 60% 高度。
+    // 为什么不是整高渐变：真实反射衰减很快，整高渐变会让下半部分也被提亮，
+    // 读作「整块都浮起来」——而我们需要的是「上面受光、下面背光」的方向感。
+    val innerBrush = Brush.verticalGradient(
+        0f to skeuo.innerLight,
+        0.6f to Color.Transparent,
+        endY = h,
+    )
+    // 斜面笔刷：横向渐变，两端渐隐（避免在圆角处与弧线交叉成直角）
+    val sideInset = w * 0.06f
+    val topColor = if (raised) skeuo.bevelTop else skeuo.recessTop
+    val bottomColor = if (raised) skeuo.bevelBottom else skeuo.recessBottom
+    val topBrush = Brush.horizontalGradient(
+        listOf(Color.Transparent, topColor, Color.Transparent),
+        startX = sideInset, endX = w - sideInset,
+    )
+    val bottomBrush = Brush.horizontalGradient(
+        listOf(Color.Transparent, bottomColor, Color.Transparent),
+        startX = sideInset, endX = w - sideInset,
+    )
+    val faceColor = if (raised) skeuo.faceRaised else skeuo.face
+    onDrawBehind {
+        // 1. 面（不透明）
+        drawRect(color = faceColor)
+        // 2. 面内高光
+        drawRect(brush = innerBrush)
+        // 3. 斜面：上沿 + 下沿各 bevelPx 宽
+        drawLine(topBrush, Offset(0f, bevelPx / 2f), Offset(w, bevelPx / 2f), bevelPx)
+        drawLine(bottomBrush, Offset(0f, h - bevelPx / 2f), Offset(w, h - bevelPx / 2f), bevelPx)
+    }
+}
+
+/**
+ * 拟物投影。
+ *
+ * **必须在 clip 之前挂**：它要画到节点边界以外，而 clip 会把越界部分裁掉。
+ * 拟物的「厚度」信号主要就来自边界之外的投影，裁掉它等于取消这个风格。
+ *
+ * 用 androidx.compose.ui.draw.shadow 而不是自己画：它已经把「近/远两笔」拆成
+ * ambientColor / spotColor（Material 的 elevation 模型），我们要的双笔阴影正好
+ * 落在它的语义里。手写 drawBehind 需要自己算 blur 蒙版，而在 RenderEffect 之外
+ * 没有低成本实现。
+ */
+private fun Modifier.skeuomorphShadow(skeuo: SkeuomorphColors, shape: Shape): Modifier =
+    shadow(
+        elevation = SkeuoElevation.FarBlur.dp,
+        shape = shape,
+        clip = false, // 由调用方紧接着 clip(shape)；这里再裁一次是重复工作
+        ambientColor = skeuo.shadow,
+        spotColor = skeuo.shadow,
+    )
+
 /** 玻璃圆形按钮：40dp，lo 填充 + 细描边，按压 scale(.92)
  *
  *  **为什么它保留描边，而 [GlassSurface] 的 Lo 层不再画描边**（视觉审计 D3 的边界澄清）：
@@ -521,6 +640,24 @@ fun GlassIconButton(
 ) {
     val glass = LocalGlassColors.current
     val interactionSource = remember { MutableInteractionSource() }
+    // 拟物档：圆钮是**凸起的小实体**（注塑按键），不是「lo 填充的圆形色斑」。
+    // 玻璃档靠描边定义边界；拟物档靠斜面 + 投影定义「这是个能按的东西」——
+    // 两者目的相同（边界 + 可点性），手段必须各自成立，所以这里分流而不是叠加。
+    if (LocalVisualStyle.current == com.local.music.core.ui.state.VisualStyle.Skeuomorph) {
+        val skeuo = LocalSkeuomorphColors.current
+        Box(
+            modifier
+                .pressScale(interactionSource)
+                .size(size)
+                .skeuomorphShadow(skeuo, CircleShape)
+                .clip(CircleShape)
+                .skeuomorphFace(skeuo, raised = true)
+                .clickable(interactionSource = interactionSource, indication = null, onClick = onClick),
+            contentAlignment = Alignment.Center,
+            content = content,
+        )
+        return
+    }
     Box(
         modifier
             .pressScale(interactionSource)
@@ -556,14 +693,37 @@ fun GlassToggle(
         label = "toggle",
     )
     val track = androidx.compose.foundation.shape.RoundedCornerShape(R.Full)
+    // 拟物档：开关是**凹槽 + 凸起滑块**——这是拟物语言最经典也最有说服力的一对：
+    // 轨道必须读作「凹进去」（上沿暗、下沿亮），滑块必须读作「凸起来」（投影 + 斜面）。
+    // 玻璃档的轨道是半透明色块 + 白滑块，两个世界。
+    val skeuomorphToggle = LocalVisualStyle.current == com.local.music.core.ui.state.VisualStyle.Skeuomorph
     Box(
         modifier
             .size(42.dp, 25.dp)
-            .clip(track)
-            .background(
-                androidx.compose.ui.graphics.lerp(
-                    LocalGlassColors.current.textPrimary.copy(alpha = 0.18f), palette.seed, fraction,
-                ),
+            .then(
+                if (skeuomorphToggle) {
+                    val skeuo = LocalSkeuomorphColors.current
+                    Modifier
+                        .clip(track)
+                        // 凹槽底色：开态仍然吃 seed 色（状态信号不能丢），
+                        // 但把它压成「凹槽里的色光」而不是「轨道本色」
+                        .background(
+                            androidx.compose.ui.graphics.lerp(
+                                skeuo.faceRecessed,
+                                palette.seed.copy(alpha = 0.85f),
+                                fraction,
+                            ),
+                        )
+                        .skeuomorphFace(skeuo, raised = false)
+                } else {
+                    Modifier
+                        .clip(track)
+                        .background(
+                            androidx.compose.ui.graphics.lerp(
+                                LocalGlassColors.current.textPrimary.copy(alpha = 0.18f), palette.seed, fraction,
+                            ),
+                        )
+                },
             )
             .clickable(interactionSource = interactionSource, indication = null) { onToggle(!checked) }
             .semantics {
@@ -579,7 +739,17 @@ fun GlassToggle(
                 .align(Alignment.CenterStart)
                 .size(thumbSize)
                 .clip(CircleShape)
-                .background(androidx.compose.ui.graphics.lerp(Color.White, onSeed, fraction)),
+                .then(
+                    if (skeuomorphToggle) {
+                        // 拟物滑块：凸起实体 + 投影（投影是「滑块高于轨道」的唯一信号）
+                        val skeuo = LocalSkeuomorphColors.current
+                        Modifier
+                            .skeuomorphShadow(skeuo, CircleShape)
+                            .skeuomorphFace(skeuo, raised = true)
+                    } else {
+                        Modifier.background(androidx.compose.ui.graphics.lerp(Color.White, onSeed, fraction))
+                    },
+                ),
         )
     }
 }

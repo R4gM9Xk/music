@@ -100,5 +100,20 @@
     <string name="restore_report_partial">Restored %1$d tracks, %2$d not found (file paths changed)</string>
     <string name="restore_report_none">None of the %1$d tracks were found (file paths changed)</string>
 
+    <!-- ── Widget (二轮补齐：Lint MissingTranslation) ──
+         这几条此前只存在于 values/ ，MissingTranslation 直接报 6 个 error 并让 :app:lintDebug
+         失败（Lint 默认把 MissingTranslation 定为 error）。补齐后 lint 的 i18n 面清零。 -->
+    <string name="widget_label">Music Player</string>
+    <string name="widget_not_playing">Not playing</string>
+    <string name="widget_desc_wide">4×1 playback bar: cover, title, previous / play-pause / next</string>
+    <string name="widget_desc_square">4×2 cover version: large cover, title, progress and full controls</string>
+    <string name="widget_label_wide">Music Bar</string>
+    <string name="widget_label_square">Music Cover</string>
+
+    <!-- 小部件无障碍描述（P2）：与 values/widget_strings.xml 的四条一一对应 -->
+    <string name="widget_desc_cover">Album cover</string>
+    <string name="widget_desc_prev">Previous</string>
+    <string name="widget_desc_play_pause">Play or pause</string>
+    <string name="widget_desc_next">Next</string>
 
 </resources>

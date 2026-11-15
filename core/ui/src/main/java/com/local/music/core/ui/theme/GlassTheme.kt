@@ -18,6 +18,11 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.lerp
+// VisualStyle（材质语言）定义在 state 包：它是用户可见的**设置项**，与 GlassIntensity /
+// MotionIntensity 同级，由 AppState 持久化。theme 包只消费它，不拥有它——
+// 反过来（把枚举放 theme、让 state 依赖 theme）会让「设置值」依赖「渲染实现」，
+// 那是本仓一贯避免的方向。
+import com.local.music.core.ui.state.VisualStyle
 
 /**
  * 液态玻璃流 · 设计 token
@@ -975,12 +980,29 @@ private fun animatePalette(target: AuroraPalette): AuroraPalette {
 /**
  * 液态玻璃主题根：注入动画化后的取色 + 玻璃 token。
  * 所有页面共用一个极光底，取色随封面主色变化；isDark 切换深浅令牌并做 400ms 交叉渐变。
+ *
+ * ## [visualStyle]：材质语言开关（快照 v12）
+ *
+ * 这是与 [glassIntensity] **正交**的第二个维度，不是它的第四档：
+ * - [glassIntensity] 调的是「这块玻璃多浓」（通透 / 标准 / 浓郁）——同一套语言的参数；
+ * - [visualStyle] 决定「用的是不是玻璃」——换的是整套视觉语法。
+ *
+ * 为什么必须正交：拟物的定义就是「**不透明**、不透背景」，而玻璃的全部身家都建立在
+ * 半透明 + 真模糊上。把拟物做成「浓郁到不透」的玻璃是行不通的：
+ * ① 它仍然会读背景（hazeEffect 就在那条链上）；
+ * ② 用户调整「玻璃强度」时会发现拟物档毫无反应，那是个死控件。
+ * 所以这里把两条语言分流，各读自己的 token 集，玻璃强度在拟物档下如实说明不生效
+ * （见设置页那一行的副标题），而不是假装可调。
+ *
+ * 零回归保证：本参数默认 [VisualStyle.Glass]，且拟物档额外注入
+ * [LocalSkeuomorphColors]——Glass 档的调用点读不到它，行为逐像素不变。
  */
 @Composable
 fun GlassTheme(
     palette: AuroraPalette = GlassPalettes.Purple,
     isDark: Boolean = true,
     glassIntensity: GlassIntensity = GlassIntensity.Standard,
+    visualStyle: VisualStyle = VisualStyle.Glass,
     content: @Composable () -> Unit,
 ) {
     // A3-01：时长走 tweenPalette（Palette×动效强度乘数）——旧实现裸常量 400ms，
@@ -1006,11 +1028,29 @@ fun GlassTheme(
     val lightGlass = GlassColors.light().deriveBy(fillScale, strokeScale)
     val glass = lerpGlassColors(darkGlass, lightGlass, themeFraction)
         .withChromeScrim(effectivePalette, themeFraction)
+    // 拟物贴面：与玻璃同一套 400ms 交叉渐变节奏（themeFraction 是同一个动画值），
+    // 所以切换深浅时两种材质语言都以同一速度收束——不会出现「玻璃已经变完、
+    // 拟物还在半路」的错位（那种错位在来回快速切换时最明显）。
+    //
+    // 为什么用 themeFraction 而不是另起一个 animateFloatAsState：拟物的深/浅不是
+    // 「同一个东西的两个亮度」，但用户的心智里它们就是「深色模式/浅色模式」，
+    // 所以切换时机必须与玻璃档**完全同步**。多开一个动画会让两条时间线漂移。
+    val skeuomorph = lerpSkeuomorph(
+        from = SkeuomorphColors.dark(),
+        to = SkeuomorphColors.light(),
+        fraction = themeFraction,
+    )
 
     CompositionLocalProvider(
         // 直接提供混合结果：第三层动画是多余滞后（见上），不是设计意图
         LocalAuroraPalette provides effectivePalette,
         LocalGlassColors provides glass,
+        // 拟物 token 恒注入（不按 visualStyle 条件注入）：CompositionLocal 的读取方
+        // 本来就只有拟物分支，而条件注入会让「切到拟物」这一帧的读者落回默认值
+        // （默认是深色拟物），浅色主题下会闪一下深贴面。
+        LocalSkeuomorphColors provides skeuomorph,
+        // 材质语言本身也下发：所有渲染分支据此选路径
+        LocalVisualStyle provides visualStyle,
         // A1-03：LocalIsDark 仍是阈值布尔（供非视觉/必须二选一的消费者），但所有
         // 视觉连续值消费者改读 LocalThemeFraction——旧实现的极光混合模式、暗角、
         // auroraAccentColor、面板 veil 都在 400ms 渐变中点硬翻转

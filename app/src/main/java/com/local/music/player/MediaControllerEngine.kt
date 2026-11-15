@@ -30,7 +30,14 @@ private const val MAX_CONSECUTIVE_SKIPS = 5
  * 通知 / 锁屏 / 流体云 / 后台播放由 MediaSessionService 统一承担。
  * 整条队列经 setMediaItems 下发（稳定 mediaId），循环 / 随机用播放器原生模式；
  * 全部调用异步转发，播放状态经 Player.Listener 回流 AppState。
+ *
+ * `@OptIn(UnstableApi::class)` 的理由与 [MusicPlaybackService] 同类注释（那里写了完整论证）：
+ * media3 1.11 把部分 API 标为 `@UnstableApi` 表示「不保证跨小版本源码兼容」，
+ * 而非「不能用于生产」。本类的职责就是代理 MediaController/MediaSession 的命令面，
+ * 那层 API 大量落在该标记内。类级 `@OptIn` 是编译器级的事实声明，
+ * 比逐行 `@Suppress` 更准确（后者会把将来真正该被提醒的新 API 用法一并压掉）。
  */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 class MediaControllerEngine(
     private val controller: MediaController,
     /** 封面解码用的 Context（`CoverArtBitmap.smallJpeg` 需读 externalCacheDir 下的封面文件）。

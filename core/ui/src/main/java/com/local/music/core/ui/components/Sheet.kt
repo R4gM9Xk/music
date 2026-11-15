@@ -11,8 +11,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -57,7 +59,6 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -430,12 +431,32 @@ fun GlassSheetLazy(
             LazyColumn(
                 Modifier.fillMaxSize(),
                 state = listState,
+                // 尾部留白 = 脚注高度：见上方 P2 说明。footer 为 null 时不补——
+                // 那时最后一行贴底是正确的（多出的空白会被读成「列表没加载完」）。
+                contentPadding = PaddingValues(bottom = if (footer != null) QueueUndoBarHeight else 0.dp),
                 content = content,
             )
             if (footer != null) {
-                // 脚注**叠在**列表底部之上，而不是把列表挤矮：
-                // 挤矮会让列表高度随脚注出现/消失跳变，而撤销条是 4 秒后自动
-                // 消失的瞬态元素，那种跳变会很显眼。
+                // 脚注**叠在**列表底部之上，而不是把列表挤矮（P2 修复：改为按实际高度让位）。
+                //
+                // ## 为什么仍然叠（而不是把列表挤矮）
+                // 挤矮会让列表高度随脚注出现/消失跳变，而撤销条是 4 秒后自动消失的瞬态
+                // 元素，那种跳变会很显眼（面板整体高度在 4 秒内弹一下）。
+                //
+                // ## 为什么必须补 bottom padding 给列表内容
+                // 旧实现的注释声称「不遮任何内容」，但**它确实会遮**：footer 是
+                // `align(BottomCenter)` 的覆盖层，而 LazyColumn 的内容一直延伸到可视区末尾，
+                // 所以当用户把列表滚到底部时，最后一行正好落在 footer 底下——
+                // 「已清空 N 首 / 撤销」那条浮条压住了用户刚想看的最后一首。
+                //
+                // 修法不是把 footer 挪走（它必须固定可见），而是**给列表内容补足尾部留白**：
+                // LazyColumn 的 contentPadding 只在内容两端生效、不影响视口高度，
+                // 于是滚到底时最后一行会停在 footer 之上，而 footer 出现/消失仍不改变
+                // 面板高度（contentPadding 变化只是内容偏移，不触发视口重排跳变）。
+                //
+                // 高度取 QueueUndoBarHeight —— 与 footer 那个 `.height()` 是同一个常量，
+                // 不另写一份数值（两处各写一份就会「改了一处忘了另一处」，那正是这条
+                // 缺陷最初的成因）。
                 Box(
                     Modifier
                         .align(Alignment.BottomCenter)
@@ -508,7 +529,15 @@ private fun GlassSheetScaffold(
         exit = fadeOut(GlassMotion.tweenPage()) +
             slideOutVertically(GlassMotion.tweenPage()) { it },
     ) {
-        Box(
+        // BoxWithConstraints 而**不是**直接读 LocalConfiguration.screenHeightDp（P2 修复）：
+        // 后者报的是**物理屏幕**的高度，在分屏/自由窗口/画中画下与这个 Composable 真正
+        // 拿到的高度无关（Lint 的 ConfigurationScreenWidthHeight 正是这条）。而面板高度
+        // 按「屏幕的 65%」算，在分屏里会得到一个比可用空间还大的值 → 面板被顶穿、
+        // 内容被 GlassSurface 的 clip 裁掉、最后几行点不到。
+        //
+        // BoxWithConstraints 的 maxHeight 是**本节点实际拿到的约束上限**，天然跟着
+        // 窗口大小/横竖屏/insets 走，也不需要再手写任何「减去系统栏」的补偿。
+        BoxWithConstraints(
             modifier
                 .fillMaxSize()
                 .background(Color.Black.copy(alpha = 0.35f))
@@ -541,6 +570,13 @@ private fun GlassSheetScaffold(
                     onClick = onDismiss,
                 ),
         ) {
+            // 可用高度必须在**本 lambda 的第一层**接成普通局部 val：一旦进入内部
+            // Box / GlassSurface / Column 的 content lambda（各带 BoxScope /
+            // ColumnScope 接收者），隐式接收者就换成了别的 scope，直接写 `maxHeight`
+            // 会编译失败：
+            //   'val maxHeight: Dp' cannot be called in this context with an implicit receiver
+            // 接成普通 val 之后，下面任意深度的 lambda 都只是闭包捕获，不受接收者影响。
+            val panelAvailableHeight = maxHeight
             // 面板本体：吃掉自身点击，避免透传到 scrim；imePadding 让输入面板浮在键盘之上
             Box(
                 Modifier
@@ -586,6 +622,9 @@ private fun GlassSheetScaffold(
                         Color.White.copy(alpha = 0.62f),
                         LocalThemeFraction.current,
                     )
+                    // 可用高度已在 GlassSurface 之前接成 panelAvailableHeight（见那里），
+                    // 这里不再碰 maxHeight —— 本 lambda 的隐式接收者是 BoxScope 而非
+                    // BoxWithConstraintsScope，读它会编译失败。
                     Column(
                         Modifier
                             .fillMaxWidth()
@@ -615,21 +654,30 @@ private fun GlassSheetScaffold(
                                 .align(Alignment.CenterHorizontally)
                                 .padding(top = S.Gap12.dp, bottom = 6.dp),
                         )
-                        // E5 面板高度：固定 420dp → 屏幕高度的 65%。
+                        // E5 面板高度：固定 420dp → **可用高度的 65%**。
                         //
                         // 为什么不再用固定值：420dp 在小屏（≈640dp 高）上占 66%、在
                         // 一加13 这类 900+dp 大屏上只占 46%——同一个面板在大屏上「显得局促」
-                        // 而小屏上「几乎铺满」，面板的呼吸感随设备漂移。按屏高取比例后，
-                        // 「面板占屏幕多少」这个观感在设计上是常量。
+                        // 而小屏上「几乎铺满」，面板的呼吸感随设备漂移。按可用高度取比例后，
+                        // 「面板占多少」这个观感在设计上是常量。
                         //
-                        // **下限 280dp 是必须的**：横屏时 screenHeightDp 只剩 360–420dp，
+                        // **分母用 maxHeight 而不是 LocalConfiguration.screenHeightDp**：
+                        // 后者是物理屏幕高度，分屏/自由窗口下与本节点实际可用空间无关
+                        // （Lint 的 ConfigurationScreenWidthHeight 告警即此项）；面板会因此
+                        // 被算得比可用空间还大，被顶部顶穿、末尾几行落在卡片外且点不到。
+                        // maxHeight 是**本节点拿到的约束上限**，天然含窗口尺寸与 insets。
+                        //
+                        // **下限 280dp 是必须的**：横屏时可用高度只剩 360–420dp，
                         // 纯 65% 会算出 234–273dp，长队列（几百首）就只能在一条窄缝里滚动。
                         // 280dp 保证横屏下至少露出约 4 行，队列面板仍然可用。
+                        // 下限用 coerceAtMost(maxHeight) 兜一层：极窄分屏（例如 300dp 高）
+                        // 上 280dp 仍然超出可用空间，此时必须服从父约束——宁可面板矮，
+                        // 也不能超出屏幕（超出部分既画不出来、也点不到）。
                         //
                         // **不需要再手写上限**：外层 Column 在测量非 weight 子项时会递减
                         // 剩余空间（把手 4 + 标题 38 已占用，另有 navigationBarsPadding 与
                         // 内边距先行扣减），把「剩余可用高度」作为 mainAxisMax 传给本列。
-                        // 于是横屏极小屏（360dp）上 280dp 会被父约束自动压到约 244dp，
+                        // 于是横屏极小屏上 280dp 会被父约束自动压到约 244dp，
                         // 面板不会被顶穿、也不会被 GlassSurface 的 clip 裁掉。
                         //
                         // 顺序要求：heightIn 必须作用在滚动**视口**上（排在 verticalScroll
@@ -643,8 +691,9 @@ private fun GlassSheetScaffold(
                         // 声明，而父级实际只给得出「此值 − 骨架（navbar+padding+把手+标题）」，
                         // 两者错位导致列表绘制/命中区溢出卡片。所以 `GlassSheetLazy`
                         // 内部会再扣一次骨架（见该函数），这里保持原值不变。
-                        val screenHeight = LocalConfiguration.current.screenHeightDp
-                        val contentMaxHeight = (screenHeight * 0.65f).dp.coerceAtLeast(280.dp)
+                        val contentMaxHeight = (panelAvailableHeight * 0.65f)
+                            .coerceAtLeast(280.dp)
+                            .coerceAtMost(panelAvailableHeight)
                         // 滚动容器由调用方（GlassSheet / GlassSheetLazy）提供，
                         // 这一层只负责「把有界高度传下去」与外壳装饰
                         scrollableContent(contentMaxHeight)
@@ -923,12 +972,39 @@ fun QueueSheet(
             }
             return@GlassSheetLazy
         }
-        // ── 已播放段（懒加载，key = 稳定曲目 id）──
+        // ── 已播放段（懒加载）──
+        //
+        // ## key 为什么是**段内下标**而不是曲目 id（P0 修复）
+        //
+        // 队列**允许重复曲目**：`AppState.playNext / playLast / insertQueueItems`
+        // （AppState.kt 的 playNext/playLast 系列）的 KDoc 明写「重复添加允许」，
+        // 而它们确实会往队列里塞同一首歌的第二份、第三份。旧实现的 key 是
+        // `"played-${song.id}"` / `"upcoming-${queue[queueIndex].id}"` ——
+        // 同一首歌出现两次就得到**两个相同的 key**，LazyColumn 在组合期直接抛
+        // `IllegalArgumentException: Key "played-f/sdcard/a.mp3" was already used`。
+        //
+        // 触发路径很日常，不是边角：
+        // 1. 对同一首歌连点两次「下一首播放」（长按 → 下一首播放 → 再长按 → 仍下一首播放）；
+        // 2. 先播放某张专辑，再对该专辑点「下一首播放全部」——整张专辑的曲目各出现两次。
+        // 随后打开播放队列即崩溃。这是可静态证实的崩溃路径（不是概率问题）。
+        //
+        // ## 为什么不用「id + 出现序号」而直接用下标
+        //
+        // 本面板从行到状态层的**所有**寻址都是下标：`onPick(index)` / `onRemove(index)` /
+        // `onMove(from, to)`，拖拽数学（ReorderableLazyState）也完全是「槽位 = 下标」
+        // 的模型（见该文件的「行数学前提」）。id + 出现序号虽然也能唯一，却会在
+        // 拖拽/插入后让 key 随内容变化 —— 行节点被重建，而落位补间的目标是**槽位**，
+        // 两者语义立刻分叉。下标作为 key 唯一且恒稳定，与既有数学同源。
+        //
+        // 代价（如实记录）：插入/删除中间行时，后续行是「原地换内容」而不是
+        // 「带位移的增删」。但队列编辑本来就是瞬时的列表语义（且拖拽有自己的
+        // settle 补间），这里没有 `Modifier.animateItem()` 依赖 key 位移做动画，
+        // 所以不存在观感回归。
         if (safeIndex > 0) {
             item(key = "played-header") { SectionLabel("已播放 · $safeIndex 首") }
             itemsIndexed(
                 items = queue.take(safeIndex),
-                key = { _, song -> "played-${song.id}" },
+                key = { index, _ -> "played-$index" },
             ) { index, song ->
                 SongRow(song = song, onClick = { onPick(index) })
             }
@@ -982,10 +1058,15 @@ fun QueueSheet(
             }
         }
         // ── 接下来段（可拖拽，懒加载）──
+        //
+        // key = **队内绝对下标**（`queueIndex` 而非段内下标）：本段是「接下来」的
+        // 后半段，插入只会发生在当前曲之后（playNext 系列）或队尾（playLast 系列），
+        // 用队内下标能保证「已播放段 + 接下来段」整份 key 空间不重叠、也不随段长变化。
+        // 为什么不能用曲目 id：同上一段的 KDoc —— 队列允许重复曲目，id 会重复。
         if (upcomingCount > 0) {
             itemsIndexed(
                 items = List(upcomingCount) { safeIndex + 1 + it },
-                key = { _, queueIndex -> "upcoming-${queue[queueIndex].id}" },
+                key = { _, queueIndex -> "upcoming-$queueIndex" },
             ) { upcomingIndex, queueIndex ->
                 SongRow(
                     song = queue[queueIndex],

@@ -55,6 +55,41 @@ internal class DragTouchListener(
                         onParamsChanged(lp)
                     }
                 }
+                /**
+                 * 抬手：补一次 `performClick()`（P2 无障碍修复）。
+                 *
+                 * ## 为什么必须有这一句
+                 *
+                 * Lint 的 `ClickableViewAccessibility` 检查要求：**凡是挂了
+                 * `setOnTouchListener` 的 View，都应当在处理完手势后调用
+                 * `performClick()`**。原因是 `onTouch` 一旦返回 true 就完全接管了
+                 * 触摸，`View.performClick()` 再也不会有机会被系统调用——而这正是
+                 * 无障碍服务（TalkBack / 单开关扫描 / 无障碍自动化）**派发点击**的唯一通道。
+                 *
+                 * 也就是说，缺了这一句的后果不是「少一次反馈」，而是：读屏用户
+                 * 停在这块悬浮歌词上时，双击**什么都不会发生**，且没有任何替代路径
+                 * （悬浮窗不在 Compose 树里，没有语义节点可走）。
+                 *
+                 * ## 为什么不是 ACTION_DOWN 就调
+                 *
+                 * 那会让「想拖动」的那次按下同时触发一次点击。判据用 ACTION_UP +
+                 * 位移未超阈值：抬手时若手指几乎没动，这次手势就是**点击**而不是拖动；
+                 * 真的拖过（超过 TOUCH_SLOP）就只做拖动，不发点击。
+                 *
+                 * 副作用：本类目前没有点击行为（歌词行点击展开 App 是第二版的事，
+                 * 见类 KDoc），所以 performClick 只会走到 View 的默认实现
+                 * （若外面挂了 OnClickListener 则被调用）。这是**有意**的：
+                 * 补的是「通道存在」这件事本身，而不是现在就给它一个动作。
+                 * 将来接点击时，只需 setOnClickListener，不必再回来改这里。
+                 */
+                MotionEvent.ACTION_UP -> {
+                    val dx = (event.rawX - downRawX).toInt()
+                    val dy = (event.rawY - downRawY).toInt()
+                    if (dx * dx + dy * dy < TOUCH_SLOP_PX * TOUCH_SLOP_PX) {
+                        runCatching { v.performClick() }
+                            .onFailure { Log.w(TAG, "performClick failed", it) }
+                    }
+                }
             }
         } catch (t: Throwable) {
             // 触摸回调跑在 system_server 派发链上，抛异常会连带桌面一起炸——全部兜住

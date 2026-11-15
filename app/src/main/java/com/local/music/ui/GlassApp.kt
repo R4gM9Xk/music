@@ -196,6 +196,10 @@ fun GlassApp(
         if (state.screen != GlassScreen.Player) {
             // 不走共享元素飞行：从通知进来是**冷进入**，迷你条可能还没测量出 rect，
             // 飞行会以 awaitRects 超时收场（600ms 后硬切）——那一段等待比直接进更糟。
+            //
+            // 返回值不看：上面的 `hasSongs` 判据与 openPlayer 的守卫同源（都是队列非空），
+            // 这里必然为 true。留一个 Boolean 返回值是给「散在 UI 侧的调用点」用的守卫，
+            // 本处的两条前置条件已经覆盖它。
             state.openPlayer()
         }
     }
@@ -451,12 +455,24 @@ fun GlassApp(
         // C4：播放现场的服务端副本（进程被杀后 onPlaybackResumption 靠它恢复）。
         // 切 IO 线程写：scheduleSave 由 tick 每 5s 调用，同步写会卡 UI；
         // 用单线程串行执行器保证「后写的覆盖先写的」，不会出现乱序写
-        state.queueStateWriter = { specs, index, positionSec ->
+        state.queueStateWriter = { specs, index, positionSec, settings ->
             // runCatching：executor 可能在 dispose 后已被 shutdown（queueStateWriter 的解绑
             // 与 shutdown 之间仍有一个极窄窗口），此处兜底避免抛到 UI 线程
             runCatching {
                 queueStateExecutor.execute {
-                    QueueStateStore.write(context, specs, index, positionSec)
+                    QueueStateStore.write(
+                        context,
+                        specs,
+                        index,
+                        positionSec,
+                        // 播放模式 + 音效（P2 修复）：服务端续播时没有 AppState，
+                        // 必须能从这份现场里重建，否则随机/循环/变速/EQ 全回默认值
+                        shuffleOn = settings.shuffleOn,
+                        repeatMode = settings.repeatMode,
+                        playbackSpeed = settings.playbackSpeed,
+                        eqPreset = settings.eqPreset,
+                        audioFx = settings.audioFx,
+                    )
                 }
             }
         }
@@ -1044,8 +1060,20 @@ fun GlassApp(
         }
     }
 
-    // 返回键：模态面板优先关闭 → 详情回来源页 → 播放页逆向飞行收起 → 其余回曲库
-    // （曲库页面板开着时也要拦截：否则返回直接穿透 finish 掉 Activity）
+    // 返回键：模态面板优先关闭 → 详情回来源页 → 播放页逆向飞行收起 → **设置二级页退一层**
+    // → 其余回曲库（曲库页面板开着时也要拦截：否则返回直接穿透 finish 掉 Activity）
+    //
+    // ## 设置二级页为什么必须在**这里**兜（P1 修复）
+    //
+    // 设置页的分组层级（首页 → 外观/播放/曲库/数据/关于 → 支持开发者）过去是
+    // `feature:settings` 内部的 `rememberSaveable`，而本 BackHandler 在 :app 模块，
+    // **看不到那个局部状态**。于是「设置 → 外观 → 系统返回」会一路落到 `else` 分支，
+    // 把 screen 打回 Library：用户被弹出设置页，跳过了设置首页这一层。
+    //
+    // 本轮已把这一层导航态提升到 AppState（`settingsGroup` / `settingsReturnGroup`，
+    // 见 `backInSettings()` 的 KDoc），于是这里可以问一句「设置页还有下级可以退吗」。
+    // 顺序放在 Player 之后、else 之前是刻意的：设置页是 tab 页，不存在「盖在别的页之上」
+    // 的关系，所以只要 screen == Settings 且还有下级页，返回键就属于下级页。
     BackHandler(enabled = state.screen != GlassScreen.Library || modalState.isOpen) {
         when {
             modalState.isOpen -> modalState.requestDismiss()
@@ -1053,6 +1081,9 @@ fun GlassApp(
             // 播放页收起走 closePlayer（回 playerOrigin），而不是飞行算出的 entrySource：
             // 覆盖层模型下「来源页」由 AppState 单点持有，两者语义相同但前者永远正确
             state.screen == GlassScreen.Player -> flight.beginExit(state.currentSong) { state.closePlayer() }
+            // 设置页：有二级/三级页就先退一层（返回 true 表示已消费），
+            // 已在设置首页则落回 else 的「设置 → 曲库」既有链路
+            state.screen == GlassScreen.Settings && state.backInSettings() -> Unit
             else -> state.screen = GlassScreen.Library
         }
     }
@@ -1115,6 +1146,10 @@ fun GlassApp(
             palette = state.palette,
             isDark = state.themeMode == ThemeMode.Dark,
             glassIntensity = state.glassLevel,
+            // 视觉风格（快照 v12）：玻璃 = 半透明 + haze 真模糊；拟物 = 不透明贴面 + 斜面 + 投影。
+            // 这是**材质语言**级的开关，不是玻璃强度那一维的另一档——后者只调玻璃的浓度，
+            // 本参数决定「用的还是不是玻璃」。两者正交，故各自独立下发。
+            visualStyle = state.visualStyle,
         ) {
             val appHazeState = rememberHazeState()
             // 真曲库无封面占位走极光派生色；演示内容保留设计稿色（R8 #10/#11）
@@ -1358,6 +1393,34 @@ fun GlassApp(
                                         onCheckUpdate = updateManager::check,
                                         onStartUpdate = updateManager::startUpdate,
                                         onInstallUpdate = updateManager::install,
+                                        /**
+                                         * 更新验签失败时的唯一出路（P2 修复）。
+                                         *
+                                         * 验签失败意味着「下载到的 APK 与本机已装应用的签名不一致」，
+                                         * 重试必然拿到同一份坏字节 → 再失败，所以不能给「重试」。
+                                         * 正确的出口是让用户去发布页手动下载安装（需先卸载旧版）。
+                                         * 这一行过去**有按压反馈、有按钮语义，点了却什么都不做**
+                                         * （onClick 的 when 里 Verify 分支是空实现）——
+                                         * 一个承诺了出口却没有出口的死行。
+                                         *
+                                         * 这里接上发布页：用浏览器打开 GitHub 仓库的 releases 页。
+                                         * 为什么不用应用内 WebView：多引一个组件只为跳一次外链，
+                                         * 而系统浏览器本来就有下载管理与「安装未知应用」的既有流程。
+                                         */
+                                        onOpenReleasePage = {
+                                            val opened = runCatching {
+                                                context.startActivity(
+                                                    Intent(
+                                                        Intent.ACTION_VIEW,
+                                                        Uri.parse(RELEASE_PAGE_URL),
+                                                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                                )
+                                                true
+                                            }.getOrDefault(false)
+                                            if (!opened) {
+                                                ioMessage = "未能打开浏览器，请手动访问 $RELEASE_PAGE_URL"
+                                            }
+                                        },
                                         allFilesGranted = allFilesGranted,
                                         onAllFilesAccess = {
                                             if (allFilesGranted) {
@@ -1506,19 +1569,37 @@ fun GlassApp(
                                     }
                                 },
                                 onOpenPlayer = {
-                                    val navSelected = when (baseScreen) {
-                                        GlassScreen.Playlist -> 1
-                                        GlassScreen.Settings -> 2
-                                        else -> 0
-                                    }
-                                    // 忙时兜底直切（同 PlaylistDetailScreen）：飞行中不重入共享元素动画。
-                                    // **必须先 abort()**：只改 screen 的话，正在跑的 exitJob 尾部仍会
-                                    // navigate(目标屏)，用户落进播放页后被弹回曲库（约 100-225ms 后）。
-                                    if (flight.isActive) {
-                                        flight.abort()
-                                        state.openPlayer()
-                                    } else {
-                                        flight.beginEntry(state.currentSong, navSelected, { state.openPlayer() }, baseScreen)
+                                    // **空队列必须整体拦在飞行之前**（P1 修复）。
+                                    //
+                                    // `GlassChrome` 的 hasSongs 只挡住了迷你条里的「播放/下一首」
+                                    // 两个按钮，**整条迷你条的点击没有门控**。于是音频权限被拒 /
+                                    // 曲库为空时点迷你条，会进入一个「占位播放页」：标题写「暂无歌曲」，
+                                    // 舞台是占位封面，播放/上一首/下一首/收藏/进度条全部点了没反应
+                                    // （它们各自内部都有 hasSongs 守卫）。
+                                    //
+                                    // 拦截点必须在**起飞之前**而不是只靠 openPlayer 的返回值：
+                                    // beginEntry 会立刻启动 500ms 共享元素飞行，而 openPlayer 此刻
+                                    // 拒绝切屏 —— 用户看到一次「飞起来了又落回原处」，比什么都不发生更糟。
+                                    // openPlayer() 自身的守卫仍然保留（见其 KDoc：它是唯一切屏入口，
+                                    // 散在 UI 侧的补丁漏一处就复发），这里是第二道、也是体验更好的一道。
+                                    if (state.hasSongs) {
+                                        val navSelected = when (baseScreen) {
+                                            GlassScreen.Playlist -> 1
+                                            GlassScreen.Settings -> 2
+                                            else -> 0
+                                        }
+                                        // 忙时兜底直切（同 PlaylistDetailScreen）：飞行中不重入共享元素动画。
+                                        // **必须先 abort()**：只改 screen 的话，正在跑的 exitJob 尾部仍会
+                                        // navigate(目标屏)，用户落进播放页后被弹回曲库（约 100-225ms 后）。
+                                        if (flight.isActive) {
+                                            flight.abort()
+                                            state.openPlayer()
+                                        } else {
+                                            flight.beginEntry(
+                                                state.currentSong, navSelected,
+                                                { state.openPlayer() }, baseScreen,
+                                            )
+                                        }
                                     }
                                 },
                                 onPlayPause = state::togglePlayPause,
@@ -1737,6 +1818,16 @@ private val TAB_SCREENS = setOf(GlassScreen.Library, GlassScreen.Playlist, Glass
 
 /** 播放页升起时下层后退缩放：Chrome 在播放页打开期间也被缩放（退出飞行端点还原用） */
 private const val RecedeScale = 0.96f
+
+/**
+ * 发布页地址（应用内更新验签失败时的唯一出路）。
+ *
+ * 与 `UpdateManager` 的三链分发（gh-proxy → raw → jsDelivr）不同：这里只是**用浏览器
+ * 打开一个给人看的页面**，所以直接用 github.com 的仓库地址，不走代理、也不需要
+ * HTTP 客户端。仓库地址与 UpdateManager 的 MANIFEST_URLS 同源（R4gM9Xk/music），
+ * 改仓库时要一起改——两处都指向同一个项目的两个用途（机器读的清单 / 人看的页面）。
+ */
+private const val RELEASE_PAGE_URL = "https://github.com/R4gM9Xk/music/releases"
 
 /**
  * 顶部单条玻璃提示（IO 结果 / 播放错误 / 备份恢复报告共用）：样式单点定义，避免多条各写

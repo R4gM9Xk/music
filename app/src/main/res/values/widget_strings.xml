@@ -12,4 +12,13 @@
     <!-- 小部件自身名称（部分 ROM 的选择器标题用这个名字） -->
     <string name="widget_label_wide">音乐播放条</string>
     <string name="widget_label_square">音乐封面</string>
+    <!-- 小部件按钮/封面的无障碍描述（P2 修复：Lint HardcodedText）
+         原来这四个 contentDescription 是**硬编码中文写死在 layout 里**的：
+         ① 违反 Lint HardcodedText（8 处 warning）；
+         ② 中文用户以外的人用读屏时，会听到中文——而布局本身没有语言切换能力。
+         抽到资源后由 values-en 提供英文，与 App 内其它无障碍文案同源。 -->
+    <string name="widget_desc_cover">专辑封面</string>
+    <string name="widget_desc_prev">上一首</string>
+    <string name="widget_desc_play_pause">播放或暂停</string>
+    <string name="widget_desc_next">下一首</string>
 </resources>

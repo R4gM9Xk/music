@@ -423,42 +423,65 @@ fun CollectionActionsSheet(
     // 与 SongActionsSheet 同一套机制，理由见 SystemActions.kt 的 KDoc
     val sys = LocalSystemActions.current
     GlassSheet(visible = visible && !showRename && !showDeleteConfirm, onDismiss = onDismiss, title = title) {
-        SheetAction(
-            icon = GlassIcons.Play,
-            label = "全部播放",
-            subtitle = "${tracks.size} 首",
-            onClick = {
-                onDismiss()
-                onPlayAll(false)
-            },
-        )
-        SheetAction(
-            icon = GlassIcons.Shuffle,
-            label = "随机播放",
-            subtitle = "从随机一首开始",
-            onClick = {
-                onDismiss()
-                onPlayAll(true)
-            },
-        )
-        SheetAction(
-            icon = GlassIcons.PlayNext,
-            label = "下一首播放全部",
-            subtitle = "${tracks.size} 首插到当前曲之后",
-            onClick = {
-                state.playNextAll(tracks)
-                onDismiss()
-            },
-        )
-        SheetAction(
-            icon = GlassIcons.PlayLast,
-            label = "最后播放全部",
-            subtitle = "${tracks.size} 首追加到队尾",
-            onClick = {
-                state.playLastAll(tracks)
-                onDismiss()
-            },
-        )
+        // ── 0 首集合：**不渲染任何播放动作**（P2 修复）──
+        //
+        // 旧实现无条件渲染「全部播放 / 随机播放 / 下一首播放全部 / 最后播放全部」四行，
+        // 副标题还一本正经地写「0 首」。实际行为：
+        // - 全部播放/随机播放：`playCollection(空表)` 内部 `if (tracks.isEmpty()) return`
+        //   静默什么都不做（连面板都会因为先 onDismiss 而关掉），用户视角是「点了没反应」；
+        // - 下一首/最后播放全部：`insertQueueItems` 过滤后为空也直接 return，同样无反应。
+        //
+        // 而 0 首歌单在真实使用里并不罕见：新建歌单后长按卡片（LibraryScreen 的
+        // EmptyPlaylistCard 的 onLongClick 就传 `playlist.tracks`，那时恒为空）。
+        //
+        // 取舍：把四行播放动作**整体隐藏**，而不是置灰。置灰要求用户理解「为什么灰」，
+        // 而这四行此刻没有任何可表达的意义；隐藏在菜单里也不会造成布局困惑
+        // （面板按内容测高）。改为在面板顶部给一条说明，让用户知道还能做什么。
+        if (tracks.isEmpty()) {
+            Text(
+                "这个歌单还没有歌曲 · 先在详情页添加，再回来播放",
+                color = LocalGlassColors.current.textTertiary,
+                style = GlassText.Body,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = S.Gap8.dp),
+            )
+        } else {
+            SheetAction(
+                icon = GlassIcons.Play,
+                label = "全部播放",
+                subtitle = "${tracks.size} 首",
+                onClick = {
+                    onDismiss()
+                    onPlayAll(false)
+                },
+            )
+            SheetAction(
+                icon = GlassIcons.Shuffle,
+                label = "随机播放",
+                subtitle = "从随机一首开始",
+                onClick = {
+                    onDismiss()
+                    onPlayAll(true)
+                },
+            )
+            SheetAction(
+                icon = GlassIcons.PlayNext,
+                label = "下一首播放全部",
+                subtitle = "${tracks.size} 首插到当前曲之后",
+                onClick = {
+                    state.playNextAll(tracks)
+                    onDismiss()
+                },
+            )
+            SheetAction(
+                icon = GlassIcons.PlayLast,
+                label = "最后播放全部",
+                subtitle = "${tracks.size} 首追加到队尾",
+                onClick = {
+                    state.playLastAll(tracks)
+                    onDismiss()
+                },
+            )
+        }
         if (target.kind == DetailTarget.Kind.Playlist && target.id.startsWith("user-")) {
             SheetAction(
                 icon = GlassIcons.Edit,
@@ -539,11 +562,32 @@ fun CollectionActionsSheet(
             onClick = { commitRename() },
         )
     }
-    // P2-③ 删除确认子面板：标题区写明「不可撤销」与受影响曲目数，确认行才真正删除。
+    // P2-③ 删除确认子面板：标题区写明影响与受影响曲目数，确认行才真正删除。
     // 与重命名面板同构（同一 GlassSheet 容器、同一 showXxx 布尔互斥），不引新模态机制。
+    //
+    // ## 文案必须区分「不可撤销」与「可恢复」（P2 修复）
+    //
+    // 旧文案对**所有**歌单一律写「此操作不可撤销」。而对**内建歌单**这是假话：
+    // `AppState.deletePlaylist` 对内建歌单走的是「加进 hiddenBuiltInPlaylists 隐藏集」，
+    // 曲目关系（addedTracks 里的叠加层）与基座都原样保留，用户在
+    // 设置页的「恢复内置歌单」（`restoreBuiltInPlaylists()`）一键就能全部找回来。
+    // 用户自建歌单才是真删（userPlaylists 里移除 + addedTracks 一并清除）。
+    //
+    // 为什么值得区分：确认弹窗的文案是**唯一**一次向用户说明后果的机会。把「可恢复」
+    // 说成「不可撤销」，等于让用户因为害怕而不敢删除，或者反之在真删时以为还能找回。
+    // 两种误判都比多写一个 `if` 贵。
+    val isBuiltInPlaylist = target.kind == DetailTarget.Kind.Playlist &&
+        DemoCatalog.playlist(target.id) != null
     GlassSheet(visible = visible && showDeleteConfirm, onDismiss = onDismiss, title = "删除歌单") {
         Text(
-            "「$title」将从歌单列表移除，歌单内的 ${tracks.size} 首曲目关系一并清除，此操作不可撤销。",
+            if (isBuiltInPlaylist) {
+                // 内建歌单：隐藏语义，说明恢复路径在哪
+                "「$title」将从歌单列表隐藏（歌单内的 ${tracks.size} 首曲目关系保留）。" +
+                    "可在「设置 → 曲库 → 恢复内置歌单」随时找回。"
+            } else {
+                // 用户自建歌单：真删，明确不可撤销
+                "「$title」将被永久删除，歌单内的 ${tracks.size} 首曲目关系一并清除，此操作不可撤销。"
+            },
             color = LocalGlassColors.current.textSecondary,
             style = GlassText.Body,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = S.Gap8.dp),
@@ -551,11 +595,12 @@ fun CollectionActionsSheet(
         Spacer(Modifier.height(4.dp))
         SheetAction(
             icon = GlassIcons.Trash,
-            label = "确认删除",
+            // 确认行的动词也随语义切换：隐藏 vs 删除。用户落指前最后读到的就是这四个字
+            label = if (isBuiltInPlaylist) "确认隐藏" else "确认删除",
             subtitle = "「$title」· ${tracks.size} 首",
-            // A4：这是全 App 唯一的「真正执行销毁」动作——不可撤销、清空整张歌单的
-            // 曲目关系。它是破坏性语义的**终点**，必须与上面的「删除歌单」入口同一
-            // 视觉语言，否则用户看到的是一路中性灰直到最后一击。
+            // A4：这是「真正执行销毁」动作的终点（对自建歌单）——不可撤销、清空整张歌单的
+            // 曲目关系；对内建歌单是「隐藏」，风险低但仍用同一视觉语言保持「这一步不一样」
+            // 的一致性（用户不该需要先判断这张歌单是内建还是自建，才知道红色意味着什么）。
             destructive = true,
             onClick = {
                 state.deletePlaylist(target.id)
