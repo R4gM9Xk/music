@@ -50,6 +50,7 @@ import com.local.music.core.ui.components.GlassNavBar
 import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.components.PlayerFlight
 import com.local.music.core.ui.components.drawLiquidGlass
+import com.local.music.core.ui.components.glassVeil
 import com.local.music.core.ui.components.liquidFill
 import com.local.music.core.ui.components.liquidGlassBrushes
 import com.local.music.core.ui.components.liquidHazeTint
@@ -452,7 +453,7 @@ fun PlayerFlightOverlay(
  *   26→20 插值在落地端反而与真身差 6dp——这是**实打实的端点错误**，不是观感差异。
  *   半径固定后，飞行中真正随 t 变的只剩 tint，`HazeStyle` 仍每帧重建一次（haze 1.6
  *   的 API 天花板，样式对象只能在组合期构造），代价已收到最小；
- * - **scrim**：迷你条真身带 chromeScrim（透字压制），控制台没有——随 t 淡到透明；
+ * - **内衬（veil）**：迷你条真身带 glassVeil（通透玻璃），控制台没有——随 t 淡到透明；
  * - **描边 + 顶线**：Hi 独家装饰，alpha 随 t 淡出（Liquid 不画这两层）；
  * - **方向性斜面 + specular**：alpha 随 t 淡入，t=1 时与真身共用 `liquidGlassBrushes` /
  *   `drawLiquidGlass`（同一套笔刷与绘制顺序）。specular 的 motion 取播放进度，与真身
@@ -479,6 +480,9 @@ private fun FlightGlassPanel(
     // 仅有的组合期 t 读取：haze 样式参数（见上）
     val t = tAt()
     val tint = lerp(glass.hi, liquidHazeTint(glass, palette), t)
+    // 迷你条真身的玻璃内衬（glassVeil）：替身起点必须与真身同源，随 t 淡到透明
+    // （落点控制台无内衬）。在组合期取值，绘制期只做 lerp。
+    val veil = glassVeil()
     Box(
         modifier
             .clip(FlightPanelShape)
@@ -512,8 +516,8 @@ private fun FlightGlassPanel(
                     val t2 = tAt()
                     // 无 haze 退化路径才补填充（有 haze 时填充交给 tint）
                     if (hazeState == null) drawRect(lerp(glass.hi, glass.liquidFill, t2))
-                    // 迷你条专属 scrim 随 t 淡出（落点在 haze 结果之上、描边/装饰之下）
-                    drawRect(lerp(glass.chromeScrim, Color.Transparent, t2))
+                    // 迷你条专属内衬（veil）随 t 淡出（落点在 haze 结果之上、描边/装饰之下）
+                    drawRect(lerp(veil, Color.Transparent, t2))
                     // 1px 常规描边：Hi 专属，随 t 淡出（Liquid 不画均匀描边）
                     drawRoundRect(
                         color = glass.strokeSoft,

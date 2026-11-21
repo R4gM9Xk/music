@@ -1,9 +1,9 @@
 {
-  "versionCode": 7,
-  "versionName": "1.3.0",
-  "changelog": "新增拟物风皮肤（设置 → 外观 → 视觉风格）与「支持开发者」页；修复队列重复歌曲崩溃、空歌单误进播放页、定时关闭在循环/随机下失效、设置二级页返回异常；搜索补齐艺术家结果与历史清空，续播恢复播放模式与音效；升级不丢数据（快照 v12 / 续播 v2 向后兼容）。",
+  "versionCode": 8,
+  "versionName": "1.3.1",
+  "changelog": "优化底部玻璃通透质感，与播放队列面板统一；修复若干观感细节。",
   "apk": "https://gh-proxy.com/https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
   "apkMirror": "https://ghfast.top/https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
   "apkAlt": "https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
-  "sha256": "1da641670a7fa52df657c098c9a6c4e88c4cae1dcba0cbf18d54d67a1b645b2c"
+  "sha256": "e726845063f406a5d10331dc5df912060181d5eed0b75aa057031ee7ead8c53c"
 }

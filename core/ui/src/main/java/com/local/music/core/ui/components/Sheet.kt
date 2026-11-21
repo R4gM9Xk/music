@@ -55,7 +55,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
@@ -76,7 +75,6 @@ import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.LocalGlassColors
-import com.local.music.core.ui.theme.LocalThemeFraction
 import com.local.music.core.ui.theme.auroraAccentColor
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
@@ -614,14 +612,10 @@ private fun GlassSheetScaffold(
                     shape = RoundedCornerShape(topStart = R.Player28.dp, topEnd = R.Player28.dp),
                     blur = GlassLevel.Md,
                 ) {
-                    // 模态面板是最高层级：在玻璃压底之上再加一层近不透明内衬（深浅主题各配，
-                    // 浅色黑衬会蒙灰、压不住背景透入）。A1-03：按主题进度连续插值，
-                    // 旧实现按 LocalIsDark 阈值黑白硬切，主题渐变中点面板衬底「啪」一下变色
-                    val veil = lerp(
-                        Color.Black.copy(alpha = 0.32f),
-                        Color.White.copy(alpha = 0.62f),
-                        LocalThemeFraction.current,
-                    )
+                    // 模态面板是最高层级：在玻璃压底之上再加一层内衬（深浅主题各配，
+                    // 浅色黑衬会蒙灰、压不住背景透入）。与底部 chrome 共用 glassVeil，
+                    // 按主题进度连续插值，避免主题渐变中点衬底「啪」一下变色。
+                    val veil = glassVeil()
                     // 可用高度已在 GlassSurface 之前接成 panelAvailableHeight（见那里），
                     // 这里不再碰 maxHeight —— 本 lambda 的隐式接收者是 BoxScope 而非
                     // BoxWithConstraintsScope，读它会编译失败。

@@ -25,6 +25,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.graphicsLayer
@@ -39,6 +40,7 @@ import com.local.music.core.ui.theme.GlassColors
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.LocalSkeuomorphColors
+import com.local.music.core.ui.theme.LocalThemeFraction
 import com.local.music.core.ui.theme.LocalVisualStyle
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.SkeuoElevation
@@ -105,6 +107,24 @@ internal fun GlassColors.fill(level: GlassLevel): Color = when (level) {
  * 「任何一层差一档」。所以配方只留这一份，替身读它而不是复制 0.35f。
  */
 val GlassColors.liquidFill: Color get() = fill(GlassLevel.Liquid)
+
+/**
+ * 玻璃面板的统一「内衬」(veil)：深色压黑、浅色提白，按主题进度连续插值。
+ *
+ * 队列面板与底部 chrome（迷你条 / 导航）共用这一份配方，保证「悬浮玻璃」与「面板玻璃」
+ * 读作同一种材质。它叠在 haze 模糊结果之上、内容之下，只压背景透入、不影响自身文字。
+ * 比 chromeScrim 轻得多——背后模糊内容会透出来，这正是通透玻璃感的来源；
+ * 代价是滚动列表的透字会隐约可见（雾里的轮廓），属有意取舍。
+ *
+ * 单一来源：真身（[GlassSurface] 的 scrim 入参）与飞行替身（FlightGlassPanel）都读它，
+ * 避免「改一处忘另一处」的端点漂移。
+ */
+@Composable
+fun glassVeil(): Color = lerp(
+    Color.Black.copy(alpha = 0.32f),
+    Color.White.copy(alpha = 0.62f),
+    LocalThemeFraction.current,
+)
 
 /**
  * 液态档装饰的笔刷集：只在 `drawWithCache` 的 cache 块里构造一次，绘制期帧间复用。
