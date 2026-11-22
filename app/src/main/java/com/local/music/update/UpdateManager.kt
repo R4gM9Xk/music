@@ -118,6 +118,12 @@ class UpdateManager(
                 // Failed 误判成「下载失败 → 可重试」而实际是检查失败。
                 // 这里显式清空，让 pendingInfo 的生命周期 = 「当前 state 是 Available」这一条。
                 if (info == null || info.versionCode <= currentVersionCode()) pendingInfo = null
+                // ── 清理与本次目标版本不符的残留包（P0 修复）──
+                //
+                // 检查更新是「用户表达了要更新的意图」的第一个时机，在这里清掉旧包最自然：
+                // 否则磁盘上那个上一次没装成的包会一直留着，直到 install() 才发现版本不符。
+                // 判据用 versionCode 严格相等（见 pendingApkMatches 的 KDoc）。
+                if (info != null) pruneStaleApk(info)
             } finally {
                 // 必须无条件释放：fetchManifest 内部是 runCatching 兜底的，但「协程被取消」
                 // 同样会走到这里——漏放会让本次进程内再也无法检查更新
@@ -248,6 +254,71 @@ class UpdateManager(
         install()
     }
 
+    /**
+     * 校验磁盘上的待装 APK 是不是**本次要装的那个版本**（P0 修复，2026-11-22 真机反馈）。
+     *
+     * ## 这个缺陷是怎么被发现的
+     *
+     * 用户装 v1.3.2 时，系统安装器弹出「已安装相同版本『音乐(1.3.1)』」——即装的是一个
+     * **1.3.1 的包**，而清单里写的是 1.3.2。
+     *
+     * ## 根因
+     *
+     * [apkFile] 是 `filesDir/update/app-update.apk`，它**跨进程、跨版本一直存在**：
+     * - 上一次更新（1.3.1）下载完、拉起安装器，但被系统「安装未知应用」权限拦住；
+     * - 代码把状态置为 [UpdateUiState.Status.ReadyToInstall] + `awaitingInstallPermission`，
+     *   跳去授权页；用户退出后**状态丢了、文件留在磁盘上**；
+     * - 新版发布后，设置页再次进入 ReadyToInstall（或用户点「安装已下载的更新」），
+     *   [install] 只判 `apkFile.isFile` 就把它交给了安装器。
+     *
+     * 也就是说：**磁盘上的文件与当前 pendingInfo 之间没有任何一致性校验**。
+     * sha256 只在下载完成那一刻验过一次，之后这个文件就再没人管过。
+     *
+     * ## 修法
+     *
+     * 安装前读 APK 清单里的 versionCode，必须**严格等于** [UpdateInfo.versionCode]：
+     * - 相等 → 放行（这才是本次要装的包）；
+     * - 不等或读不出 → 删除该文件 + 清 pendingInfo，让 UI 回到「需要重新下载」，
+     *   而不是把旧包塞给安装器（那会让用户看到「已安装相同版本」这种莫名其妙的提示）。
+     *
+     * ## 为什么不直接比 sha256
+     *
+     * sha256 要整文件读一遍（5.9MB），在拉起安装器这条主线程路径上不值当；
+     * 而 `getPackageArchiveInfo` 只读 AndroidManifest，是系统提供的廉价元数据查询。
+     * 真正防篡改的仍然是 [verifyApkSignature]（签名校验），本函数防的是**版本错配**——
+     * 两者职责不同，缺一不可。
+     */
+    private fun pendingApkMatches(info: UpdateInfo): Boolean = runCatching {
+        val archive = context.packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0)
+            ?: return@runCatching false
+        archive.versionCode == info.versionCode
+    }.getOrDefault(false)
+
+    /**
+     * 清理磁盘上与 [info] 目标版本不符的残留安装包（P0 修复，2026-11-22）。
+     *
+     * 只在「检查更新拿到清单」这个时机调用，职责单一：把 `filesDir/update/` 里那个
+     * 上一次没装成、且版本已对不上的包删掉。
+     *
+     * 为什么值得单独做一次（而不是只靠 [install] 的拦截）：
+     * - 用户点了「检查更新」说明他**现在想更新**，此刻清掉旧包不会造成任何困扰；
+     * - 若只在 install 时拦，用户会先看到一次「版本不符，请重新检查」的错误，
+     *   多一次无谓的往返。
+     *
+     * 失败静默：删不掉（文件被占用等）不该阻断检查流程，install 那一步仍有兜底拦截。
+     */
+    private fun pruneStaleApk(info: UpdateInfo) {
+        runCatching {
+            if (!apkFile.isFile) return@runCatching
+            if (pendingApkMatches(info)) return@runCatching
+            android.util.Log.w(
+                "UpdateManager",
+                "pruning stale update apk (target versionCode=${info.versionCode})",
+            )
+            apkFile.delete()
+        }
+    }
+
     /** 拉起系统安装器（已下载即可反复调用）；未授权时跳授权页 */
     fun install() {
         if (!apkFile.isFile) {
@@ -255,6 +326,30 @@ class UpdateManager(
                 status = UpdateUiState.Status.Failed,
                 message = "安装包已丢失，请重新下载",
                 failStage = UpdateUiState.FailStage.Install, // P2-25：包丢了要重下，与验签失败（不许重试）区分
+            )
+            return
+        }
+        // ── 版本一致性校验（P0 修复）──
+        //
+        // 必须**先于**签名校验：签名校验只回答「这个包是不是本 App 签的」，
+        // 而旧版本包当然也是本 App 签的（同一证书）——签名校验对它必然通过，
+        // 于是旧包会被顺利安装，用户看到「已安装相同版本」。
+        //
+        // pendingInfo 为 null 时（理论上不该发生：install 只在 Available/ReadyToInstall
+        // 后由 UI 触发）不做拦截，退回旧行为——不能因为缺少元数据就让用户彻底装不了。
+        val info = pendingInfo
+        if (info != null && !pendingApkMatches(info)) {
+            android.util.Log.w(
+                "UpdateManager",
+                "pending apk version mismatch: expected ${info.versionCode}, file is not that version; deleting",
+            )
+            runCatching { apkFile.delete() }
+            pendingInfo = null
+            state = state.copy(
+                status = UpdateUiState.Status.Failed,
+                message = "安装包版本不符，已删除，请重新检查更新",
+                failStage = UpdateUiState.FailStage.Install,
+                awaitingInstallPermission = false,
             )
             return
         }
