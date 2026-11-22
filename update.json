@@ -1,9 +1,9 @@
 {
-  "versionCode": 9,
-  "versionName": "1.3.2",
-  "changelog": "界面重设计：拟物与玻璃双材质重做，底部合并为统一控制底座，支持详情逐级返回",
+  "versionCode": 10,
+  "versionName": "1.3.3",
+  "changelog": "修复：更新时可能安装残留的旧版本包，现改为校验版本一致后再安装",
   "apk": "https://gh-proxy.com/https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
   "apkMirror": "https://ghfast.top/https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
   "apkAlt": "https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
-  "sha256": "9698454c04fa9d1c28132d63fc274daa5caeb07541c74d1557f5d6532b852140"
+  "sha256": "3cd4fc2d2f06a16dd9b2eaee08482ad25f103b4ca7f0f1059b978be8d5f41970"
 }
