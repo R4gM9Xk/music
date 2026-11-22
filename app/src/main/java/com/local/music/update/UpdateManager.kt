@@ -200,18 +200,31 @@ class UpdateManager(
         )
         scope.launch {
             try {
-                val downloaded = withContext(Dispatchers.IO) { downloadApk(info) }
-                when {
-                    downloaded != null -> {
+                val outcome = withContext(Dispatchers.IO) { downloadApk(info) }
+                when (outcome) {
+                    DownloadOutcome.Success -> {
                         state = state.copy(status = UpdateUiState.Status.ReadyToInstall, indeterminate = false)
                         install()
                     }
-                    else -> state = state.copy(
+                    // 网络失败：重试有意义（换个时间点源可能恢复）
+                    DownloadOutcome.NetworkFailure -> state = state.copy(
                         status = UpdateUiState.Status.Failed,
-                        message = "网络异常或下载中断",
+                        message = "下载失败：更新源暂时不可用，请稍后重试",
                         failStage = UpdateUiState.FailStage.Download, // P2-25：真·下载失败
                         indeterminate = false,
                     )
+                    // 校验失败：重试同一个清单必然再失败（清单与 APK 缓存不同步），
+                    // 所以文案要指向「重新检查」而不是「重试」，并清掉 pendingInfo
+                    // 让用户下一次必须重新拉清单（新清单可能已指向一致的一对）。
+                    DownloadOutcome.ChecksumMismatch -> {
+                        pendingInfo = null
+                        state = state.copy(
+                            status = UpdateUiState.Status.Failed,
+                            message = "更新源缓存未同步（清单与安装包版本不一致）",
+                            failStage = UpdateUiState.FailStage.Checksum,
+                            indeterminate = false,
+                        )
+                    }
                 }
             } finally {
                 // 必须无条件复位：异常/取消路径漏放会让本次进程内再也无法重新下载
@@ -464,6 +477,23 @@ class UpdateManager(
         val sha256: String?,
     )
 
+    /**
+     * 下载结果（2026-11-22 新增）：把「网络连不上」与「下到了但校验不过」分开。
+     *
+     * 为什么要分：真机复现的失败是 jsDelivr 的清单与 APK 缓存不同步
+     * （清单写 v1.3.2 / APK 实际 v1.3.3），下载完全成功、只是 sha256 对不上。
+     * 旧实现把它报成「网络异常」，用户会反复重试同一个必然失败的动作。
+     */
+    private enum class DownloadOutcome {
+        Success,
+
+        /** 所有源都连不上 / 传输中断：重试有意义 */
+        NetworkFailure,
+
+        /** 有源下载成功但 sha256 不符：清单与 APK 不一致，重试同一个清单无用 */
+        ChecksumMismatch,
+    }
+
     private fun currentVersionCode(): Int = try {
         context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode.toInt()
     } catch (e: Exception) {
@@ -514,19 +544,43 @@ class UpdateManager(
     /**
      * 按清单地址逐个尝试下载；sha256 缺失或不符均视为校验失败（fail-closed），换下一个源。
      *
-     * P3-51：runCatching 换显式 try/catch——runCatching 连 CancellationException 一起吞掉，
-     * 协程取消信号会被它伪装成「下载失败」，且阻塞 IO 里的 downloadTo 根本感知不到取消。
-     * 现在循环内 catch 到取消就删 tmp 并原样重抛，让取消语义回到协程层。
+     * ## 2026-11-22 真机排查后新增：内置 jsDelivr 镜像
+     *
+     * 清单里的三个 APK 链接（gh-proxy / ghfast / raw）在真机实测中**两个不可用**：
+     * gh-proxy 返回 403、raw 返回 000，只剩 ghfast 能下。一旦 ghfast 抖动，用户就彻底
+     * 无法更新——而**清单本身却可能正是从 jsDelivr 拿到的**（它在 MANIFEST_URLS 里）。
+     *
+     * 也就是说存在一条荒谬的路径：清单能从 jsDelivr 取到，APK 却没有 jsDelivr 这个选项。
+     * 这里补上：清单给的链接全部失败后，按**同一个仓库路径**再试 jsDelivr 的 APK 地址。
+     *
+     * 为什么不用清单里的 `apkAlt` 再拼：jsDelivr 的 URL 形态与 raw 不同
+     * （`cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}`），无法从 raw 地址机械替换，
+     * 所以作为**已知仓库的常量**写在这里。仓库改名时必须同步改这两处。
+     *
+     * ## 为什么区分「sha256 不符」与「网络失败」
+     *
+     * 旧实现两者都返回 false，最终统一报「网络异常或下载中断」——而真机复现的那次失败
+     * 其实是 **jsDelivr 清单与 APK 缓存不同步**（清单 v1.3.2 / APK v1.3.3），
+     * 下载是成功的、只是校验不过。把它报成「网络异常」会让用户反复重试同一个必然失败的动作。
+     * 现在记下是否发生过 sha256 不符，由调用方给出可区分的文案。
      */
-    private fun downloadApk(info: UpdateInfo): File? {
+    private fun downloadApk(info: UpdateInfo): DownloadOutcome {
         apkFile.parentFile?.mkdirs()
         val tmp = File(apkFile.parentFile, TMP_NAME)
-        for (url in info.apkUrls) {
+        // 清单链接 + 内置 jsDelivr 镜像（去重：清单里若已含 jsDelivr 就不重复试）
+        val candidates = (info.apkUrls + JSDELIVR_APK_MIRRORS).distinct()
+        var sawChecksumMismatch = false
+        for (url in candidates) {
             val ok = try {
                 downloadTo(url, tmp) { read, total -> updateProgress(read, total) }
                 val actual = sha256Of(tmp)
                 if (info.sha256 == null || actual != info.sha256) {
                     tmp.delete()
+                    sawChecksumMismatch = true
+                    android.util.Log.w(
+                        "UpdateManager",
+                        "sha256 mismatch from $url: expected=${info.sha256}, actual=$actual",
+                    )
                     false // sha256 缺失（疑似被代理裁剪）或不符：跳过该源
                 } else {
                     tmp.renameTo(apkFile) || (apkFile.delete() && tmp.renameTo(apkFile))
@@ -539,10 +593,12 @@ class UpdateManager(
                 // 普通网络异常：换下一个源（等价于旧 runCatching 的兜底语义）
                 false
             }
-            if (ok) return apkFile
+            if (ok) return DownloadOutcome.Success
         }
         tmp.delete()
-        return null
+        // 有源下载成功但校验不过 → 清单与 APK 不一致；全部连不上 → 网络问题。
+        // 两者对用户的意义完全不同（前者重试无用，后者重试有意义），必须分开。
+        return if (sawChecksumMismatch) DownloadOutcome.ChecksumMismatch else DownloadOutcome.NetworkFailure
     }
 
     /**
@@ -669,13 +725,61 @@ class UpdateManager(
         /** 下载临时文件名（downloadApk 与 startUpdate 的陈旧清理共用，避免两处字符串漂移） */
         private const val TMP_NAME = "app-update.tmp"
 
+        /**
+         * 内置 jsDelivr APK 镜像（2026-11-22 真机排查后新增）。
+         *
+         * 清单里的三个 APK 链接在真机实测中两个不可用（gh-proxy 403 / raw 000），
+         * 只剩 ghfast；而清单本身可能正是从 jsDelivr 拿到的。补上这条，
+         * 让「清单从哪来」与「APK 从哪来」不再脱节。
+         *
+         * ⚠️ 仓库改名/迁移时必须同步修改这里（无法从清单地址机械推导）。
+         */
+        private val JSDELIVR_APK_MIRRORS = listOf(
+            "https://fastly.jsdelivr.net/gh/R4gM9Xk/music@main/apk/app-release.apk",
+            "https://gcore.jsdelivr.net/gh/R4gM9Xk/music@main/apk/app-release.apk",
+            "https://cdn.jsdelivr.net/gh/R4gM9Xk/music@main/apk/app-release.apk",
+        )
+
         /** 进度写入最小间隔（见 [updateProgress]）：低于一帧的刷新率对人眼无意义 */
         private const val PROGRESS_MIN_INTERVAL_MS = 100L
 
-        /** 清单地址链：gh-proxy（国内可达优先）→ raw 直连 → jsDelivr（CDN，可能有最长数小时缓存） */
+        /**
+         * 清单地址链：gh-proxy（国内可达优先）→ raw 直连 → jsDelivr（CDN）。
+         *
+         * ## 2026-11-22 真机排查后重排（重要）
+         *
+         * 真机实测发现三个源**同时不可用**是常态，且 jsDelivr 存在两个独立问题：
+         *
+         * ### 一、jsDelivr 各边缘节点缓存不一致（本次新增的根因）
+         *
+         * 同一条路径在四个节点上返回了**三个不同版本**：
+         * | 节点 | 清单版本 |
+         * |---|---|
+         * | `cdn.jsdelivr.net` | v1.3.2（**过期**） |
+         * | `fastly.jsdelivr.net` | v1.3.3（正确） |
+         * | `gcore.jsdelivr.net` | v1.3.3（正确） |
+         *
+         * 更严重的是**清单与 APK 的缓存不同步**：`cdn.jsdelivr.net` 返回的清单写 v1.3.2
+         * （sha256 `9698454c…`），而同节点下 `apk/app-release.apk` 已经是 v1.3.3
+         * （实际 sha256 `3cd4fc2d…`）——于是下载必然 sha256 校验失败。
+         * 真机复现：点「立即更新」→ 下载 6% → 「下载失败（网络异常或下载中断）」。
+         *
+         * 修法：把 `cdn.jsdelivr.net` **降到最后**（它是缓存最久的主节点），
+         * 并补上 `fastly` / `gcore` 两个更新更及时的节点在前面。
+         *
+         * ### 二、gh-proxy 会返回 403
+         *
+         * 真机 `curl` 实测 gh-proxy 对清单与 APK 都返回 **403**（限流/封禁），
+         * raw 直连返回 **000**（连接失败）。也就是说国内网络下**只有 jsDelivr 系列可用**。
+         * 所以顺序改为「先试可能失败的直连类，再落到 jsDelivr 系」——
+         * 反正失败很快（5s 超时），而 jsDelivr 必须在链里且节点要新。
+         */
         private val MANIFEST_URLS = listOf(
             "https://gh-proxy.com/https://raw.githubusercontent.com/R4gM9Xk/music/main/update.json",
             "https://raw.githubusercontent.com/R4gM9Xk/music/main/update.json",
+            // jsDelivr 节点顺序：更新更及时的在前，主节点（缓存最久）放最后兜底
+            "https://fastly.jsdelivr.net/gh/R4gM9Xk/music@main/update.json",
+            "https://gcore.jsdelivr.net/gh/R4gM9Xk/music@main/update.json",
             "https://cdn.jsdelivr.net/gh/R4gM9Xk/music@main/update.json",
         )
     }

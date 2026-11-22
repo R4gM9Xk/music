@@ -79,6 +79,17 @@ data class UpdateUiState(
         Download,  // APK 下载失败（网络异常或下载中断）
         Verify,    // 签名校验失败（已删包并清 pendingInfo；**不给**「重新下载」重试入口）
         Install,   // 安装包已丢失（需要重新下载，pendingInfo 仍在可直接重下）
+
+        /**
+         * sha256 校验失败（2026-11-22 真机排查后新增）。
+         *
+         * 与 [Download] 的区别不是文案措辞，而是**重试是否有意义**：
+         * 真机复现的成因是 jsDelivr 边缘节点的清单与 APK 缓存不同步
+         * （清单写 v1.3.2、APK 实际 v1.3.3）——下载完全成功，只是 sha256 对不上。
+         * 此时拿同一份清单重试必然再失败，所以和 [Verify] 一样**不给**「点击重试」，
+         * 正确出路是「重新检查更新」（拉一份新清单，可能已指向一致的一对）。
+         */
+        Checksum,
     }
 
     /**
@@ -97,11 +108,16 @@ data class UpdateUiState(
     /**
      * 失败后是否应给「重试」入口。
      *
-     * 验签失败**不给**：同一份坏字节再下一次必然再失败（死循环），
-     * 正确出路是去发布页手动下载（文案已按 `failStage` 分流）。
+     * 两种失败**不给**重试，因为它们重试同一个动作必然再失败：
+     * - [FailStage.Verify]：同一份坏字节（签名不符）再下一次还是它；
+     * - [FailStage.Checksum]：清单与 APK 缓存不同步，同一份清单指向的 sha256 恒不变。
+     *
+     * 后者的正确出路是「重新检查更新」——重新拉清单，可能已指向一致的一对。
      */
     val offersRetry: Boolean
-        get() = status == Status.Failed && failStage != FailStage.Verify
+        get() = status == Status.Failed &&
+            failStage != FailStage.Verify &&
+            failStage != FailStage.Checksum
 }
 
 /**

@@ -1227,6 +1227,11 @@ fun SettingsScreen(
                             UpdateUiState.FailStage.Install -> "安装包已丢失，请重新下载"
                             UpdateUiState.FailStage.Download ->
                                 "下载失败（${updateState.message ?: "网络异常"}），点击重试"
+                            // 校验失败（2026-11-22 真机排查后新增）：**不能说「点击重试」**。
+                            // 成因是更新源 CDN 的清单与 APK 缓存不同步，拿同一份清单重下
+                            // 必然还是同一个 sha256 不符的结果。正确出路是重新拉清单。
+                            UpdateUiState.FailStage.Checksum ->
+                                "安装包与清单不一致（${updateState.message ?: "更新源缓存未同步"}），点击重新检查"
                             // 未细分阶段沿用旧分流：进过下载链路（versionName 已带上新版本）→ 下载失败，否则检查失败
                             else ->
                                 if (updateState.versionName != null) "下载失败（${updateState.message ?: "网络异常"}），点击重试"
@@ -1352,8 +1357,17 @@ fun SettingsScreen(
                                     // （例如此行在手势未结束时被重组）。不判就会在验证失败态里
                                     // 落进「什么都没发生」——正是本轮要消灭的那个行为。
                                     UpdateUiState.Status.Failed ->
-                                        if (update().failStage != UpdateUiState.FailStage.Verify) {
-                                            if (update().versionName != null) onStartUpdate() else onCheckUpdate()
+                                        when (update().failStage) {
+                                            // 验签失败：重下同一份坏字节必然再失败 → 什么都不做
+                                            // （上面已分流到发布页 / 纯说明行，这里兜住状态瞬变）
+                                            UpdateUiState.FailStage.Verify -> Unit
+                                            // 校验失败（清单与 APK 缓存不同步）：重下同一份清单
+                                            // 必然还是同一个 sha256 不符 → 必须**重新拉清单**
+                                            UpdateUiState.FailStage.Checksum -> onCheckUpdate()
+                                            // 其余：进过下载阶段（versionName != null）→ 直接重下，
+                                            // 否则是检查失败 → 重新检查
+                                            else ->
+                                                if (update().versionName != null) onStartUpdate() else onCheckUpdate()
                                         }
                                     else -> onCheckUpdate()
                                 }
