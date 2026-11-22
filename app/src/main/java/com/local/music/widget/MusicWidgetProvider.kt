@@ -24,12 +24,15 @@ import android.util.Log
  * 1. [onUpdate]：小部件被放置 / 系统周期性发 APPWIDGET_UPDATE（provider XML 里的
  *    updatePeriodMillis，本实现设为 0 = 不周期刷新，理由见两个 XML 的注释）。
  * 2. [onAppWidgetOptionsChanged]：用户拖动改变尺寸 → 需要重新选布局重绘。
- * 3. 播放状态变化时由服务侧调用 [refreshAll]（事件驱动，唯一的常规刷新来源）。
+ * 3. 播放状态变化时由服务侧调用 [MusicWidgetViews.refreshAll]（事件驱动，唯一的常规刷新来源）。
  *
- * **onUpdate 必须保证在系统限时内返回**：它跑在主线程，而 [MusicWidgetViews.refreshAll]
- * 内部最长阻塞 2s 等 controller。对单个 onUpdate 而言 2s 是安全的（系统给的是
- * 广播 10s 窗口），但**不能**再叠加（例如循环里对每个 id 各连一次）。
- * 所以 refreshAll 是「读一次状态，刷 N 个实例」，连接次数恒为 1。
+ * **onUpdate 现在只是「派发」，不再阻塞**：[MusicWidgetViews.refreshAll] 已改为异步
+ * （建连 + 读取在专用后台线程，主线程立即返回）。改前它是同步的、最长阻塞 2s 等
+ * controller，而 `buildAsync()` 的连接回调只能投递到主 looper——在广播回调（主线程）里
+ * 等它等于**自己等自己**，必然超时，于是小部件恒显示空态、每次切歌还冻主线程 2 秒。
+ * 现在这里返回后刷新才真正开始，系统给的 10s 广播窗口完全够用。
+ *
+ * 连接次数仍是 1（先读一次状态，再刷 N 个实例），不会随实例数放大。
  */
 abstract class MusicWidgetProviderBase : AppWidgetProvider() {
 

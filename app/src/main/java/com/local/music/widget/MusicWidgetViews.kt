@@ -61,9 +61,10 @@ internal object MusicWidgetViews {
      * 连接 MediaController 的等待上限。
      *
      * **为什么要超时**：`buildAsync()` 返回的 Future 在服务未启动/被禁用时可能永远
-     * 不 complete。而调用的源头是 `AppWidgetProvider.onUpdate` 这类系统广播入口，
-     * 必须在很短时间内返回（BroadcastReceiver.onReceive 的 ANR 线约 10s）。
-     * 给 2s 上限，超时走空态，比让桌面卡在空槽好。
+     * 不 complete。给 2s 上限，超时走空态，比让桌面永远停在旧值好。
+     *
+     * **本函数只能在 [refreshExecutor] 上调用**：连接回调投递到主 looper，
+     * 在主线程上等它等于自锁（见 [refreshAll] 的 P0 约束）。
      */
     private const val CONTROLLER_TIMEOUT_MS = 2_000L
 
@@ -83,21 +84,70 @@ internal object MusicWidgetViews {
     )
 
     /**
-     * 刷新所有已放置的小部件实例。
+     * 刷新专用单线程执行器（daemon，不阻止进程退出）。
+     *
+     * 单线程是刻意的：小部件刷新之间没有顺序要求，但**不能并发建连**——
+     * 两条连接同时读同一份状态再交叉下发，会让桌面卡片闪一帧旧值。
+     */
+    private val refreshExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "widget-refresh").apply { isDaemon = true }
+    }
+
+    /** 是否已有一次刷新在排队/执行中（合并成对触发的播放回调，见 [refreshAll]） */
+    private val refreshPending = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * 刷新所有已放置的小部件实例。**异步、立即返回**。
+     *
+     * ## 为什么必须异步（这是一条 P0 级约束，不要改回同步）
+     * 两条常规调用路径都在**主线程**：`AppWidgetProvider.onUpdate`（广播）与
+     * `MusicPlaybackService` 的 `Player.Listener` 回调。而 `buildAsync()` 的连接回调
+     * 只能投递到主 looper —— 若在主线程上 `future.get()` 等它，就是**自己等自己**：
+     * 连接永远完不成 → 必然 2s 超时 → 恒空态「未在播放」，同时每次切歌把 App UI
+     * 与通知更新一起冻结 2 秒。所以建连与读取一律放到专用后台线程，主线程只负责派发。
+     *
+     * `MediaController` 的 getter 读的是缓存字段（`MediaControllerImplBase.isPlaying()`
+     * 直接取 `playerInfo`，无 application-thread 校验），因此在后台线程读快照是安全的；
+     * 命令下发仍走 [WidgetActionReceiver] 的既有路径。
      *
      * **必须逐个 id 下发**：不同实例尺寸不同（一个 4x1 一个 4x2），
      * `updateAppWidget(ComponentName, RemoteViews)` 那种「一把刷」的形态没法按
      * `OPTION_APPWIDGET_MIN_WIDTH` 选布局，会把横条塞进封面版的槽位。
      *
-     * 连接次数恒为 1（先读一次状态，再刷 N 个实例），不会随实例数放大 ——
-     * 这点在 onUpdate 这种有 ANR 时限的入口很关键。
+     * 连接次数恒为 1（先读一次状态，再刷 N 个实例），不会随实例数放大。
      *
      * @param preConnected 调用方**已经持有**的 controller（[WidgetActionReceiver] 在
-     *   下发完命令后复用同一条连接做反馈刷新）。传非 null 时不再新建连接 ——
-     *   否则一次点击会出现「建连 → 下发 → 建连 → 刷新」两次 2s 阻塞。
-     *   **生命周期归调用方**：本函数不会释放它。
+     *   下发完命令后复用同一条连接做反馈刷新）。传非 null 时不再新建连接，就地渲染
+     *   （该调用方本身已在后台线程）。**生命周期归调用方**：本函数不会释放它。
      */
     fun refreshAll(context: Context, preConnected: MediaController? = null) {
+        val app = context.applicationContext
+        if (preConnected != null) {
+            runCatching { renderAll(app, WidgetState.read(app, preConnected)) }
+                .onFailure { Log.w(TAG, "pre-connected render failed", it) }
+            return
+        }
+        // 合并排队：播放状态变化常成对触发（切歌 + isPlaying），单线程执行器上堆一串
+        // 建连任务纯属浪费。已有待执行任务时直接丢弃本次——它们读到的会是同一份状态。
+        if (!refreshPending.compareAndSet(false, true)) return
+        runCatching {
+            refreshExecutor.execute {
+                try {
+                    renderAll(app, readStateBlocking(app))
+                } catch (t: Throwable) {
+                    Log.w(TAG, "widget refresh failed", t)
+                } finally {
+                    refreshPending.set(false)
+                }
+            }
+        }.onFailure {
+            refreshPending.set(false)
+            Log.w(TAG, "widget refresh dispatch failed", it)
+        }
+    }
+
+    /** 枚举全部实例并按各自尺寸渲染同一份快照。可在任意线程调用（Binder + RemoteViews）。 */
+    private fun renderAll(context: Context, state: WidgetState) {
         val manager = AppWidgetManager.getInstance(context) ?: return
         // 两个尺寸是两个独立 receiver，各取一次 id 再合并：
         // 只取一个的话，用户同时放了 4x1 和 4x2 时只有一个会刷新。
@@ -110,12 +160,7 @@ internal object MusicWidgetViews {
             }.getOrDefault(emptyList())
             ids.forEach { id -> idToWide.putIfAbsent(id, wideDefault) }
         }
-        if (idToWide.isEmpty()) return // 用户没放小部件：直接返回，别白连一次播放服务
-        val state = if (preConnected != null) {
-            WidgetState.read(preConnected)
-        } else {
-            readStateBlocking(context)
-        }
+        if (idToWide.isEmpty()) return // 用户没放小部件：别白连一次播放服务
         idToWide.forEach { (id, wideDefault) ->
             runCatching { manager.updateAppWidget(id, build(context, manager, id, state, wideDefault)) }
                 .onFailure { Log.w(TAG, "updateAppWidget failed id=$id", it) }
@@ -137,7 +182,7 @@ internal object MusicWidgetViews {
         return try {
             val controller = future.get(CONTROLLER_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             try {
-                WidgetState.read(controller)
+                WidgetState.read(context, controller)
             } finally {
                 MediaController.releaseFuture(future)
             }
@@ -231,7 +276,7 @@ internal object MusicWidgetViews {
             views.setViewVisibility(R.id.widget_time, View.GONE)
             views.setViewVisibility(R.id.widget_subtitle, View.GONE)
             views.setViewVisibility(R.id.widget_empty, View.VISIBLE)
-            views.setTextViewText(R.id.widget_empty, "未在播放")
+            views.setTextViewText(R.id.widget_empty, context.getString(R.string.widget_not_playing))
             views.setTextViewText(R.id.widget_title, "")
             return
         }

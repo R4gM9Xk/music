@@ -308,7 +308,15 @@ fun SettingsScreen(
     val sleepSubtitle = when {
         sleepActiveMode > 0 -> "剩余 ${sleepRemainingSec.asTime()}（${sleepTimerLabel(sleepActiveMode)}）"
         sleepActiveMode == -1 -> "播完当前首后暂停"
-        sleepActiveMode == -2 -> "播完整个队列后暂停"
+        // 与面板同源：-2 档在会回绕的模式下必须如实说明「不会生效」，
+        // 否则设置首页这行摘要会承诺一个永远不会发生的暂停
+        sleepActiveMode == -2 -> sleepTimerSubtitle(
+            option = -2,
+            activeMode = -2,
+            remainingSec = 0,
+            repeatMode = state.repeatMode,
+            shuffleOn = state.shuffleOn,
+        ) ?: "播完整个队列后暂停"
         else -> "未开启"
     }
 
@@ -355,12 +363,47 @@ fun SettingsScreen(
                         onClick = null,
                         trailing = {},
                     )
-                    // 唯一出口：用户明确同意后才放弃旧快照重新开始存盘
+                    // 唯一出口：用户明确同意后才放弃旧快照重新开始存盘。
+                    //
+                    // **必须二次确认**（本轮修复）：这是全 App 唯一一处「一次点击永久丢弃
+                    // 歌单/收藏/设置」的入口，而它过去点下去就执行——警示色只是让它看起来
+                    // 危险，并没有给用户反悔的机会。同仓「删除歌单」早就做了两步确认
+                    // （CollectionActionsSheet 的 showDeleteConfirm），这里对齐：本行只负责
+                    // 打开确认面板，真正执行由确认面板里的破坏性行触发。
                     SheetAction(
                         icon = GlassIcons.Trash,
                         label = "放弃旧快照并重新开始",
                         subtitle = "以当前显示的状态覆盖保存（不可撤销）",
-                        onClick = onRebuildFromCorrupt,
+                        // 破坏性动作必须走警示色：副标题写了「不可撤销」却渲染成普通行，
+                        // 与同页「清除背景照片」等破坏性项的视觉语言不一致，一次点击即永久
+                        // 丢弃旧快照里的歌单/收藏/设置
+                        destructive = true,
+                        onClick = {
+                            modal.show {
+                                ModalSheet(modal, "放弃旧快照？") {
+                                    Text(
+                                        "旧快照里的歌单、收藏与设置将被永久丢弃，" +
+                                            "并以当前显示的状态重新开始保存。此操作不可撤销。",
+                                        color = LocalGlassColors.current.textSecondary,
+                                        style = GlassText.Body,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 6.dp, vertical = S.Gap8.dp),
+                                    )
+                                    Spacer(Modifier.height(S.Gap8.dp))
+                                    SheetAction(
+                                        icon = GlassIcons.Trash,
+                                        label = "确认放弃并重新开始",
+                                        subtitle = "不可撤销",
+                                        destructive = true,
+                                        onClick = {
+                                            modal.requestDismiss()
+                                            onRebuildFromCorrupt()
+                                        },
+                                    )
+                                }
+                            }
+                        },
                     )
                 }
             }
@@ -431,7 +474,16 @@ fun SettingsScreen(
                     // 用户按「上方」抬头找不到出口，而这一行又正处在「开关拨了没反应」的
                     // 最容易上火的状态（被短路的是它自己）。方位词写错不是错别字级别的问题：
                     // 它是这一行唯一的可行动指引。写「下方」后与界面事实一致。
-                    if (state.customSeedArgb != null) "已被自定义主题色覆盖（点下方主题色可恢复）" else "极光背景取自当前专辑封面",
+                    if (state.customSeedArgb != null) {
+                        "已被自定义主题色覆盖（点下方主题色可恢复）"
+                    } else if (state.visualStyle == VisualStyle.Skeuomorph) {
+                        // 拟物档：背景是机身，主题色只以极低强度掺入环境光。
+                        // 旧文案恒写「极光背景取自当前专辑封面」——拟物档下屏幕上根本没有
+                        // 极光，这行承诺了一件不存在的事（摘要的唯一职责是指对路）。
+                        "机身环境光取自当前专辑封面"
+                    } else {
+                        "极光背景取自当前专辑封面"
+                    },
                     onClick = { state.applyFollowCover(!state.followCover) },
                     trailing = { GlassToggle(state.followCover, onToggle = state::applyFollowCover) },
                 )
@@ -579,9 +631,12 @@ fun SettingsScreen(
                 // 「拟物 vs 玻璃确实是光的行为」这个联想不足以抵消这个误读。
                 SettingRow(
                     GlassIcons.Tag, "视觉风格",
+                    // 本轮（2026-11）文案重写：两套语言都做了重设计，旧描述（「不透明贴面 +
+                    // 斜面 + 投影」）会让人以为拟物是「整屏浮雕」。新描述强调各自的**取舍**：
+                    // 玻璃是「内容透出来」，拟物是「内容安静、控件有实体感」。
                     when (state.visualStyle) {
-                        VisualStyle.Glass -> "液态玻璃 · 半透明模糊，背景会透过来"
-                        VisualStyle.Skeuomorph -> "拟物 · 不透明贴面 + 斜面 + 投影，背景不透"
+                        VisualStyle.Glass -> "液态玻璃 · 晨雾质感，背景柔和透出"
+                        VisualStyle.Skeuomorph -> "拾音拟物 · 机身平面、按键有实体手感"
                     },
                     // 整行点击 = 在两个语言之间直接对切（与下方的下拉双通道，同既有各行口径）。
                     // 二选一时这是最省事的路径：不必展开下拉再点一次。
@@ -606,8 +661,8 @@ fun SettingsScreen(
                                     // 用户看到两个并列选项时的默认预期是「浓度/强弱差异」，
                                     // 而这里是两套互不兼容的材质语法（见 AppState.VisualStyle 的 KDoc）。
                                     subtitle = when (style) {
-                                        VisualStyle.Glass -> "半透明 + 背景模糊，界面浮在内容之上"
-                                        VisualStyle.Skeuomorph -> "不透明贴面 + 斜面高光 + 投影，像真实的物理面板"
+                                        VisualStyle.Glass -> "半透明 + 背景模糊，内容与背景连成一片"
+                                        VisualStyle.Skeuomorph -> "不透明机身 + 实体按键，内容安静、控件有手感"
                                     },
                                     payload = style,
                                 )
@@ -862,7 +917,17 @@ fun SettingsScreen(
                                     SheetAction(
                                         icon = GlassIcons.Moon,
                                         label = sleepTimerLabel(option),
-                                        subtitle = sleepTimerSubtitle(option, activeMode, sleepRemainingSec),
+                                        subtitle = sleepTimerSubtitle(
+                                            option = option,
+                                            activeMode = activeMode,
+                                            remainingSec = sleepRemainingSec,
+                                            // 必须传：-2 档在列表循环/随机下**永不触发**，
+                                            // 副标题要如实说明并给出可执行动作（见 sleepTimerSubtitle
+                                            // 的 KDoc）。漏传会走默认 null/false，恒显示
+                                            // 「整个队列播完后暂停」——用户开着循环选它，整夜放歌。
+                                            repeatMode = state.repeatMode,
+                                            shuffleOn = state.shuffleOn,
+                                        ),
                                         // P3-47（与播放页同款）：无定时时「取消定时」不高亮
                                         emphasized = option != 0 && option == activeMode,
                                         onClick = {
@@ -915,8 +980,12 @@ fun SettingsScreen(
                         // 与自动派生（Disc 取色）区分开
                         GlassIcons.Edit, "桌面歌词字号",
                         DesktopLyricsStyle.FontSteps.getOrNull(desktopLyricsFontStep)?.let {
-                            if (desktopLyricsEnabled) it else "$it · 开启后生效"
+                            if (desktopLyricsEnabled) "$it · 点按切换" else "$it · 开启后生效"
                         } ?: "标准",
+                        // 去掉右箭头：本行是**原地循环点选**，不是「进入下一级」。
+                        // 本文件自己的规矩是「箭头＝可以进去」，带箭头会让用户期待一个
+                        // 五档面板，结果值静默跳一档、看不到其余档也无法直接回退。
+                        trailing = {},
                         onClick = {
                             val next = (desktopLyricsFontStep + 1).mod(DesktopLyricsStyle.FontSteps.size)
                             onDesktopLyricsFontStepChange(next)
@@ -926,8 +995,10 @@ fun SettingsScreen(
                     SettingRow(
                         GlassIcons.Edit, "桌面歌词不透明度",
                         DesktopLyricsStyle.OpacitySteps.getOrNull(desktopLyricsOpacityStep)?.let {
-                            if (desktopLyricsEnabled) it else "$it · 开启后生效"
+                            if (desktopLyricsEnabled) "$it · 点按切换" else "$it · 开启后生效"
                         } ?: "清晰",
+                        // 同上：原地循环点选，不该带「可进入」的右箭头
+                        trailing = {},
                         onClick = {
                             val next = (desktopLyricsOpacityStep + 1).mod(DesktopLyricsStyle.OpacitySteps.size)
                             onDesktopLyricsOpacityStepChange(next)
@@ -1003,7 +1074,7 @@ fun SettingsScreen(
                                     SheetAction(
                                         icon = GlassIcons.Folder,
                                         label = folder,
-                                        subtitle = "$count 首",
+                                        subtitle = if (excluded) "$count 首 · 已排除" else "$count 首",
                                         emphasized = excluded,
                                         onClick = {
                                             if (excluded) state.excludedFolders.remove(folder) else state.excludedFolders.add(folder)
@@ -1131,7 +1202,15 @@ fun SettingsScreen(
                         // 总长未知（不定长响应，P3-50）：显示进度而非恒 0%
                         if (updateState.indeterminate) "下载中…" else "下载中 ${(updateState.progress * 100).toInt()}%"
                     UpdateUiState.Status.ReadyToInstall ->
-                        "已下载 v${updateState.versionName}，点击安装"
+                        // 「在等系统授权」与「已下载待安装」是两种不同的**下一步**：
+                        // 前者要用户去系统页开开关（并承诺回来会继续），后者才是点一下就装。
+                        // 不区分的话，用户被跳到系统页后回来看到的仍是「点击安装」，
+                        // 会以为自己刚才那一下白点了。
+                        if (updateState.awaitingInstallPermission) {
+                            "已下载 v${updateState.versionName}，需先允许安装未知应用（去系统设置授权，返回后自动继续）"
+                        } else {
+                            "已下载 v${updateState.versionName}，点击安装"
+                        }
                     UpdateUiState.Status.Failed ->
                         // P2-25：按失败阶段给准确文案——过去一律「下载失败」，检查失败也不例外；
                         // 验签失败再给重试是死循环（同一份坏字节必然再失败），文案改引导发布页
@@ -1244,7 +1323,12 @@ fun SettingsScreen(
                                                         else -> "立即更新"
                                                     },
                                                     subtitle = when (current.status) {
-                                                        UpdateUiState.Status.ReadyToInstall -> "无需重新下载"
+                                                        UpdateUiState.Status.ReadyToInstall ->
+                                                            if (current.awaitingInstallPermission) {
+                                                                "在系统设置里允许后返回即自动安装"
+                                                            } else {
+                                                                "无需重新下载"
+                                                            }
                                                         else -> "下载完成后自动打开安装程序"
                                                     },
                                                     onClick = {
@@ -1398,7 +1482,15 @@ private fun settingsGroups(
         else -> "品牌靛紫"
     }
     val darkSummary = if (state.themeMode == ThemeMode.Dark) "深色" else "浅色"
-    val bgSummary = if (state.backgroundMode == BackgroundMode.Photo) "照片背景" else "极光背景"
+    // 背景摘要必须按**材质语言**分支（2026-11 真机修正）：
+    // 拟物档下根层画的是机身（SkeuomorphBackground），不再是极光。
+    // 旧文案恒写「极光背景」，切到拟物后用户会看到摘要与屏幕事实相反——
+    // 这正是本仓反复点名的「摘要的唯一职责就是指对路」。
+    val bgSummary = when {
+        state.visualStyle == VisualStyle.Skeuomorph -> "机身背景"
+        state.backgroundMode == BackgroundMode.Photo -> "照片背景"
+        else -> "极光背景"
+    }
 
     // 播放摘要：均衡器档位 + 定时/桌面歌词这类「正在生效」的状态。
     // 顺序按「用户最可能特意来确认的」排：定时是时间敏感状态（还剩多久），
@@ -1437,15 +1529,18 @@ private fun settingsGroups(
         ),
         SettingsGroup(
             "数据",
-            "M3U 导入 / 备份与恢复",
+            "M3U 导入 / 备份与恢复 / 崩溃日志",
             GlassIcons.Down,
         ),
         SettingsGroup(
             // 摘要里补上「支持开发者」的存在感：它是关于组里新增的一行，
             // 而摘要的作用正是「不进去也能确认这一组里有什么」（见本函数 KDoc）。
             // 不写进摘要的话，用户想知道「支持开发者去哪了」只能挨个组点进去。
+            //
+            // **崩溃日志不在本组**：那两行实际渲染在「数据」组（openGroup == "数据"），
+            // 摘要写在这里会把用户送进一个没有该行的页——摘要的唯一职责就是指对路。
             AboutGroup,
-            "版本 / 更新 / 崩溃日志 / 支持开发者",
+            "版本 / 更新 / 支持开发者",
             GlassIcons.Book,
         ),
     )

@@ -2,6 +2,7 @@ package com.local.music.core.ui.state
 
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.DemoSong
+import com.local.music.core.ui.components.DetailTarget
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -347,5 +348,98 @@ class AppStateRegressionTest {
 
         state.clearSearchHistory()
         assertTrue("全部清空", state.searchHistory.isEmpty())
+    }
+
+    // ── 导航重设计（2026-11）：连续详情栈 ──────────────────────
+
+    @Test
+    fun `连续进入详情可以逐级返回`() {
+        val state = stateWith(song("A"), song("B"))
+        val album = DetailTarget(DetailTarget.Kind.Album, "专辑A")
+        val artist = DetailTarget(DetailTarget.Kind.Artist, "歌手A")
+        val album2 = DetailTarget(DetailTarget.Kind.Album, "专辑B")
+
+        state.openDetail(album)
+        state.openDetail(artist)
+        state.openDetail(album2)
+        assertEquals("栈里应有三层", 3, state.detailStack.size)
+        assertEquals("当前目标是最后一层", album2, state.detail)
+
+        state.backFromDetail()
+        assertEquals("退一层到艺术家", artist, state.detail)
+        assertEquals("仍停在详情屏", GlassScreen.Detail, state.screen)
+
+        state.backFromDetail()
+        assertEquals("再退一层到专辑", album, state.detail)
+
+        state.backFromDetail()
+        assertEquals("栈空后回到来源屏", GlassScreen.Library, state.screen)
+        assertTrue("栈必须清空", state.detailStack.isEmpty())
+    }
+
+    @Test
+    fun `详情栈的返回目标是首次进入时的来源屏`() {
+        val state = stateWith(song("A"))
+        state.screen = GlassScreen.Search
+        state.openDetail(DetailTarget(DetailTarget.Kind.Album, "专辑A"))
+        state.openDetail(DetailTarget(DetailTarget.Kind.Artist, "歌手A"))
+
+        // 连续两层详情，来源仍应是最初的搜索页（而不是被覆盖成 Detail）
+        assertEquals("来源屏必须是首次进入时的屏", GlassScreen.Search, state.detailReturn)
+
+        state.backFromDetail()
+        state.backFromDetail()
+        assertEquals("逐级退完后回到搜索页", GlassScreen.Search, state.screen)
+    }
+
+    @Test
+    fun `切主模块会清空详情栈`() {
+        val state = stateWith(song("A"))
+        state.openDetail(DetailTarget(DetailTarget.Kind.Album, "专辑A"))
+        state.openDetail(DetailTarget(DetailTarget.Kind.Artist, "歌手A"))
+        assertEquals("先压两层", 2, state.detailStack.size)
+
+        // 模拟底部导航切到歌单：GlassApp 的 onNavSelect 会先 clearDetailStack
+        state.clearDetailStack()
+        state.screen = GlassScreen.Playlist
+
+        assertTrue("切模块后栈必须为空", state.detailStack.isEmpty())
+
+        // 从新模块再进详情：栈应从一层重新开始，不继承旧模块的层级
+        state.openDetail(DetailTarget(DetailTarget.Kind.Playlist, "pl-1"))
+        assertEquals("新模块的详情栈只有一层", 1, state.detailStack.size)
+        state.backFromDetail()
+        assertEquals("返回落到新模块的来源屏", GlassScreen.Playlist, state.screen)
+    }
+
+    @Test
+    fun `详情栈可以跨重建还原`() {
+        val state = stateWith(song("A"))
+        state.openDetail(DetailTarget(DetailTarget.Kind.Album, "专辑A"))
+        state.openDetail(DetailTarget(DetailTarget.Kind.Artist, "歌手A"))
+        val saved = state.navigationState()
+
+        val restored = stateWith(song("A")).apply { restoreNavigationState(saved) }
+        assertEquals("栈长度必须还原", 2, restored.detailStack.size)
+        assertEquals("当前目标必须还原", DetailTarget(DetailTarget.Kind.Artist, "歌手A"), restored.detail)
+
+        restored.backFromDetail()
+        assertEquals("还原后仍能逐级返回", DetailTarget(DetailTarget.Kind.Album, "专辑A"), restored.detail)
+    }
+
+    @Test
+    fun `详情栈编码损坏时整栈作废而不是保留半截`() {
+        val state = stateWith(song("A"))
+        state.openDetail(DetailTarget(DetailTarget.Kind.Album, "专辑A"))
+        state.openDetail(DetailTarget(DetailTarget.Kind.Artist, "歌手A"))
+        val saved = state.navigationState().toMutableList()
+        // 破坏第二帧的 kind：解析必然失败
+        saved[10] = "Album\u0001专辑A\u0001Library\u0002NoSuchKind\u0001歌手A\u0001Library"
+
+        val restored = stateWith(song("A")).apply { restoreNavigationState(saved) }
+        assertTrue(
+            "任一帧损坏就丢弃整栈——半个栈会让返回退到错误目标，比退回来源页更糟",
+            restored.detailStack.isEmpty(),
+        )
     }
 }

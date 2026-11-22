@@ -32,6 +32,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -95,13 +96,27 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
     // 展示序列先按 id 去重（索引仍是连续的，不影响任何按位判定）；
     // 去重序列同时作为表头计数与播放队列的口径，避免「看到的条数」与「实际入队」错位
     val listedSongs = remember(results) { results.distinctBy { it.id } }
-    // 展开态跟随查询词重置（remember 以 query 为 key，换词自动收起）
-    var showAllAlbums by remember(query) { mutableStateOf(false) }
+    // 展开态提升到 AppState（跨屏存活）：与查询词配对，换词即自然失效收起。
+    // 旧实现是屏内 remember(query)，从专辑详情返回时组合被重建 → 展开态丢失。
+    val showAllAlbums = state.searchAlbumsExpanded && state.searchExpandedQuery == query
     // A2-06：换查询词重置滚动位置——历史态/结果态/空态三态共用一个 LazyColumn，滚动位置
     // 不重置会让新结果从旧偏移处展示（index 未超界时看不出换了内容），结果变少时被 clamp
-    // 跳到尾部。每键归零与主流搜索一致（输入即新查询）
-    val resultListState = rememberLazyListState()
-    LaunchedEffect(query) { resultListState.scrollToItem(0) }
+    // 跳到尾部。每键归零与主流搜索一致（输入即新查询）。
+    //
+    // **判据必须是「词真的变了」而不是「effect 跑了」**：旧实现无条件 scrollToItem(0)，
+    // 而从详情返回时组合重建也会跑一次 effect（词没变）→ 用户被弹回列表顶部。
+    val resultListState = rememberLazyListState(initialFirstVisibleItemIndex = state.searchScrollIndex)
+    LaunchedEffect(query) {
+        if (state.searchScrollQuery != query) {
+            state.searchScrollQuery = query
+            state.searchScrollIndex = 0
+            resultListState.scrollToItem(0)
+        }
+    }
+    LaunchedEffect(resultListState) {
+        snapshotFlow { resultListState.firstVisibleItemIndex }
+            .collect { state.searchScrollIndex = it }
+    }
     val flight = LocalPlayerFlight.current
     // 模态面板宿主（GlassApp 根层）；Chrome 让位同读此状态
     val modal = LocalModalState.current
@@ -123,7 +138,10 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                     value = query,
                     onValueChange = { state.searchQuery = it },
                     hint = "搜索歌曲、专辑、艺术家",
-                    autoFocus = true,
+                    // 只在**空查询**时自动聚焦：从专辑详情返回时查询词非空，用户是在
+                    // 浏览结果而不是准备打字——旧实现恒 true，返回即 requestFocus，
+                    // 键盘自动弹起遮住半屏，还得先收键盘才能看结果。
+                    autoFocus = query.isEmpty(),
                     onSearch = { state.addSearchHistory(query) },
                     modifier = Modifier.weight(1f),
                 )
@@ -308,7 +326,10 @@ fun SearchScreen(state: AppState, modifier: Modifier = Modifier) {
                                         .pressScale(expandInteraction, pressed = 0.92f)
                                         .clickable(
                                             interactionSource = expandInteraction, indication = null,
-                                        ) { showAllAlbums = !showAllAlbums }
+                                        ) {
+                                            state.searchAlbumsExpanded = !showAllAlbums
+                                            state.searchExpandedQuery = query
+                                        }
                                         // 读屏（无障碍 P0-4）：纯 Text + clickable，无 role。
                                         // 这行文字本身在「全部 N 张专辑」/「收起」之间切换，
                                         // 文字已完整表达当前可做的动作，所以只补 role 不写死描述

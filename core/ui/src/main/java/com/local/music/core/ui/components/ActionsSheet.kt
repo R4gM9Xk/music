@@ -547,6 +547,9 @@ fun CollectionActionsSheet(
             onValueChange = { newName = it },
             hint = "歌单名称",
             leading = null,
+            // 重命名也是**命名**不是搜索：默认 ImeAction.Search 会让键盘右下角显示
+            // 「搜索」键，语义与「保存改名」不符（同 PlaylistScreen 新建面板的修法）
+            imeAction = ImeAction.Done,
             onSearch = { commitRename() },
         )
         Spacer(Modifier.height(S.Gap8.dp))

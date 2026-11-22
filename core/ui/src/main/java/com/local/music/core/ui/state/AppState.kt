@@ -12,6 +12,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.ArtworkBitmapCache
+import com.local.music.core.ui.components.PlayerArtworkCache
 import com.local.music.core.ui.components.BackgroundMode
 import com.local.music.core.ui.components.DemoCatalog
 import com.local.music.core.ui.components.DemoData
@@ -289,7 +290,19 @@ fun songFormatText(song: DemoSong, live: SongFormat? = null): String {
  * UI 经 onMediaItemChanged 按 mediaId 回流同步——界面销毁、退后台、锁屏后仍连续播放。
  */
 interface PlayerEngine {
-    var onPlayingChanged: ((Boolean) -> Unit)?
+    /**
+     * 播放**意图**变化（对应 Media3 的 `playWhenReady`），不是「此刻有没有出声」。
+     *
+     * ## 为什么不能用 isPlaying
+     * `isPlaying = playWhenReady && state == READY`，于是 **seek 期间的 BUFFERING、
+     * 音频焦点瞬断、切歌缓冲**都会让它瞬时变 false。旧实现拿它当「用户暂停了」，
+     * 造成两个用户可见缺陷：
+     * 1. armed「播完当前首/整队」后拖一次进度条，定时被静默撤销（与副标题承诺的
+     *    「手动切歌/拖动进度不触发」直接矛盾）；
+     * 2. 播放键图标在每次 seek 时闪一下「暂停」。
+     * 用户意图只有 `playWhenReady` 能表达，故本回调一律用它。
+     */
+    var onPlayWhenReadyChanged: ((Boolean) -> Unit)?
     var onFormatChanged: ((SongFormat?) -> Unit)?
     var onMediaItemChanged: ((String?) -> Unit)?
     /** 引擎自动切换（完播/自动下一首）回调：仅用于播放次数统计（D1）——手动切歌不计 */
@@ -422,6 +435,41 @@ class AppState(
     var detailReturn by mutableStateOf(GlassScreen.Playlist)
         private set
 
+    /**
+     * 详情页**历史栈**（本轮新增，2026-11 导航重设计）。
+     *
+     * ## 为什么需要它（旧模型的缺陷）
+     *
+     * 旧模型只有一个 `detail` + 一个 `detailReturn`，表达的是「一层详情」。而真实路径里
+     * 详情可以连续进入：
+     *
+     * ```
+     * 歌曲 → 专辑详情 → 艺术家详情 → 另一张专辑详情
+     * ```
+     *
+     * 旧实现每次 `openDetail` 都覆盖 `detail`，`detailReturn` 只在**第一次**进入时记录。
+     * 于是从第三层按返回，会直接跳回最初的来源页，中间两层消失——用户无法原路退回。
+     *
+     * ## 现在的语义
+     *
+     * 栈里每一帧记录「回到这一层时应该显示什么」：
+     * - [DetailTarget]：这一层要看的目标；
+     * - 来源 [GlassScreen]：这一层的上一层是哪个屏（主 Tab / 搜索）。
+     *
+     * `openDetail` 压栈，`backFromDetail` 弹栈。栈空时回 [detailReturn]。
+     *
+     * ## 为什么用 List 而不是 ArrayDeque
+     *
+     * 栈需要整体参与 Compose 快照（导航态变化要触发重组），`List` 是不可变值，
+     * 每次压/弹产生新实例，快照比较天然正确。`ArrayDeque` 是可变对象，改了内容
+     * Compose 感知不到，会出现「数据变了但界面没动」这类最难查的 bug。
+     */
+    var detailStack by mutableStateOf<List<DetailStackEntry>>(emptyList())
+        private set
+
+    /** 详情栈的一帧：目标 + 进入这一层时的来源屏 */
+    data class DetailStackEntry(val target: DetailTarget, val origin: GlassScreen)
+
     /** 详情页自绘 Chrome 的底部导航高亮位：跟随「进入详情时的来源屏」，
      *  而不是硬编码 1（歌单位）——从曲库进专辑详情、或从搜索进详情时，
      *  硬编码会让导航一直亮着「歌单」，与用户认知的来源页不符（返回键反倒是正确的：
@@ -522,6 +570,10 @@ class AppState(
         libraryScrollIndex.toString(),
         libraryScrollOffset.toString(),
         playlistScroll.toString(),
+        // 详情栈（本轮新增）：编码成 "kind:id:origin" 用 \u0001 分隔。
+        // 为什么不用 JSON：这份快照只活在 rememberSaveable 里，解析器越简单越不容易
+        // 在「某一项解析失败」时整份作废（见 restoreNavigationState 的容错口径）。
+        detailStack.joinToString("\u0002") { "${it.target.kind.name}\u0001${it.target.id}\u0001${it.origin.name}" },
     )
 
     /**
@@ -546,6 +598,19 @@ class AppState(
         saved.getOrNull(7)?.toIntOrNull()?.let { libraryScrollIndex = it.coerceAtLeast(0) }
         saved.getOrNull(8)?.toIntOrNull()?.let { libraryScrollOffset = it.coerceAtLeast(0) }
         saved.getOrNull(9)?.toIntOrNull()?.let { playlistScroll = it.coerceAtLeast(0) }
+        // 详情栈（本轮新增）：逐帧解析，**任何一帧失败就丢弃整个栈**而不是保留半截——
+        // 半个栈会让返回键退到错误的目标，比退回来源页更糟。
+        saved.getOrNull(10)?.takeIf { it.isNotEmpty() }?.let { encoded ->
+            val parsed = encoded.split("\u0002").mapNotNull { frame ->
+                val parts = frame.split("\u0001")
+                if (parts.size != 3) return@mapNotNull null
+                val kind = parts[0].toDetailKindOrNull() ?: return@mapNotNull null
+                val origin = parts[2].toScreenOrNull() ?: return@mapNotNull null
+                DetailStackEntry(DetailTarget(kind, parts[1]), origin)
+            }
+            // 帧数必须与原文一致，否则说明有帧解析失败 → 整栈作废
+            if (parsed.size == encoded.split("\u0002").size) detailStack = parsed
+        }
         // 恢复到播放页时 playerOrigin 必须是个「能退出去」的页：历史上它是 Player 的坏数据
         // 会让 closePlayer 原地打转。还原时兜一刀，代价为零。
         if (playerOrigin == GlassScreen.Player) playerOrigin = GlassScreen.Library
@@ -572,6 +637,25 @@ class AppState(
 
     /** 歌单页滚动位置（px，ScrollState.value） */
     var playlistScroll by mutableIntStateOf(0)
+
+    // ── 搜索页瞬态导航态（与 libraryTab / playlistScroll 同级，不进 DataStore 快照）──
+    //
+    // 为什么必须提升到 AppState：GlassApp 的 AnimatedContent 换屏会**销毁**搜索页组合，
+    // 屏内 remember / rememberSaveable 都拿不回来。于是「搜索 → 点专辑卡进详情 → 返回」
+    // 会丢滚动位置、丢专辑展开态，还会因为 autoFocus 重新 requestFocus 而**自动弹起键盘**
+    // 遮住半屏。曲库/歌单早已为同类场景做过提升，搜索漏了。
+
+    /** 搜索结果列表首可见项下标 */
+    var searchScrollIndex by mutableIntStateOf(0)
+
+    /** [searchScrollIndex] 对应的查询词：换词才归零，从详情返回时保持原位 */
+    var searchScrollQuery by mutableStateOf<String?>(null)
+
+    /** 专辑区是否展开 */
+    var searchAlbumsExpanded by mutableStateOf(false)
+
+    /** [searchAlbumsExpanded] 生效时的查询词：换词后比较不成立即自然收起，不需要 effect */
+    var searchExpandedQuery by mutableStateOf<String?>(null)
 
     /** 记录曲库滚动位置（库屏在滚动停止时回写） */
     fun rememberLibraryScroll(index: Int, offset: Int) {
@@ -1095,17 +1179,19 @@ class AppState(
         // 但也可能是服务真的重建过、协程已经没了），代次 +1 让 syncEngineModes 的重武装判重
         // 失效，从而按**剩余时间**补发一次（见 sleepTimerArmed）。
         engineGeneration++
-        engine.onPlayingChanged = { isPlaying ->
+        engine.onPlayWhenReadyChanged = { playWhenReady ->
             // 仅在引擎驱动真实播放时回流；演示模式（stopAndClear 之后）的 false 回调不打断定时器
             if (engineLoadedUri != null) {
-                playing = isPlaying
+                playing = playWhenReady
                 // 定时关闭播完档（-1/-2）以「播放停止」为使命完成信号：服务端到点暂停会走到这里，
                 // 就地归零回显状态（服务端无回执，UI 侧自行推断）；用户手动暂停视为放弃定时
                 // （重新设置即可）；分钟档（>0）不受影响，仍按 deadline 期限推导。
+                // **判据必须是 playWhenReady 而不是 isPlaying**：seek/焦点瞬断造成的
+                // 瞬时 isPlaying=false 不是用户放弃定时（见 PlayerEngine.onPlayWhenReadyChanged）。
                 // **归零必须同时下发服务端**：只清 UI 会让 stopAfterCurrent 变成孤儿旗标——
                 // 面板显示「未开启定时」，但服务端仍 armed，恢复播放后当前曲播完的瞬间会被
                 // 无故暂停（用户视角：明明取消了定时却还是停了）。旗标无回执，只能主动撤销。
-                if (!isPlaying && sleepTimerMode < 0) {
+                if (!playWhenReady && sleepTimerMode < 0) {
                     sleepTimerMode = 0
                     sleepTimerDeadlineMs = 0L
                     engine?.setSleepTimer(0) // 撤销服务端「播完当前首/整队」旗标
@@ -1288,7 +1374,7 @@ class AppState(
      * `sleepTimerMode` 落到 0，`sleepTimerMinutesForEngine()` 会返回 null（「不触碰」）。
      * 但 Activity 重建时**服务进程是活的**，`stopAfterCurrent`/`stopAtQueueEnd` 原样保留 ——
      * 不主动撤销就是一个孤儿旗标：用户改个字号，回来听歌，当前曲自然播完的瞬间被莫名暂停，
-     * 而 UI 上「定时关闭」显示未开启。 [attachPlayer] 的 onPlayingChanged 里已经踩过同一个坑
+     * 而 UI 上「定时关闭」显示未开启。 [attachPlayer] 的 onPlayWhenReadyChanged 里已经踩过同一个坑
      * （「归零必须同时下发服务端」），这里是它的续集。
      */
     private var sleepTimerNeedsCancel = false
@@ -1858,8 +1944,17 @@ class AppState(
             // 旧版快照没有 currentSongId 字段：按原索引兜底
             else -> position.first.coerceIn(0, songs.lastIndex)
         }
+        // 扫描对**缺失时长元数据**兜底为 1s（MediaLibrary.loadMetadata）。拿它当上限钳
+        // 续播进度，会把一首实际几分钟的歌压成「从第 1 秒播」——而 effectiveDurationSec
+        // 的 KDoc 明写「兜底 1s 不得钳死真实进度」，tick/seek 都已改走引擎真值，这里漏改。
+        // 1s 是哨兵不是真时长：遇到它就不钳，交给引擎装载后的真实时长收口。
+        val scanDurationSec = songs.getOrNull(queueIndex)?.durationSec?.toFloat() ?: 0f
         progressSec = if (resolvedIndex != null || savedSongId == null) {
-            position.second.coerceIn(0f, songs.getOrNull(queueIndex)?.durationSec?.toFloat() ?: durationSec)
+            if (scanDurationSec > 1f) {
+                position.second.coerceIn(0f, scanDurationSec)
+            } else {
+                position.second.coerceAtLeast(0f)
+            }
         } else {
             0f
         }
@@ -1960,6 +2055,9 @@ class AppState(
         //    同一个 artworkUri 即使内容换了图，LRU 里那张旧位图仍然直接命中，
         //    「换了封面但界面还是老图」。clear() 同时清两者，正是这里要的语义。
         ArtworkBitmapCache.clear()
+        // 播放页大封面缓存同理：它按 mediaUri 缓存从音频里重取的高分辨率内嵌封面，
+        // 重扫可能换了文件/换了标签，留着旧图就是「换了封面但播放页还是老图」
+        PlayerArtworkCache.clear()
         // 空库终态（删光音乐 / 全部被过滤 / 首次扫描无结果）：队列与播放态一并归零，
         // 否则 currentSong 会落到占位曲而 playing 仍为 true（假播放 + 脏计数）。
         // 这里必须早于下面所有分支——空库时那些分支只会把 queue 设成空列表。
@@ -2105,6 +2203,12 @@ class AppState(
         if (sleepTimerMode < 0) {
             sleepTimerMode = 0
             sleepTimerDeadlineMs = 0L
+            // **必须同时下发服务端**：本函数的调用点里，「上一首」在播放超过 3 秒时走的是
+            // seekTo(0) 重播本曲——**不发生 mediaItemTransition**，服务端不会自行清旗标。
+            // 只清回显就留下孤儿旗标：面板显示「未开启」，曲尾却仍被暂停；而上面
+            // onPlayWhenReadyChanged 的兜底此时也失效（sleepTimerMode 已归 0，判据不成立）。
+            // 真发生切歌时服务端本就会清，这里再发一次 0 是幂等的，无副作用。
+            engine?.setSleepTimer(0)
         }
     }
 
@@ -2444,7 +2548,7 @@ class AppState(
 
     /** 生效中的定时模式（面板高亮 / 设置副标题用）：分钟档过了期限视为结束——
      *  服务端到点自行暂停且无回执，本地按期限推导归零；播完档（-1/-2）同样无回执，
-     *  由 onPlayingChanged 收到播放停止时就地归零（用户手动暂停视为放弃定时） */
+     *  由 onPlayWhenReadyChanged 收到播放停止时就地归零（用户手动暂停视为放弃定时） */
     fun effectiveSleepTimerMode(): Int {
         val mode = sleepTimerMode
         if (mode > 0 && clock() >= sleepTimerDeadlineMs) return 0
@@ -2687,6 +2791,16 @@ class AppState(
     /** 撤销条上显示的条数（0 表示无可用撤销） */
     var undoClearUpNextCount by mutableIntStateOf(0)
         private set
+
+    /**
+     * 撤销窗口**剩余毫秒**（0 = 已过期 / 无现场）。
+     *
+     * 为什么需要它：[canUndoClearUpNext] 读的是注入时钟而非快照状态，组合期读它
+     * 不建立订阅——没有别的重组源时，撤销条会在窗口过后继续挂着。面板拿这个值
+     * 起一次计时，到点主动收条（见 QueueSheet 的 undoWindowMs）。
+     */
+    fun undoClearRemainingMs(): Long =
+        if (canUndoClearUpNext) (undoDeadlineMs - clock()).coerceAtLeast(0L) else 0L
 
     /**
      * 关闭撤销窗口（超时 / 用户点了别处 / 已撤销 / 现场失效）。
@@ -3009,14 +3123,49 @@ class AppState(
         // 必须先把播放页收起，否则 playerOrigin 会被记成 Player —— 之后 closePlayer
         // 会落回 Player（自己），详情页再也退不出去。
         if (screen == GlassScreen.Player) screen = playerOrigin
-        if (screen != GlassScreen.Detail) detailReturn = screen
+        // 本轮（2026-11）：**压栈**而不是覆盖。
+        //
+        // 关键判据是 `screen != GlassScreen.Detail`：从详情 A 进入详情 B 时，
+        // 栈里已经有 A 那一帧，只需要再压 B；而 `detailReturn` 只在**首次**离开
+        // 非详情页时记录，保证栈空后能回到最初的主模块/搜索页。
+        if (screen != GlassScreen.Detail) {
+            detailReturn = screen
+            detailStack = emptyList()
+        }
+        detailStack = detailStack + DetailStackEntry(target, detailReturn)
         detail = target
         screen = GlassScreen.Detail
     }
 
-    /** 从详情页返回：回到进入前的页面（兜底歌单页） */
+    /**
+     * 从详情页返回：**弹一层栈**，栈空才回到最初的来源页。
+     *
+     * 这是本轮导航重设计的核心修复：旧实现直接跳回 `detailReturn`，中间层全部丢失。
+     * 现在「歌曲 → 专辑 → 艺术家 → 另一张专辑」可以逐级退回到歌曲。
+     */
     fun backFromDetail() {
-        screen = if (detailReturn == GlassScreen.Detail) GlassScreen.Playlist else detailReturn
+        val stack = detailStack
+        if (stack.size <= 1) {
+            // 最后一层：回到最初来源
+            detailStack = emptyList()
+            screen = if (detailReturn == GlassScreen.Detail) GlassScreen.Playlist else detailReturn
+            return
+        }
+        // 弹掉当前层，恢复到上一层
+        val remaining = stack.dropLast(1)
+        detailStack = remaining
+        remaining.lastOrNull()?.let { detail = it.target }
+        // screen 保持 Detail（仍在详情页，只是目标换了）
+    }
+
+    /**
+     * 离开详情、回到某个主模块时清空详情栈（本轮新增）。
+     *
+     * 场景：用户在「专辑详情 → 艺术家详情」中点了底部导航的「曲库」。
+     * 若不清栈，下次从曲库进详情会读到上一个模块残留的栈，返回时退到错误的层。
+     */
+    fun clearDetailStack() {
+        if (detailStack.isNotEmpty()) detailStack = emptyList()
     }
 
     // ── 错误提示 ──────────────────────────────────────────

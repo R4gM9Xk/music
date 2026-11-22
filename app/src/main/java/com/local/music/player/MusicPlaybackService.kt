@@ -36,6 +36,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 前台播放服务：ExoPlayer + MediaSession 在此托管。
@@ -131,6 +132,16 @@ class MusicPlaybackService : MediaSessionService() {
     private var sleepJob: Job? = null
     private var stopAfterCurrent = false // -1 档：当前曲自然播完的瞬间暂停
     private var stopAtQueueEnd = false // -2 档：队列/随机序走完时暂停
+
+    /**
+     * 已尝试补铺内嵌封面的 mediaId（见 [topUpCurrentArtwork]）。
+     *
+     * 为什么需要：装载队列时只给 startIndex 起的一小段铺封面（Binder 预算所限），
+     * 顺着播过那段窗口后当前曲就没有封面了。补铺按 id 记一笔，避免
+     * 「单曲循环同一首 + 封面文件本就缺失」时每轮回绕都重读一次磁盘。
+     * 上限只是防御性收口（正常曲库里远小于此），插满即整体清空重试一轮。
+     */
+    private val artworkToppedUp = LinkedHashSet<String>()
 
     // ── 睡眠定时渐弱的状态位（只有分钟档用；见 applySleepTimer 的档位说明） ──
     // 渐弱是否正在进行：决定「用户手动暂停」要不要中止渐弱并复位音量
@@ -375,6 +386,10 @@ class MusicPlaybackService : MediaSessionService() {
                     // 响度标签按需读取：只在「响度归一」开着时才付出这个 IO 代价
                     if (audioFxSettings.loudnessNorm) scheduleTrackGainRead(mediaItem)
 
+                    // 通知/锁屏封面补铺：装载时只铺了 startIndex 起的一小段（Binder 预算），
+                    // 播过窗口后当前曲封面会变默认图且永不自愈——这里按新曲补一张。
+                    topUpCurrentArtwork()
+
                     // ── 定时关闭「播完当前首」（-1 档）──────────────────────────
                     //
                     // 语义 = **当前这首自然播完就暂停**。要判两件事：
@@ -498,24 +513,37 @@ class MusicPlaybackService : MediaSessionService() {
         val index = state.index.coerceIn(0, (state.specs.size - 1).coerceAtLeast(0))
         val items = state.specs.map { it.toMediaItem() }.withArtwork(state.specs, index)
         val positionMs = (state.positionSec * 1000f).toLong().coerceAtLeast(0L)
-        // 播放模式 + 音效：直接落到播放器与两条效果链上（全部 runCatching：
-        // 音频会话此刻可能还没就绪，失败由首个 READY 的回调按同一份状态重放）
+        // 播放模式 + 音效：直接落到播放器与两条效果链上。
+        //
+        // **必须 post 回播放器的 application looper**：本函数跑在 [queueReadExecutor]
+        // 后台线程（见 onPlaybackResumption），而 ExoPlayerImpl.setRepeatMode /
+        // setShuffleModeEnabled 第一行就是 verifyApplicationThread() —— 在后台线程直接写
+        // 会抛 "Player is accessed on the wrong thread"，被 runCatching 吞掉后
+        // **同一块里后面的 shuffle / 倍速根本不会执行**。用户视角：开着随机 + 1.25x
+        // 从锁屏/蓝牙按播放，回来变成顺序 1.0x（EQ/音效因为在独立 runCatching 里反而能恢复，
+        // 恰好掩盖了这条）。
+        //
+        // 顺序仍然成立：本函数返回后调用方才 future.set(result)，media3 随后在主线程
+        // 应用 setMediaItems；这里的 post 先入队，所以 shuffle 仍早于队列装载
+        // （Media3 的 shuffle 序是在装载时生成的，装载后再开会得到与 UI 不同的顺序）。
         mediaSession?.player?.let { player ->
-            runCatching {
-                val repeatAll = state.repeatMode == "All"
-                val repeatOne = state.repeatMode == "One"
-                player.repeatMode = when {
-                    repeatOne -> Player.REPEAT_MODE_ONE
-                    repeatAll -> Player.REPEAT_MODE_ALL
-                    else -> Player.REPEAT_MODE_OFF
-                }
-                player.shuffleModeEnabled = state.shuffleOn
-                player.setPlaybackSpeed(state.playbackSpeed.takeIf { it > 0f } ?: 1f)
-            }.onFailure { Log.w(TAG, "resumption mode restore failed", it) }
-            runCatching { applyEqPreset(state.eqPreset) }
-                .onFailure { Log.w(TAG, "resumption eq restore failed", it) }
-            runCatching { applyAudioFxSettings(state.audioFx) }
-                .onFailure { Log.w(TAG, "resumption audio fx restore failed", it) }
+            android.os.Handler(player.applicationLooper).post {
+                runCatching {
+                    val repeatAll = state.repeatMode == "All"
+                    val repeatOne = state.repeatMode == "One"
+                    player.repeatMode = when {
+                        repeatOne -> Player.REPEAT_MODE_ONE
+                        repeatAll -> Player.REPEAT_MODE_ALL
+                        else -> Player.REPEAT_MODE_OFF
+                    }
+                    player.shuffleModeEnabled = state.shuffleOn
+                    player.setPlaybackSpeed(state.playbackSpeed.takeIf { it > 0f } ?: 1f)
+                }.onFailure { Log.w(TAG, "resumption mode restore failed", it) }
+                runCatching { applyEqPreset(state.eqPreset) }
+                    .onFailure { Log.w(TAG, "resumption eq restore failed", it) }
+                runCatching { applyAudioFxSettings(state.audioFx) }
+                    .onFailure { Log.w(TAG, "resumption audio fx restore failed", it) }
+            }
         }
         return MediaSession.MediaItemsWithStartPosition(items, index, positionMs)
     }
@@ -565,6 +593,9 @@ class MusicPlaybackService : MediaSessionService() {
                     .setTitle(title)
                     .setArtist(artist)
                     .setAlbumTitle(album)
+                    // 与引擎侧 MediaControllerEngine.toMediaItem 同口径：漏发时长会让
+                    // 续播/插入重建的整条队列在锁屏/车机列表里显示 --:--（下游只读 metadata）
+                    .apply { if (durationMs > 0L) setDurationMs(durationMs) }
                     .build(),
             )
             .build()
@@ -603,6 +634,54 @@ class MusicPlaybackService : MediaSessionService() {
                         .build(),
                 )
                 .build()
+        }
+    }
+
+    /**
+     * 给**当前曲**补一张内嵌封面（通知栏 / 锁屏 / 流体云 / 车机读的就是它）。
+     *
+     * ## 为什么必须补
+     * [withArtwork] 受 Binder 1MB 事务上限约束，只铺装载时 `startIndex` 起的一小段
+     * （128KB ÷ 单张 5–15KB ≈ 9–25 首）。而 `artworkUri` 是刻意不下发的
+     * （应用私有 file:// 路径，系统进程读不到，见 [SongSpec.toMediaItem]）。
+     * 两者相加的后果：歌单顺着播过那段窗口后，当前曲 `artworkData` 与 `artworkUri`
+     * **双空** → 通知/锁屏封面变默认图，且全仓没有任何补铺路径，直到用户重新点歌才恢复。
+     *
+     * ## 线程
+     * 读盘 + 解码在 IO（每首一次，不在主线程）；写播放器必须回到主线程
+     * （ExoPlayer 有 application-thread 校验）。写之前重新核对当前曲仍是同一首——
+     * 异步窗口里用户可能又切歌了，否则会把封面贴到别的歌上。
+     */
+    private fun topUpCurrentArtwork() {
+        val player = mediaSession?.player ?: return
+        val item = player.currentMediaItem ?: return
+        if (item.mediaMetadata.artworkData != null) return
+        val id = item.mediaId ?: return
+        if (id in artworkToppedUp) return
+        if (artworkToppedUp.size >= ARTWORK_TOPUP_MAX_IDS) artworkToppedUp.clear()
+        artworkToppedUp.add(id)
+        serviceScope.launch {
+            val bytes = withContext(Dispatchers.IO) {
+                runCatching {
+                    val spec = QueueStateStore.read(this@MusicPlaybackService)
+                        ?.specs?.firstOrNull { it.id == id }
+                    spec?.let { CoverArtBitmap.smallJpeg(this@MusicPlaybackService, it.artworkUri) }
+                }.getOrNull()
+            } ?: return@launch
+            val cur = player.currentMediaItem ?: return@launch
+            if (cur.mediaId != id || cur.mediaMetadata.artworkData != null) return@launch
+            runCatching {
+                player.replaceMediaItem(
+                    player.currentMediaItemIndex,
+                    cur.buildUpon()
+                        .setMediaMetadata(
+                            cur.mediaMetadata.buildUpon()
+                                .setArtworkData(bytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+                                .build(),
+                        )
+                        .build(),
+                )
+            }.onFailure { Log.w(TAG, "artwork top-up failed id=$id", it) }
         }
     }
 
@@ -859,10 +938,26 @@ class MusicPlaybackService : MediaSessionService() {
                 sleepJob = serviceScope.launch {
                     val player = mediaSession?.player
                     if (player != null) {
+                        val totalMs = modeMinutes * 60_000L
                         // 提前 FADE_MS 起渐弱；档位短于渐弱时长时立刻开始（协议最小 15 分钟，
                         // 实际不会发生，这里只是不让 delay 负数变成「永不触发」）
-                        delay((modeMinutes * 60_000L - FADE_MS).coerceAtLeast(0L))
-                        fadeOutThenPause(player)
+                        delay((totalMs - FADE_MS).coerceAtLeast(0L))
+                        if (!fadeOutThenPause(player)) {
+                            // 渐弱没落地（起渐弱时已暂停 / 中途被用户暂停打断）。
+                            // **定时语义是「到点停」，不是「到点开始渐弱」**：旧实现在这里
+                            // 直接结束协程，于是用户在到期前最后 10 秒内暂停过一次再恢复，
+                            // 音乐就越过 deadline 一直放下去，而 UI 倒计时照常走完显示「未开启」。
+                            // 补完剩余时长后硬暂停，把这条路径收口。
+                            delay(FADE_MS.coerceAtMost(totalMs))
+                            if (player.playWhenReady) {
+                                pausingForSleep = true
+                                try {
+                                    player.pause()
+                                } finally {
+                                    pausingForSleep = false
+                                }
+                            }
+                        }
                     }
                     sleepJob = null // 到点执行完清理引用（被 cancel 时走不到这里，不会误清新定时）
                 }
@@ -887,11 +982,15 @@ class MusicPlaybackService : MediaSessionService() {
      * 注意复位到的是**渐弱开始时的音量**而不是硬编码 1f：若上层将来把音量做成可调项，
      * 这里不会把它抹平。
      */
-    private suspend fun fadeOutThenPause(player: Player) {
+    /**
+     * @return true = 已经落地暂停；false = 渐弱被中止（起渐弱时已暂停 / 中途用户暂停），
+     *   调用方**必须**自行补完剩余时长再暂停，否则定时静默失效（见 [applySleepTimer]）。
+     */
+    private suspend fun fadeOutThenPause(player: Player): Boolean {
         if (!player.playWhenReady) {
             // 已经暂停：没有可渐弱的音频，直接收尾。不写 volume 是刻意的——
             // 避免无意义地 0→原值 抖一次（有些设备会听到轻微 pop）
-            return
+            return false
         }
         val restoreVolume = player.volume.coerceIn(0f, 1f).let { if (it <= 0f) 1f else it }
         fadeInProgress = true
@@ -899,7 +998,8 @@ class MusicPlaybackService : MediaSessionService() {
         try {
             val steps = (FADE_MS / FADE_STEP_MS).toInt().coerceAtLeast(1)
             for (i in 1..steps) {
-                if (fadeAborted) return // 用户手动暂停：交 finally 复位音量，定时照旧保留
+                // 用户手动暂停：交 finally 复位音量，并由调用方补完剩余时长后暂停
+                if (fadeAborted) return false
                 player.volume = restoreVolume * (1f - i.toFloat() / steps)
                 delay(FADE_STEP_MS)
             }
@@ -907,6 +1007,7 @@ class MusicPlaybackService : MediaSessionService() {
             // 没有这面旗，渐弱自己的暂停会被当成「用户手动暂停」
             pausingForSleep = true
             player.pause()
+            return true
         } finally {
             fadeInProgress = false
             pausingForSleep = false
@@ -1020,6 +1121,9 @@ class MusicPlaybackService : MediaSessionService() {
 
         /** 渐弱步进间隔：10s / 150ms ≈ 67 步，听感连续，主线程开销可忽略 */
         private const val FADE_STEP_MS = 150L
+
+        /** 封面补铺已尝试 id 集合的容量上限（防御性收口，见 [artworkToppedUp]） */
+        private const val ARTWORK_TOPUP_MAX_IDS = 2048
 
         /** 5 频段（低→高）增益表，单位 dB，幅度控制在 ±6 内 */
         private fun eqGainsFor(presetName: String?): FloatArray? = when (presetName) {

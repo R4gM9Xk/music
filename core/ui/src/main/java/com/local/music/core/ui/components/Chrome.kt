@@ -1,6 +1,8 @@
 package com.local.music.core.ui.components
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -56,6 +58,7 @@ import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.GlassText
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
+import com.local.music.core.ui.theme.LocalVisualStyle
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.S
 import kotlinx.coroutines.flow.collectLatest
@@ -318,13 +321,22 @@ fun ProgressTrack(
     onPreview = onPreview,
 )
 
-/** 悬浮迷你条：62h / 圆角 20 / hi 玻璃，底部 2.5px 进度线。
+/** 悬浮迷你条：60h / 圆角 20 / hi 玻璃，底部 2.5px 进度线。
  *
- *  [hasSongs] = false（空曲库 / 权限被拒）时**不渲染播放与下一首按钮**：
- *  旧实现无门控，空曲库下迷你条显示占位曲「暂无歌曲 / 本地曲库」+ 两个可点按钮，
- *  而 togglePlayPause / next 内部有 hasSongs 守卫 → 点了完全没反应，纯死按钮。
+ *  ## 本轮重设计（2026-11）：从「两块悬浮胶囊」到「一块控制底座」
  *
- *  **本参数刻意不给默认值**（本轮修复）：默认 `true` 让「忘记传」不报错、不崩溃，
+ *  旧结构是迷你条 + 导航胶囊两块独立的悬浮玻璃，中间留 8dp 缝。问题有三：
+ *  1. 两块玻璃各自投一次阴影、各自带一次描边，视觉上是两个物体在争夺注意力；
+ *  2. 加起来 128dp 的高度把可读内容压得很紧，尤其在小屏上；
+ *  3. 两者在功能上其实是**同一个东西**——「我现在在听什么」与「我在哪」。
+ *
+ *  现在合并为 [GlassChrome] 里的单一控制底座：上半是迷你播放区，下半是导航，
+ *  中间一条 1dp 分隔线。圆角、阴影、材质只有一份。
+ *
+ *  [hasSongs] = false（空曲库 / 权限被拒）时**不渲染播放与下一首按钮**，
+ *  且 [GlassChrome] 会把整块迷你播放区收起来（见那里）。
+ *
+ *  **本参数刻意不给默认值**：默认 `true` 让「忘记传」不报错、不崩溃，
  *  只静默退化成死按钮 —— GlassApp 传了，但 SearchScreen 与 PlaylistDetailScreen
  *  都漏了（三处调用点只有一处生效）。改成必填后，任何漏传都是编译错误。 */
 @Composable
@@ -342,20 +354,16 @@ fun MiniPlayerBar(
     val glass = LocalGlassColors.current
     val flight = LocalPlayerFlight.current
     val interactionSource = remember { MutableInteractionSource() }
-    GlassSurface(
-        modifier = modifier
+    // 迷你条不再自持玻璃容器：它现在是控制底座的上半段，容器由 GlassChrome 提供。
+    // 这样「一块底座」只有一个圆角、一份阴影、一处材质来源。
+    Box(
+        modifier
             .fillMaxWidth()
-            .height(62.dp)
+            .height(60.dp)
             .trackFlight(FlightKeys.MiniGlass, keepOnDispose = true)
-            .graphicsLayer { alpha = flight?.miniSharedAlpha() ?: 1f },
-        level = GlassLevel.Hi,
-        shape = RoundedCornerShape(R.Player28.dp),
-        blur = GlassLevel.Hi,
-        // 与队列面板同源的玻璃内衬（glassVeil）：轻 veil 让模糊背景透出，呈现播放队列
-        // 那种通透玻璃质感，而非厚 chromeScrim 压成的近实色板。代价是滚动列表的透字
-        // 会隐约可见（雾里的轮廓）——这是通透感的有意取舍。飞行替身读同一份 veil。
-        scrim = glassVeil(),
-        onClick = onClick,
+            .graphicsLayer { alpha = flight?.miniSharedAlpha() ?: 1f }
+            .clip(RoundedCornerShape(20.dp))
+            .clickable(interactionSource = interactionSource, indication = null, onClick = onClick),
     ) {
         Row(
             Modifier.fillMaxSize().padding(horizontal = S.Gap12.dp),
@@ -364,40 +372,20 @@ fun MiniPlayerBar(
         ) {
             ArtThumb(
                 song.art,
-                Modifier.trackFlight(FlightKeys.MiniCover, keepOnDispose = true).size(42.dp),
-                // C4 嵌套圆角共心推导：外容器 R28、内边距 12dp → 内侧应为 28−12=16dp。
-                // 原来是 Thumb10，与外弧不平行，四角「脏」但说不出哪里错（见 R.nested 的推导）。
-                // 结果 16 落在 R 刻度之外，此处**几何正确优先于刻度一致**——刻度本身也服务于嵌套关系。
-                //
-                // ⚠️ 这里刻意写 16.dp 字面量而**不写 R.nested(R.Player28, 12)**：
-                // R.nested 是 object R 的**运行时函数**，本仓曾因它触发一次 P0——`object R` 的
-                // 全部字段都是 `const val`（编译期内联），改造前没有任何代码在运行时引用 R 类
-                // 本体，AGP 的 dex 处理便把它剔出了 APK（debug 与 release 均复现
-                // NoClassDefFoundError，详见 docs/2026-11-08-visual-design-audit.md §10.7③）。
-                // 只要不引入对 R 的运行时引用，字面量就是最安全的形态。
-                // **将来在代码里引用 R.nested / 非 const 成员前，必须先解决类被剔除的问题**
-                // （加 keep 规则或把 nested 挪成 @JvmStatic 顶层函数并验证 dex），否则又是同款崩溃。
-                //
-                // ⚠️ 对端：PlayerFlightOverlay 的封面替身起点圆角同样是 16.dp 字面量
-                // （不是 R.Thumb10）。那边是一份独立的值，改这里必须同步改那边，
-                // 否则起飞/落地那一帧 42dp 封面的四角弧线会跳变（旧值 10dp 时差 6dp，肉眼可辨）。
-                RoundedCornerShape(16.dp),
+                Modifier.trackFlight(FlightKeys.MiniCover, keepOnDispose = true).size(40.dp),
+                // 嵌套圆角共心推导：底座圆角 20、内边距 12 → 内侧应为 8dp。
+                // 这与 SkeuoShape.Chip / R.Thumb10 都不同，是几何正确优先于刻度一致的一处。
+                RoundedCornerShape(8.dp),
                 bordered = true,
                 // coverBitmap 恒为 null（扫描不再预解码全库）；真封面经 artworkUri 按需解码
                 bitmap = song.coverBitmap,
                 artworkUri = song.artworkUri,
             )
             Column(Modifier.weight(1f)) {
-                // B3：15sp SemiBold 裸写对齐 RowStrong（15 SemiBold 21）——语义与数值都一致
+                // 15sp SemiBold 对齐 RowStrong（15 SemiBold 21）
                 Text(song.title, color = glass.textPrimary, style = GlassText.RowStrong,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.trackFlight(FlightKeys.MiniTitle, keepOnDispose = true))
-                // B3：艺术家名 11sp → Caption（12sp），与 SongRow 副标题同 token。
-                // 原 11sp 让迷你条副标题比列表副标题还小一档，同一信息在相邻两块 chrome 里
-                // 值不同字号——这是「token 没有着力点」的典型表现（见 GlassText 的 KDoc）。
-                // ⚠️ 对端：PlayerFlightOverlay 的歌手行替身 sizeFrom/lineFrom 必须同为
-                // 12/16（Caption 端点）。替身旧值 11/14 曾导致起飞瞬间副标题缩小一档——
-                // 改这里的 style 必须同步改那边。
                 Text(song.artist, color = glass.textSecondary, style = GlassText.Caption,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.trackFlight(FlightKeys.MiniArtist, keepOnDispose = true))
@@ -411,39 +399,31 @@ fun MiniPlayerBar(
                     modifier = Modifier.trackFlight(FlightKeys.MiniPlay, keepOnDispose = true),
                 ) {
                     Icon(if (playing) GlassIcons.Pause else GlassIcons.Play, null,
-                        Modifier.size(22.dp), tint = glass.textPrimary)
+                        Modifier.size(20.dp), tint = glass.textPrimary)
                 }
                 MiniBarButton(
                     onClick = onNext,
                     contentDescription = "下一首",
                     modifier = Modifier.trackFlight(FlightKeys.MiniNext, keepOnDispose = true),
                 ) {
-                    Icon(GlassIcons.Next, null, Modifier.size(22.dp), tint = glass.textPrimary)
+                    Icon(GlassIcons.Next, null, Modifier.size(20.dp), tint = glass.textPrimary)
                 }
             }
         }
-        // 底部进度线（.mini .ml）：绘制期读进度（同上，避免 10Hz 重组迷你条整行）
-        // 空曲库（hasSongs = false）时进度恒为 0：不读 progressProvider，画出全空轨道，
-        // 避免占位曲场景下显示一条来历不明的填充（P2-11）
+        // 底部进度线：绘制期读进度（避免 10Hz 重组迷你条整行）
         //
-        // 增-P1-A：这里同样走帧级平滑——迷你条是**常驻可见**的进度指示，10Hz 阶梯在它
-        // 2.5dp 的细线上尤其明显（一格 2.5px 的跳变比粗轨道更扎眼）。平滑器与主进度轨
-        // 各持一份实例（两者是独立组合节点，共享一份反而会互相打断动画）。
+        // 空曲库（hasSongs = false）时进度恒为 0：不读 progressProvider，画出全空轨道，
+        // 避免占位曲场景下显示一条来历不明的填充。
         val smoothMini = rememberSmoothProgress(progressProvider)
         Box(
             Modifier
                 .align(Alignment.BottomStart)
                 .padding(horizontal = S.Gap12.dp)
                 .fillMaxWidth()
-                .height(2.5.dp)
-                .clip(RoundedCornerShape(2.dp))
+                .height(2.dp)
+                .clip(RoundedCornerShape(1.dp))
                 .background(glass.textPrimary.copy(alpha = 0.15f))
                 .drawWithCache {
-                    // D6：与主进度轨统一为纯 seed2（原来是 seed2→textPrimary 渐变）。
-                    // 迷你条这条线只有 2.5dp 高、几十到三百 dp 宽，渐变在里面几乎不可辨，
-                    // 反而是「两条进度指示器不是同一个东西」这种不一致最容易被看见。
-                    // ⚠️ 对端：PlayerFlightOverlay 的迷你条进度线替身也必须画**纯色** seed2。
-                    // 替身旧实现仍带渐变，起飞/落地瞬间这条线的右端颜色会跳变——改这里必须同步。
                     val fill = palette.seed2
                     onDrawBehind {
                         val shown = if (hasSongs) smoothMini.value.coerceIn(0f, 1f) else 0f
@@ -490,20 +470,20 @@ private fun MiniBarButton(
     ) { content() }
 }
 
-/** 底导航胶囊：58h / 圆角 99 / md 玻璃 + hi 模糊层级，3 项，选中项白色 + 字重加粗
+/** 底导航：54h，3 项，选中项由「颜色 + 字重 + 短指示线」三重信号表达。
  *
- *  **D6 去装饰（视觉审计）**：选中项原有的彩色径向光晕（30dp drawCircle of
- *  radialGradient(seed2 α0.9)）已删除。常驻光晕是「展示柜」语言——它把一个
- *  「我现在在哪」的状态指示，做成了一个持续发光的装饰物；而且它与「硬切」（增-P3）
- *  是同一个问题的两面：光晕本身是瞬现瞬隐的，没有过渡。
+ *  ## 本轮重设计（2026-11）
  *
- *  **删掉光晕后选中态仍然可辨吗？可辨，但必须补层级**（这是本条的判断，不是照抄任务书）：
- *  只留 `tint = textPrimary` vs `textTertiary` 的纯色差是**单维度**信号，而 token-baseline
- *  要求层级差 ≥2 维度；且 textTertiary 白 50% 叠在 chromeScrim 压过的深玻璃上，
- *  实际对比差比数值看起来更小。所以用**字形维度**补齐（不加回任何发光元素）：
- *   1. 文字 SemiBold vs Normal（字重）
- *   2. 图标 22dp vs 20dp（尺寸，+21% 面积）
- *  两个维度都不引入新图层、不新增 draw 调用，纯排版属性差异。
+ *  旧实现是一个独立的悬浮胶囊，带自己的玻璃、自己的描边和自己的模糊。
+ *  现在它是 [GlassChrome] 控制底座的下半段——不再持有容器，只负责排列三个入口。
+ *
+ *  选中态的三重信号（替代旧版的彩色径向光晕）：
+ *  1. **颜色**：textPrimary vs textTertiary；
+ *  2. **字重**：SemiBold vs Normal；
+ *  3. **短指示线**：选中项上方 16×2dp 的强调色短线。
+ *
+ *  为什么用指示线而不是把图标放大：图标尺寸变化会让整列高度跳 2dp，标签基线跟着动；
+ *  指示线是独立的绘制层，不参与布局。
  */
 @Composable
 fun GlassNavBar(
@@ -513,96 +493,82 @@ fun GlassNavBar(
 ) {
     val glass = LocalGlassColors.current
     // 文案与目标页必须一致：index 0/1/2 = 曲库 / 歌单 / 设置（GlassApp 的 TAB_SCREENS 序）。
-    // 旧文案「曲库 / 发现 / 我的」是设计稿残留——「发现」实际跳的是歌单页、「我的」跳的是
-    // 设置页，图标（指南针/人形）也跟着错位，三处都不符，属纯文案缺陷而非设计意图。
     val items = listOf(
         Triple(NavLabel.Library, GlassIcons.Home, 0),
         Triple(NavLabel.Playlist, GlassIcons.Queue, 1),
         Triple(NavLabel.Settings, GlassIcons.Gear, 2),
     )
-    GlassSurface(
-        modifier = modifier.fillMaxWidth().height(58.dp),
-        // 填充与模糊都升到 Hi（与迷你条同级）：两者都是悬浮 chrome，本该同一材质等级。
-        level = GlassLevel.Hi,
-        shape = CircleShape,
-        blur = GlassLevel.Hi,
-        // 与迷你条 / 队列面板同源的玻璃内衬（glassVeil）：弃用厚 chromeScrimNav，
-        // 让导航胶囊与迷你条一样透出模糊背景，呈现播放队列的通透玻璃质感。
-        scrim = glassVeil(),
-    ) {
-        Row(Modifier.fillMaxSize()) {
-            items.forEach { (label, icon, index) ->
-                val on = selected == index
-                val interactionSource = remember { MutableInteractionSource() }
-                // 增-P3（硬切）的视觉侧：选中/未选中色改为 250ms 渐变。
-                // 旧实现是 if/else 直取两个 token，点击瞬间色值一步跳到终点；
-                // 导航是最高频的交互，硬切在观感上就是「廉价」。
-                // animateColorAsState 在这里只驱动 Icon.tint 与 Text.color 两个颜色
-                // （颜色动画走绘制层，不触发额外布局），成本可忽略。
-                val tintColor by animateColorAsState(
-                    targetValue = if (on) glass.textPrimary else glass.textTertiary,
-                    animationSpec = GlassMotion.tweenHover<Color>(),
-                    label = "navTint",
-                )
-                Column(
+    Row(modifier.fillMaxWidth().height(54.dp)) {
+        items.forEach { (label, icon, index) ->
+            val on = selected == index
+            val interactionSource = remember { MutableInteractionSource() }
+            // 选中/未选中色改为 250ms 渐变（硬切在观感上就是「廉价」）
+            val tintColor by animateColorAsState(
+                targetValue = if (on) glass.textPrimary else glass.textTertiary,
+                animationSpec = GlassMotion.tweenHover<Color>(),
+                label = "navTint",
+            )
+            // 指示线的透明度同样走动画：切换时它应该「长出来」而不是「跳出来」
+            val indicatorAlpha by animateFloatAsState(
+                targetValue = if (on) 1f else 0f,
+                animationSpec = GlassMotion.tweenHover(),
+                label = "navIndicator",
+            )
+            Column(
+                Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .pressScale(interactionSource, pressed = 0.94f)
+                    .clickable(interactionSource = interactionSource, indication = null) { onSelect(index) }
+                    .semantics {
+                        this.role = Role.Tab
+                        this.selected = on
+                        // 显式 contentDescription：Icon 没有描述、Column 又没合并子节点，
+                        // 不指定时 TalkBack 会把「空图标 + 文字」拆成两个节点。
+                        this.contentDescription = label
+                    },
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                // 指示线：固定 2dp 高度占位，透明度动画控制显隐——不参与布局变化
+                Box(
                     Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .pressScale(interactionSource, pressed = 0.94f)
-                        .clickable(interactionSource = interactionSource, indication = null) { onSelect(index) }
-                        .semantics {
-                            this.role = Role.Tab
-                            this.selected = on
-                            // tab 的可见文字就是标签本身，但 Icon 没有描述、Column 又没合并子节点：
-                            // 不显式给 contentDescription 时，TalkBack 会把「图标(无描述) + 文字」
-                            // 拆成两个节点，读屏出现一个空节点。显式指定后整列合并为单个可读 tab。
-                            this.contentDescription = label
-                        },
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    // D6 去装饰：这里原来是一个 30dp 的彩色径向光晕（见函数 KDoc）。
-                    // 现在选中态的层级由**两处**共同承担，不再需要任何发光元素：
-                    //   1. 颜色 contrast —— textPrimary（白）vs textTertiary（白50%）；
-                    //   2. 图标尺寸 —— 选中 22dp vs 未选中 20dp（约 +21% 面积）。
-                    // 两条各只差一档，但**同时**作用在同一个元素上，叠加后足以在余光下
-                    // 分辨出「哪一列是亮的」；且都不涉及新增图层（无额外 draw 调用）。
-                    //
-                    // 外层 Box 固定 22dp 是**必须的**：图标尺寸随选中态变化，若让它直接
-                    // 参与 Column 测量，选中切换时整列高度变 2dp → 标签基线上下跳 1dp。
-                    // 固定容器后图标在内部居中缩放，布局零跳动。
-                    Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
-                        Icon(
-                            icon, null, Modifier.size(if (on) 22.dp else 20.dp),
-                            tint = tintColor,
-                        )
-                    }
-                    Spacer(Modifier.height(3.dp))
-                    // B3：标签 → Micro（11sp）。
-                    //
-                    // 选中态用 NavLabelSelectedStyle（Micro 的 SemiBold 派生）而不是在 Text 上
-                    // 再写一个 fontWeight —— 那会让 `style` 与 `fontWeight` 并存，正是
-                    // GlassText 的 KDoc 明确禁止的写法（覆盖式用法没有着力点，值会重新漂移）。
-                    // 派生放成文件级 val 而不是就地 .copy()：后者每次重组都新建 TextStyle。
-                    //
-                    // 为什么必须加粗：光晕删除后这是「看得见的选择器」的主要信号。
-                    // 纯颜色差在取色可变的极光底上不够稳（seed 一变，textPrimary 与
-                    // textTertiary 的实际观感差就跟着变），字重是**与背景无关**的层级信号。
-                    Text(
-                        label,
-                        style = if (on) NavLabelSelectedStyle else GlassText.Micro,
-                        color = tintColor,
-                    )
-                }
+                        .size(width = 16.dp, height = 2.dp)
+                        .clip(RoundedCornerShape(1.dp))
+                        .background(com.local.music.core.ui.theme.auroraAccentColor().copy(alpha = indicatorAlpha)),
+                )
+                Spacer(Modifier.height(5.dp))
+                Icon(icon, null, Modifier.size(22.dp), tint = tintColor)
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    label,
+                    style = if (on) NavLabelSelectedStyle else GlassText.Micro,
+                    color = tintColor,
+                )
             }
         }
     }
 }
 
-/** 屏幕底部 chrome：迷你条 + 胶囊导航（左右 12、下 10，悬浮于极光之上）
+/** 屏幕底部 chrome：**统一控制底座**（迷你播放区 + 分隔线 + 导航区）
+ *
+ *  ## 本轮重设计（2026-11）：从两块悬浮胶囊到一块底座
+ *
+ *  旧结构是 `Column { MiniPlayerBar; Spacer(8dp); GlassNavBar }`，两块各自悬浮的玻璃。
+ *  新结构是**一块**圆角 20dp 的玻璃底座，上半迷你播放、下半导航、中间 1dp 分隔线：
+ *
+ *  - 只投一次阴影、只有一处描边、只有一个圆角来源；
+ *  - 总高度从 128dp 降到 115dp，可读内容多出 13dp；
+ *  - 「我在听什么」与「我在哪」在视觉上被明确归为同一个东西。
+ *
+ *  ## 空曲库：整块迷你播放区收起
+ *
+ *  `hasSongs = false` 时不渲染上半区（也不渲染分隔线），底座高度收到 54dp。
+ *  这比「显示占位曲 + 两个死按钮」正确得多——没有歌就没有「正在播放」这回事。
+ *  高度变化走 200ms 动画，不硬切。
  *
  *  [progressProvider] 而非 Float：见 [ProgressTrack] 的说明——进度是 10Hz 变的状态，
- *  以 Float 形参传入会让**调用方屏幕**每 tick 重组一次（Chrome + NavBar + 封面链全部重跑）。 */
+ *  以 Float 形参传入会让**调用方屏幕**每 tick 重组一次。 */
 @Composable
 fun GlassChrome(
     song: DemoSong,
@@ -617,23 +583,72 @@ fun GlassChrome(
     modifier: Modifier = Modifier,
 ) {
     val flight = LocalPlayerFlight.current
+    // 迷你播放区高度：有歌 60dp，无歌 0dp（动画过渡，不硬切）
+    val miniHeight by animateDpAsState(
+        targetValue = if (hasSongs) 60.dp else 0.dp,
+        animationSpec = GlassMotion.tweenHover(),
+        label = "miniHeight",
+    )
+    val dividerAlpha by animateFloatAsState(
+        targetValue = if (hasSongs) 1f else 0f,
+        animationSpec = GlassMotion.tweenHover(),
+        label = "dividerAlpha",
+    )
+    val glass = LocalGlassColors.current
+    val skeuoMode = LocalVisualStyle.current == com.local.music.core.ui.state.VisualStyle.Skeuomorph
     Column(
         modifier
             .fillMaxWidth()
-            .navigationBarsPadding() // 手势条悬浮于 chrome 之下（对应设计稿 homebar）
-            // 底距 10dp → S.Gap12（归位口径「10 就近取让留白不缩小的一档」）。
-            // 这是 chrome 与手势条之间的呼吸缝，略松比略挤安全：收紧会让胶囊压到手势区。
+            .navigationBarsPadding() // 手势条悬浮于 chrome 之下
             .padding(start = S.Gap12.dp, end = S.Gap12.dp, bottom = S.Gap12.dp),
     ) {
-        MiniPlayerBar(song, playing, progressProvider, onOpenPlayer, onPlayPause, onNext, hasSongs = hasSongs)
-        Spacer(Modifier.height(NavBarBottomInsetSpacer))
-        // 导航胶囊：飞行期间随 t 消隐/复原；rect 供进入飞行的覆盖层渐隐替身使用
-        GlassNavBar(
-            navSelected, onNavSelect,
-            Modifier
+        GlassSurface(
+            modifier = Modifier
+                .fillMaxWidth()
                 .trackFlight(FlightKeys.MiniNav, keepOnDispose = true)
                 .graphicsLayer { alpha = flight?.navAlpha() ?: 1f },
-        )
+            level = GlassLevel.Hi,
+            shape = RoundedCornerShape(20.dp),
+            blur = GlassLevel.Hi,
+            // 「模糊挡字」配方（见 MiniPlayerBar 旧注释与 BlurVeilKind 对比表）：
+            // 现在整块底座共用一份材质，不再分两块各自配一遍。
+            blurVeil = BlurVeilKind.Chrome,
+            scrim = glassVeil(),
+            // 拟物档：底部底座是**机身面板**（平放），不是浮起来的封套。
+            // 给它 Sleeve 会让它带着大投影浮在列表上，与「底座压在最下面」的物理关系相反。
+            skeuoRole = com.local.music.core.ui.theme.SkeuoRole.Body,
+        ) {
+            Column(Modifier.fillMaxWidth()) {
+                if (miniHeight > 0.dp) {
+                    Box(Modifier.fillMaxWidth().height(miniHeight)) {
+                        MiniPlayerBar(
+                            song, playing, progressProvider, onOpenPlayer, onPlayPause, onNext,
+                            hasSongs = hasSongs,
+                        )
+                    }
+                    // 分隔线：1dp，只在有迷你播放区时出现。
+                    // 用 token 色而不是硬编码白/黑——深浅主题下它必须自动反转。
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = S.Gap16.dp)
+                            .height(1.dp)
+                            .background(
+                                if (skeuoMode) {
+                                    com.local.music.core.ui.theme.LocalSkeuomorphColors.current.separator
+                                } else {
+                                    glass.textPrimary.copy(alpha = 0.08f * dividerAlpha)
+                                },
+                            ),
+                    )
+                }
+                // 导航区：飞行期间随 t 消隐/复原
+                GlassNavBar(
+                    navSelected, onNavSelect,
+                    Modifier.graphicsLayer { alpha = flight?.navAlpha() ?: 1f },
+                )
+            }
+        }
     }
 }
 
@@ -645,16 +660,11 @@ object NavLabel {
 }
 
 /**
- * 主屏列表底部避让高度：悬浮 Chrome（迷你条 62 + 间距 8 + 导航 58 + 底距 12 = 140dp）+ 余量 6dp。
+ * 主屏列表底部避让高度：统一控制底座（迷你播放 60 + 分隔 1 + 导航 54 + 底距 12 = 127dp）+ 余量 8dp。
  *
  * 单点定义的原因：曲库/歌单/设置三个主屏原本各自硬编码 `Spacer(height = 146.dp)`，
  * Chrome 高度一改就要同步改三处，漏一处就是最后一行被迷你条盖住（且很难在评审里发现）。
  *
- * 注：底距由 10dp 归位到 [S.Gap12] 后，实际占用从 138 涨到 140dp；146 仍有 6dp 余量，
- * **不需要跟着改**。但若将来继续加大 chrome 组件高度，这里必须同步——
- * 6dp 已经不宽裕，再加就会真的盖住最后一行。
+ * 本轮控制底座从 128dp 降到 115dp（两块胶囊合并），避让值同步从 146 收到 135。
  */
-val ChromeBottomInset: androidx.compose.ui.unit.Dp = 146.dp
-
-/** 迷你条与导航胶囊之间的间距（[ChromeBottomInset] 的构成之一，避免两处魔数漂移） */
-private val NavBarBottomInsetSpacer = S.Gap8.dp
+val ChromeBottomInset: androidx.compose.ui.unit.Dp = 135.dp

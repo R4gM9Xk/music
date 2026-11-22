@@ -214,6 +214,40 @@ class UpdateManager(
         }
     }
 
+    /**
+     * 回到前台时的续装入口：用户被跳去系统页授权「安装未知应用」，回来时自动接着装。
+     *
+     * 为什么需要：安装器被系统拦住时 App 会跳 `ACTION_MANAGE_UNKNOWN_APP_SOURCES`，
+     * 而授权页对用户是黑盒。旧实现跳过去就断了——用户授权回来看到的还是「点击安装」，
+     * 得自己再找一遍入口，很容易以为「更新坏了」就放弃了。
+     *
+     * 只在 [UpdateUiState.awaitingInstallPermission] 为真时动作：普通回前台（切出去看消息、
+     * 接电话）不该凭空拉起安装器。授权未生效（用户只是按了返回）时 install() 会再次
+     * 跳授权页——那正是「还没允许」的正确反馈，不算抖动。
+     */
+    fun resumeInstallIfWaiting() {
+        if (!state.awaitingInstallPermission) return
+        if (!apkFile.isFile) {
+            // 包在等待期间被系统清理了：清位并如实说明，别让用户回来面对一个死状态
+            state = state.copy(
+                status = UpdateUiState.Status.Failed,
+                message = "安装包已丢失，请重新下载",
+                failStage = UpdateUiState.FailStage.Install,
+                awaitingInstallPermission = false,
+            )
+            return
+        }
+        // **只有真的拿到权限才续装**。不能无脑调 install()：那条路径在权限仍缺时会
+        // 再次跳授权页，而用户是按返回键离开的——于是「返回 → 被弹回系统设置 →
+        // 再返回 → 再被弹回」，怎么都退不出去。没拿到就清位，回到「点击安装」，
+        // 让用户自己决定何时再试。
+        if (!context.packageManager.canRequestPackageInstalls()) {
+            state = state.copy(awaitingInstallPermission = false)
+            return
+        }
+        install()
+    }
+
     /** 拉起系统安装器（已下载即可反复调用）；未授权时跳授权页 */
     fun install() {
         if (!apkFile.isFile) {
@@ -242,11 +276,30 @@ class UpdateManager(
             return
         }
         if (!context.packageManager.canRequestPackageInstalls()) {
-            context.startActivity(
-                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            // 置位再跳：系统授权页对用户是**黑盒**（一串看不懂的开关），跳过去不解释一句
+            // 只会让人以为 App 出错了。这个标记让设置页把副标题改成明确的「去允许安装
+            // 未知应用，返回后会自动继续」，并让宿主在 ON_RESUME 时补一次 install()——
+            // 旧实现跳过去就断了，用户授权回来还要自己再找一遍「安装已下载的更新」。
+            state = state.copy(
+                status = UpdateUiState.Status.ReadyToInstall,
+                awaitingInstallPermission = true,
             )
+            runCatching {
+                context.startActivity(
+                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            }.onFailure {
+                // 没有这个系统页（个别定制 ROM）：清位并给出可执行的原因，而不是停在
+                // 「正在等授权」这个永远不前进的状态上
+                android.util.Log.w("UpdateManager", "open unknown-sources settings failed", it)
+                state = state.copy(awaitingInstallPermission = false)
+            }
             return
+        }
+        // 权限已具备：清掉等待标记，再拉起安装器
+        if (state.awaitingInstallPermission) {
+            state = state.copy(awaitingInstallPermission = false)
         }
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apkFile)
         context.startActivity(

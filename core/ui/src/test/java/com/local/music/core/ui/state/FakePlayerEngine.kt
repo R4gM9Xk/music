@@ -31,7 +31,7 @@ import com.local.music.core.ui.state.AudioFxSettings
 class FakePlayerEngine : PlayerEngine {
 
     // ── 回调槽位（AppState.attachPlayer 会填充）─────────────
-    override var onPlayingChanged: ((Boolean) -> Unit)? = null
+    override var onPlayWhenReadyChanged: ((Boolean) -> Unit)? = null
     override var onFormatChanged: ((SongFormat?) -> Unit)? = null
     override var onMediaItemChanged: ((String?) -> Unit)? = null
     override var onAutoAdvanced: ((String?) -> Unit)? = null
@@ -183,10 +183,10 @@ class FakePlayerEngine : PlayerEngine {
         onAutoAdvanced?.invoke(previousId)
     }
 
-    /** 模拟「引擎播放态变化」 */
+    /** 模拟「引擎播放意图变化」（playWhenReady，不是瞬时 isPlaying） */
     fun emitPlayingChanged(isPlaying: Boolean) {
         playing = isPlaying
-        onPlayingChanged?.invoke(isPlaying)
+        onPlayWhenReadyChanged?.invoke(isPlaying)
     }
 
     /** 模拟引擎报错（recovered 见 [PlayerEngine.onError] 注释） */

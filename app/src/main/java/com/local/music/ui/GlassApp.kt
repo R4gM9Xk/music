@@ -27,12 +27,11 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -79,6 +78,7 @@ import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionToken
 import com.local.music.crash.CrashHandler
 import com.local.music.core.ui.components.AuroraBackground
+import com.local.music.core.ui.components.SkeuomorphBackground
 import com.local.music.core.ui.components.BackgroundMode
 import com.local.music.core.ui.components.DesktopLyricsStyle
 import com.local.music.core.ui.components.GlassChrome
@@ -100,6 +100,7 @@ import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.GlassScreen
 import com.local.music.core.ui.state.RestoreReport
 import com.local.music.core.ui.state.ThemeMode
+import com.local.music.core.ui.state.VisualStyle
 import com.local.music.core.ui.state.restoreReportMessage
 import com.local.music.core.ui.theme.GlassMotion
 import com.local.music.core.ui.theme.GlassText
@@ -187,9 +188,17 @@ fun GlassApp(
     // 等 hasSongs 变 true 再消费：这是唯一的正确时机。事件本身保留在
     // openPlayerFromNotification 里，不会被「等太久」丢掉——除非用户中途自己
     // 导航去了别处（下面的 screen 判据），那说明他的意图已经变了。
-    LaunchedEffect(openPlayerFromNotification, state.hasSongs) {
+    // **flag.value 必须在组合期读出来当 key**：LaunchedEffect 只在 key 变化时重启，
+    // 而在协程体里读 MutableState **不建立订阅**。旧写法把 MutableState 实例本身当 key
+    // （它永远是同一个对象），于是热启动路径——MainActivity.onNewIntent 写 flag=true，
+    // 此时 hasSongs 早已是 true——两个 key 都不变，事件永不被消费：
+    // 用户点媒体通知回到 App 落在上次那一页，而不是播放页（冷启动才碰巧生效，
+    // 因为那时 hasSongs 会 false→true 触发一次重启）。残留的 true 还会在日后
+    // hasSongs 翻转时突然误跳一次。
+    val pendingNotificationOpen = openPlayerFromNotification?.value == true
+    LaunchedEffect(pendingNotificationOpen, state.hasSongs) {
         val flag = openPlayerFromNotification ?: return@LaunchedEffect
-        if (!flag.value) return@LaunchedEffect
+        if (!pendingNotificationOpen) return@LaunchedEffect
         if (!state.hasSongs) return@LaunchedEffect
         flag.value = false // 消费掉：旋转/后续重组不再重复触发
         // 已经在播放页就不动（用户可能正看着它，重复 openPlayer 会重置飞行态）
@@ -563,6 +572,9 @@ fun GlassApp(
     // navigationState() 的 KDoc 点名「症状没修掉一半」的那个状态。
     LaunchedEffect(
         state.screen, state.detail, state.detailReturn, state.playerOrigin, state.searchQuery,
+        // 详情栈（本轮新增）必须进 key：栈变化时 detail 可能不变（例如回到同一目标），
+        // 但导航态确实变了，不重跑就会存下旧的栈长度。
+        state.detailStack,
     ) {
         val nav = state.navigationState()
         if (savedNav.value != nav) savedNav.value = nav
@@ -679,7 +691,11 @@ fun GlassApp(
     // 声明点必须早于所有写入者（桌面歌词 / 文件 IO / 分享 / 恢复报告），
     // Kotlin 局部变量不支持前向引用——原先声明在文件 IO 段（约 650 行）时，
     // 桌面歌词段（约 570 行）赋值会报 Unresolved。
-    var ioMessage by remember { mutableStateOf<String?>(null) }
+    //
+    // 用 [IoBannerState] 委托而不是裸 mutableStateOf：它额外带一个**展示序号**，
+    // 让「同文案重复触发」也能重新计时（见该类 KDoc）。17 个写入点的语义一字未改。
+    val ioBanner = remember { IoBannerState() }
+    var ioMessage by ioBanner
 
     // 桌面歌词（P0-8）开关状态与接线。
     // 为什么不放进 AppState：AppStateSnapshot（SettingsStore 快照 v1→v10 迁移链）已封板，
@@ -889,6 +905,21 @@ fun GlassApp(
         kotlinx.coroutines.delay(5_000)
         updateManager.checkSilently()
     }
+    // 回前台续装：用户被跳去系统页授权「安装未知应用」，回来时自动接着装。
+    // 不接这条的话，授权页对用户就是一次「点了更新 → 跳到一堆看不懂的开关 → 回来还是
+    // 原来那行」的死循环（UpdateManager.resumeInstallIfWaiting 的 KDoc 有完整推导）。
+    //
+    // **必须用生命周期而不是 snapshotFlow**：用户按返回键回来时 awaitingInstallPermission
+    // 仍是 true（值没变），snapshotFlow 不会重发——那样只在「刚被置位」那一刻触发一次，
+    // 而那一刻正好是 App 正在离开前台的瞬间。ON_RESUME 才是「用户从系统页回来了」这个
+    // 事件本身。判据仍在 manager 内部（只在等待授权时动作），普通切后台不会拉起安装器。
+    DisposableEffect(activity, updateManager) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) updateManager.resumeInstallIfWaiting()
+        }
+        activity?.lifecycle?.addObserver(observer)
+        onDispose { activity?.lifecycle?.removeObserver(observer) }
+    }
 
     // ── D2/D3 文件 IO：SAF 选择器（导出 M3U / 导入 M3U / 导出备份 / 恢复备份）──
     // 结果通过一次性回调交给发起方（设置页行 / 歌单详情菜单），避免把 SAF 逻辑散到各屏
@@ -912,6 +943,35 @@ fun GlassApp(
             )
         }
     }
+    /**
+     * 导出 M3U 的统一入口（歌单详情 / 歌单墙长按 / 曲库歌单 tab 长按三个调用点共用）。
+     *
+     * 为什么不各自内联：三处需要完全相同的四步（构造 DemoPlaylist → sanitize 文件名 →
+     * 拉起 SAF → 结果回执）。此前只有详情页接了线，另外两个入口的「导出 M3U」整项不渲染
+     * ——同一个歌单换个入口就没有这个能力，是本仓一贯判为缺陷的那类不一致。
+     * 抽成一处后，接线本身只剩「传不传这个 lambda」，不可能再漏。
+     */
+    val exportPlaylistM3u: (
+        playlistId: String,
+        title: String,
+        tracks: List<com.local.music.core.ui.components.DemoSong>,
+    ) -> Unit =
+        { playlistId, title, tracks ->
+            pendingM3uExportPlaylist = com.local.music.core.ui.components.DemoPlaylist(
+                // id 用调用方给的（歌单墙/曲库传的是被长按的那张卡，详情页传 state.detail.id），
+                // 统一成一个参数来源后不会出现「同一张歌单两个入口导出成不同 id」的漂移
+                id = playlistId,
+                title = title,
+                meta = "${tracks.size} 首",
+                art = tracks.firstOrNull()?.art
+                    ?: com.local.music.core.ui.components.ArtStyle.Night,
+                tracks = tracks,
+            )
+            // 文件名经 sanitize：歌单名不受限（用户可输入 / 等非法字符），
+            // 原实现直接拼 "$title.m3u8" 交给 SAF，部分 ROM 会拒绝或截断
+            m3uExportLauncher.launch(M3uPlaylistIO.suggestedFileName(title))
+        }
+
     val m3uImportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
@@ -1242,8 +1302,19 @@ fun GlassApp(
                         // 而内容 Box 被 baseContentAlpha 随飞行淡出 → 替身 haze 失去输入退化为
                         // 平灰 tint（录屏「灰板」），落定真控制台又透出活极光 → 灰→彩跳变。
                         // 根极光在 recede<1（即整个进入/退出飞行期）恒在，补进源后替身全程带彩。
+                        //
+                        // 拟物档（2026-11 真机修正）：**不画极光，改画机身**。
+                        // 真机验证发现：切到拟物后所有面板都成了不透明实体，但背后仍是
+                        // 会漂移的彩色极光，读作「塑料机身浮在极光里」——既不是实体设备
+                        // 也不是玻璃。拟物的物理前提是「一块放在桌上的设备」，背景必须是
+                        // 机身本身。机身背景同样要进 hazeSource：玻璃档切回来时飞行替身
+                        // 仍需一份可采样的底（且拟物档本身不消费，无额外代价）。
                         Box(Modifier.fillMaxSize().hazeSource(appHazeState)) {
-                            AuroraBackground()
+                            if (state.visualStyle == VisualStyle.Skeuomorph) {
+                                SkeuomorphBackground()
+                            } else {
+                                AuroraBackground()
+                            }
                         }
                     }
 
@@ -1354,24 +1425,18 @@ fun GlassApp(
                                         state,
                                         audioDenied = audioDenied,
                                         onRequestAudioPermission = ::requestAudioPermission,
+                                        // 歌单 tab 长按卡片 → 集合面板；与歌单墙/详情页同源接线
+                                        onExportM3u = exportPlaylistM3u,
                                     )
-                                    GlassScreen.Playlist -> PlaylistScreen(state)
+                                    GlassScreen.Playlist -> PlaylistScreen(
+                                        state,
+                                        // 歌单墙长按卡片 → 集合面板；同上
+                                        onExportM3u = exportPlaylistM3u,
+                                    )
                                     GlassScreen.Detail -> PlaylistDetailScreen(
                                         state,
                                         // D2：导出 M3U（选位置 → 写文件）
-                                        onExportM3u = { _, title, tracks ->
-                                            pendingM3uExportPlaylist = com.local.music.core.ui.components.DemoPlaylist(
-                                                id = state.detail.id,
-                                                title = title,
-                                                meta = "${tracks.size} 首",
-                                                art = tracks.firstOrNull()?.art
-                                                    ?: com.local.music.core.ui.components.ArtStyle.Night,
-                                                tracks = tracks,
-                                            )
-                                            // 文件名经 sanitize：歌单名不受限（用户可输入 / 等非法字符），
-                                            // 原实现直接拼 "$title.m3u8" 交给 SAF，部分 ROM 会拒绝或截断
-                                            m3uExportLauncher.launch(M3uPlaylistIO.suggestedFileName(title))
-                                        },
+                                        onExportM3u = exportPlaylistM3u,
                                     )
                                     GlassScreen.Search -> SearchScreen(state)
                                     GlassScreen.Settings -> SettingsScreen(
@@ -1545,7 +1610,19 @@ fun GlassApp(
                         //   与替身接位；不组合的话迷你条与胶囊会在飞行结束时整块pop出来。
                         // 注意这里只读 phase（低频），不读 t.value —— 后者每帧变，会让整个
                         // GlassApp 每帧重组。淡入淡出交给 Chrome 内部的 graphicsLayer lambda。
-                        if (baseScreen in TAB_SCREENS && state.librarySettled && !modalState.isOpen &&
+                        //
+                        // **面板开合不再卸载 Chrome**：旧实现把 `!modalState.isOpen` 放进组合
+                        // 条件，于是从曲库/歌单/设置打开任意面板时，迷你条与导航胶囊**瞬间消失**、
+                        // 关闭后又瞬间 pop 回来。而搜索页/详情页对同一动作走的是 360ms 渐变
+                        // （searchChromeAlpha / detailChromeAlpha），播放页控制台也是渐变让位
+                        // （P3-63）——同一个 App 三种语言。这里对齐成渐变。
+                        // alpha=0 不挡触摸，但面板自带全屏 scrim 拦截，隐形 Chrome 不会被误点。
+                        val tabChromeAlpha by animateFloatAsState(
+                            targetValue = if (modalState.isOpen) 0f else 1f,
+                            animationSpec = GlassMotion.tweenPage(),
+                            label = "tabChromeAlpha",
+                        )
+                        if (baseScreen in TAB_SCREENS && state.librarySettled &&
                             flight.phase != PlayerFlight.Phase.Entering
                         ) {
                             GlassChrome(
@@ -1562,6 +1639,11 @@ fun GlassApp(
                                     else -> 0
                                 },
                                 onNavSelect = { index ->
+                                    // 本轮导航重设计：切主模块必须**清空详情栈**。
+                                    // 否则从「专辑 → 艺术家」两层详情直接点「歌单」，
+                                    // 栈里还留着旧模块的两帧；下次从歌单进详情再按返回，
+                                    // 会退到上一个模块的艺术家页——用户完全无法理解。
+                                    state.clearDetailStack()
                                     state.screen = when (index) {
                                         0 -> GlassScreen.Library
                                         1 -> GlassScreen.Playlist
@@ -1604,7 +1686,9 @@ fun GlassApp(
                                 },
                                 onPlayPause = state::togglePlayPause,
                                 onNext = { state.next() },
-                                modifier = Modifier.align(Alignment.BottomCenter),
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .graphicsLayer { alpha = tabChromeAlpha },
                             )
                         }
 
@@ -1680,6 +1764,10 @@ fun GlassApp(
                                         bitmap = state.photoBacking!!.bitmap!!,
                                         tint = state.photoBacking?.tint,
                                     )
+                                } else if (state.visualStyle == VisualStyle.Skeuomorph) {
+                                    // 拟物档：播放页背景也是机身（与根层同一组件、同一 token），
+                                    // 否则播放页仍是一片彩色极光，与它的不透明控制台打架。
+                                    SkeuomorphBackground()
                                 } else {
                                     AuroraBackground()
                                 }
@@ -1713,6 +1801,11 @@ fun GlassApp(
                             .statusBarsPadding()
                             .padding(top = S.Gap8.dp)
                             .fillMaxWidth(),
+                        // 间距交给 Arrangement：它只在**真实存在的子项之间**留缝。
+                        // 旧实现用 `if (ioMessage != null) Spacer(6dp)` 手写间距，判据与
+                        // 实际相邻关系对不上——扫描回执是第一条，它上面反而多出 6dp，
+                        // 而它与下面的 IO 提示之间是 0 间距；恢复报告/播放错误同理。
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
                         // A-1（本轮）：扫描完成回执。走与 IO 提示同一个纵向栈（同一时刻可能
                         // 与「备份已导出」之类并存，同栈才不会互相盖住）。
@@ -1725,7 +1818,6 @@ fun GlassApp(
                                 delay(3_000)
                                 state.consumeScanResult()
                             }
-                            if (ioMessage != null) Spacer(Modifier.height(6.dp))
                             TopBanner(
                                 message,
                                 maxLines = 2,
@@ -1742,7 +1834,9 @@ fun GlassApp(
                         // 为它引入结构化状态会牵动 8 个写入点；而中文失败文案在本工程是
                         // 统一的「X 失败：原因」句式，前缀判据与实际语义一致）。
                         ioMessage?.let { message ->
-                            LaunchedEffect(message) {
+                            // key 并入展示序号：同文案重复触发（4s 内连点两次导出）时
+                            // message 不变，只靠它计时会让第二条提示提前消失
+                            LaunchedEffect(message, ioBanner.seq) {
                                 delay(4000)
                                 ioMessage = null
                             }
@@ -1770,7 +1864,6 @@ fun GlassApp(
                         val visibleRestoreReport = state.restoreReport
                             ?.takeIf { it.fromBackup || it.needsAttention }
                         visibleRestoreReport?.let { report ->
-                            if (ioMessage != null) Spacer(Modifier.height(6.dp))
                             LaunchedEffect(report) {
                                 delay(9000)
                                 state.consumeRestoreReport()
@@ -1793,7 +1886,6 @@ fun GlassApp(
                                 delay(4000)
                                 state.dismissPlaybackError()
                             }
-                            if (ioMessage != null) Spacer(Modifier.height(6.dp)) // 两条并存才需要间距
                             TopBanner(
                                 message,
                                 maxLines = 2,
@@ -1854,6 +1946,35 @@ private const val RELEASE_PAGE_URL = "https://github.com/R4gM9Xk/music/releases"
  * 用 onClick(label=...) 的方式追加动作名，才能既保留内容又表达可点性。
  */
 private enum class BannerTone { Neutral, Error }
+
+/**
+ * 顶部 IO 横幅的状态载体：文案 + **展示序号**。
+ *
+ * ## 为什么需要序号
+ * 自动消退用 `LaunchedEffect(message)` 计时，而 message 本身就是 key——
+ * 4 秒内连点两次「导出备份」时第二次赋的是**同一个字符串**，key 不变 → effect 不重启
+ * → 第二条提示在第一次的剩余时间里就消失了（用户刚点完，回执一闪就没）。
+ * 序号在每次非空赋值时自增，把它并入 key 即可重新计时。
+ *
+ * ## 为什么用委托属性
+ * 写入点有 17 处（分享/铃声/导入导出/备份/崩溃日志/权限引导…）。改成 `showIoMessage(...)`
+ * 要逐处改写且容易漏；委托属性让 `ioMessage = x` 的写法与语义完全不变，
+ * 序号在 setter 里自动维护，**不可能漏**。
+ */
+private class IoBannerState {
+    private val seqState = mutableIntStateOf(0)
+    private var value by mutableStateOf<String?>(null)
+
+    /** 展示序号：组合期读它即建立订阅，每次新提示都会让计时 effect 重启 */
+    val seq: Int get() = seqState.intValue
+
+    operator fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): String? = value
+
+    operator fun setValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>, v: String?) {
+        value = v
+        if (v != null) seqState.intValue++
+    }
+}
 
 @Composable
 private fun TopBanner(

@@ -52,7 +52,9 @@ internal class DragTouchListener(
                         lp.y = startY + dy
                         runCatching { wm.updateViewLayout(v, lp) }
                             .onFailure { Log.w(TAG, "updateViewLayout failed", it) }
-                        onParamsChanged(lp)
+                        // **不在这里落盘**：一次拖动有几十上百个 MOVE，逐个写 JSON
+                        // 等于在触摸主线程上做几十上百次磁盘 IO（掉帧 + 无谓磨损闪存）。
+                        // 位置持久化统一收口到 ACTION_UP / ACTION_CANCEL。
                     }
                 }
                 /**
@@ -88,14 +90,27 @@ internal class DragTouchListener(
                     if (dx * dx + dy * dy < TOUCH_SLOP_PX * TOUCH_SLOP_PX) {
                         runCatching { v.performClick() }
                             .onFailure { Log.w(TAG, "performClick failed", it) }
+                    } else {
+                        // 真的拖过：抬手时落盘一次（MOVE 期间只更新窗口，不写磁盘）
+                        persist(v)
                     }
                 }
+                // 手势被系统打断（来电/全局手势/父层拦截）：位置已经变了，同样要落盘，
+                // 否则下次启动会回到拖动前的旧坐标
+                MotionEvent.ACTION_CANCEL -> persist(v)
             }
         } catch (t: Throwable) {
             // 触摸回调跑在 system_server 派发链上，抛异常会连带桌面一起炸——全部兜住
             Log.w(TAG, "touch handling failed", t)
         }
         return true // 全程消费：悬浮窗不响应其他手势，拖柄语义完整
+    }
+
+    /** 把当前窗口位置交回调用方落盘（职责单一：本类不持有 Context/磁盘） */
+    private fun persist(v: View) {
+        val lp = v.layoutParams as? WindowManager.LayoutParams ?: return
+        runCatching { onParamsChanged(lp) }
+            .onFailure { Log.w(TAG, "persist position failed", it) }
     }
 
     private companion object {

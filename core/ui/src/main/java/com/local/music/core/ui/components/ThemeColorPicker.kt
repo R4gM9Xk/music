@@ -61,36 +61,41 @@ fun ThemeColorSwatches(
                     // 全局索引（跨行连续）：读屏序号与色板展示顺序一一对应
                     val index = rowIndex * 5 + colIndex
                     val on = selected != null && color.toArgbValue() == selected.toArgbValue()
-                    Box(
-                        Modifier
-                            .weight(1f)
-                            .height(44.dp)
-                            .clip(CircleShape)
-                            .background(color)
-                            // A3-04：选中环宽度/颜色走 tweenHover——旧实现双重瞬变
-                            // （border 不参与布局，动画只影响描边绘制）
-                            .border(
-                                width = androidx.compose.animation.core.animateDpAsState(
-                                    if (on) 3.dp else 1.dp,
-                                    com.local.music.core.ui.theme.GlassMotion.tweenHover(),
-                                    label = "swatchBorder",
-                                ).value,
-                                color = androidx.compose.animation.animateColorAsState(
-                                    if (on) glass.textPrimary else glass.strokeSoft,
-                                    com.local.music.core.ui.theme.GlassMotion.tweenHover(),
-                                    label = "swatchBordercolor",
-                                ).value,
-                                shape = CircleShape,
-                            )
-                            // clickable 在 semantics 之前：读屏把 role/selected 合并到同一可点击节点
-                            .clickable(onClickLabel = "选择主题色") { onSelect(color) }
-                            .semantics {
-                                this.role = Role.RadioButton
-                                this.selected = on
-                                contentDescription = "主题色 ${index + 1}"
-                            },
-                    ) {
-                        // 色点内不放内容：纯色块 + 3dp 描边已足够识别（P3-56：不再叠白圈）
+                    // 外层只负责等分网格，色点本体固定 44dp 见方。
+                    // 旧写法把 weight(1f) + height(44dp) 挂在同一个 Box 上再 clip(CircleShape)：
+                    // CircleShape 半径取短边一半，而格宽随屏宽变（411dp 屏上约 64.6dp），
+                    // 于是渲染成**横向胶囊**而不是圆点，宽屏更扁——与「圆形色点」的设计不符。
+                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                        Box(
+                            Modifier
+                                .size(44.dp)
+                                .clip(CircleShape)
+                                .background(color)
+                                // A3-04：选中环宽度/颜色走 tweenHover——旧实现双重瞬变
+                                // （border 不参与布局，动画只影响描边绘制）
+                                .border(
+                                    width = androidx.compose.animation.core.animateDpAsState(
+                                        if (on) 3.dp else 1.dp,
+                                        com.local.music.core.ui.theme.GlassMotion.tweenHover(),
+                                        label = "swatchBorder",
+                                    ).value,
+                                    color = androidx.compose.animation.animateColorAsState(
+                                        if (on) glass.textPrimary else glass.strokeSoft,
+                                        com.local.music.core.ui.theme.GlassMotion.tweenHover(),
+                                        label = "swatchBordercolor",
+                                    ).value,
+                                    shape = CircleShape,
+                                )
+                                // clickable 在 semantics 之前：读屏把 role/selected 合并到同一可点击节点
+                                .clickable(onClickLabel = "选择主题色") { onSelect(color) }
+                                .semantics {
+                                    this.role = Role.RadioButton
+                                    this.selected = on
+                                    contentDescription = "主题色 ${index + 1}"
+                                },
+                        ) {
+                            // 色点内不放内容：纯色块 + 3dp 描边已足够识别（P3-56：不再叠白圈）
+                        }
                     }
                 }
                 // 不足 5 个时补空位，保持网格对齐

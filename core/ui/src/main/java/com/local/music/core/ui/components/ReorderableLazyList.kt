@@ -9,6 +9,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -186,6 +187,16 @@ class ReorderableLazyState internal constructor(
         liveDataVersion = version
     }
 
+    /**
+     * 进行中的拖拽是否已因内容位移而失效。
+     *
+     * 判据必须是「实时版本 vs **起拖瞬间**的版本」（[dragDataVersion]）。
+     * 旧写法拿 `rememberUpdatedState(dataVersion)` 与 `dataVersion` 自己比——两者恒等，
+     * 条件永假，这道保护实际是死代码。
+     */
+    internal fun isDragStale(liveVersion: Any?): Boolean =
+        dragFrom >= 0 && liveVersion != dragDataVersion
+
     /** 让位偏移：本行相对槽位应平移多少（px） */
     internal fun shiftFor(index: Int): Float = when {
         dragFrom < 0 || dragTarget == dragFrom -> 0f
@@ -264,7 +275,7 @@ fun rememberReorderableLazyState(
         // 内容位移（自动切歌把「接下来」段整体挪一格）时作废本次拖拽：
         // 继续拖就必须把手指位移、让位预览、目标槽位全部重映射到新基准，
         // 任一处算错就是一次错歌移动（不可撤销）；作废只损失一次手势
-        if (state.dragFrom >= 0 && versionLive != dataVersion) state.cancelDrag()
+        if (state.isDragStale(versionLive)) state.cancelDrag()
     }
     // ── 边缘自动滚动 ──
     //
@@ -311,20 +322,30 @@ fun rememberReorderableLazyState(
  */
 @Composable
 fun ReorderableLazyState.rowModifier(index: Int, dataVersion: Any? = null): Modifier {
-    val rowShift by animateFloatAsState(
-        targetValue = shiftFor(index),
-        animationSpec = tween(
-            (150 * GlassMotion.scale).toInt().coerceAtLeast(1),
-            easing = GlassMotion.Curve,
-        ),
-        label = "lazyReorderShift$index",
-    )
+    // key(commitGen)：提交后内容整体重索引（槽 i 现在显示旧 item(i+1)），让位偏移必须以 0
+    // 为初值重建。只把目标值改成 0 不够——animateFloatAsState 的**当前动画值**仍是 ±rowPx，
+    // 途经行会被画到「正确位置再偏一格」再花 150ms 滑回来。与 ReorderableColumn 的
+    // key(dataVersion, commitGen, index) 同一修法（那边是内容 key，这里只能 key 住动画本身）。
+    //
+    // **持有 State 对象而不是解构后的 Float**：值只在下方 graphicsLayer 的绘制期 lambda 里
+    // 读，让位动画的 150ms 内本行零重组（本仓既有红线）。解构成 Float 会把读取带回组合期，
+    // 每帧重组整行。
+    val rowShift = key(commitGen) {
+        animateFloatAsState(
+            targetValue = shiftFor(index),
+            animationSpec = tween(
+                (150 * GlassMotion.scale).toInt().coerceAtLeast(1),
+                easing = GlassMotion.Curve,
+            ),
+            label = "lazyReorderShift$index",
+        )
+    }
     return Modifier
         .graphicsLayer {
             translationY = when {
                 index == dragFrom -> dragOffset + scrollCompensation()
                 isSettling(index) -> settleValueNow()
-                else -> rowShift
+                else -> rowShift.value
             }
             if (index == dragFrom) {
                 scaleX = 1.02f

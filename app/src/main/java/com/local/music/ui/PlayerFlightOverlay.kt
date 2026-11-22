@@ -45,7 +45,9 @@ import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.lerp
 import com.local.music.core.ui.components.ArtThumb
+import com.local.music.core.ui.components.BlurVeilKind
 import com.local.music.core.ui.components.FlightKeys
+import com.local.music.core.ui.components.veilTint
 import com.local.music.core.ui.components.GlassNavBar
 import com.local.music.core.ui.components.LocalHazeState
 import com.local.music.core.ui.components.PlayerFlight
@@ -59,6 +61,7 @@ import com.local.music.core.ui.theme.GlassIcons
 import com.local.music.core.ui.theme.LocalAuroraPalette
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.R
+import dev.chrisbanes.haze.HazeProgressive
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeStyle
 import dev.chrisbanes.haze.HazeTint
@@ -270,16 +273,16 @@ fun PlayerFlightOverlay(
                     .flightOffset(rect, tAt)
                     .flightSize(rect, tAt)
                     .graphicsLayer {
-                        // R角 16→28 与阴影 0→18 都在绘制期求值（层级属性直更，零重组）；
-                        // shape+clip 等价原 .clip(lerp 形状)，shadowElevation 等价原 .shadow。
-                        // from 端必须是 **16dp 字面量**：迷你条真身封面是 C4 嵌套圆角
-                        // （Chrome.kt：外容器 R28 − 内边距 12dp = 16dp，那里也是字面量，
-                        // 因为 R.nested 是运行时引用、曾触发 dex 剔除 P0）。旧值 R.Thumb10=10dp
-                        // 让 42dp 封面的四角弧线在点按/落地瞬间差 6dp，肉眼可辨。
+                        // R角 8→16 与阴影 0→10 都在绘制期求值（层级属性直更，零重组）。
+                        //
+                        // ⚠️ **必须与两端真身严格同源**（本轮重设计后）：
+                        // - 起点：迷你条封面 40dp / 圆角 8dp（Chrome.kt，底座圆角 20 − 内边距 12）
+                        // - 终点：播放页封套圆角 16dp / 阴影 10dp（PlayerScreen.kt）
+                        // 改任何一端必须同步改这里，否则起飞/落地那一帧四角弧线会跳变。
                         val t = tAt()
-                        shape = RoundedCornerShape(lerp(16.dp, R.Player28.dp, t))
+                        shape = RoundedCornerShape(lerp(8.dp, 16.dp, t))
                         clip = true
-                        shadowElevation = lerp(0.dp, 18.dp, t).toPx()
+                        shadowElevation = lerp(0.dp, 10.dp, t).toPx()
                     }
                     .drawWithContent {
                         // 1px 描边（白 12% → 玻璃高光）：内缩半线宽，对齐 Border 修饰符的画法。
@@ -292,7 +295,7 @@ fun PlayerFlightOverlay(
                             color = lerp(glass.strokeSoft, glass.stroke, t),
                             topLeft = Offset(sw / 2f, sw / 2f),
                             size = Size(size.width - sw, size.height - sw),
-                            cornerRadius = CornerRadius(lerp(16.dp, R.Player28.dp, t).toPx() - sw / 2f),
+                            cornerRadius = CornerRadius(lerp(8.dp, 16.dp, t).toPx() - sw / 2f),
                             style = Stroke(sw),
                         )
                     },
@@ -479,9 +482,26 @@ private fun FlightGlassPanel(
     val palette = LocalAuroraPalette.current
     // 仅有的组合期 t 读取：haze 样式参数（见上）
     val t = tAt()
-    val tint = lerp(glass.hi, liquidHazeTint(glass, palette), t)
+    // ── 起点必须与真身同源（2026-11-21 用户反馈「Chrome 遮住下方文字」）──
+    //
+    // 真身已改为 chromeHaze 配方：tint 只有 hi 的 1/3 浓度、半径 36dp、竖向 progressive。
+    // 替身若继续用 `glass.hi` 原浓度 + 26dp 无 progressive，起飞第一帧就会从
+    // 「通透模糊」跳到「近实色板」——这正是本文件反复警告的「端点差一档」。
+    //
+    // 所以起点端用与 chromeHaze 完全相同的三个参数，随 t 走向 Liquid 端点：
+    // - tint：hi×0.35 → liquidHazeTint
+    // - 半径：36 → 26（Liquid 真身是 26，见 HazeGlass.glassHaze 的 level 映射）
+    // - progressive：起点开、终点关（控制台是 360dp 的大面板，竖向衰减在那里没有意义）
+    val chromeTintStart = veilTint(glass, BlurVeilKind.Chrome)
+    val tint = lerp(chromeTintStart, liquidHazeTint(glass, palette), t)
     // 迷你条真身的玻璃内衬（glassVeil）：替身起点必须与真身同源，随 t 淡到透明
     // （落点控制台无内衬）。在组合期取值，绘制期只做 lerp。
+    //
+    // ⚠️ 真身现在**只在 haze 退化时**才叠 veil（正常设备靠模糊挡字）。替身这里仍按
+    // 旧公式画 veil——因为它代表的是「退化设备上的真身」。两条路径在正常设备上
+    // 不一致（替身多了层 veil），但飞行只有 420ms 且替身始终在移动，实测不可辨；
+    // 而若替身也去掉 veil，退化设备上起飞瞬间会「突然变透」再「突然变实」，更糟。
+    // 这个取舍与 GlassSurface 的 blurVeil 兜底逻辑是同一条原则：退化路径必须自洽。
     val veil = glassVeil()
     Box(
         modifier
@@ -493,13 +513,22 @@ private fun FlightGlassPanel(
                         style = HazeStyle(
                             backgroundColor = Color.Transparent,
                             tints = listOf(HazeTint(tint)),
-                            // 26dp 两端同值（Hi / Liquid 真身都是 26）；Md 才是 20。
-                            // 飞行中半径不变，只有 tint 随 t 走向 Liquid 配方。
-                            blurRadius = 26.dp,
+                            // 12 → 26：起点对齐 chrome 档（已降到 12dp），终点对齐 Liquid 真身 26dp
+                            blurRadius = lerp(12.dp, 26.dp, t),
                             noiseFactor = 0.05f,
                             fallbackTint = HazeTint(tint),
                         ),
-                    )
+                    ) {
+                        // 起点用真身同款竖向 progressive，随 t 淡出到「无 progressive」
+                        // （t=1 时 intensity 恒 1 等价于关闭）
+                        if (t < 1f) {
+                            this.progressive = HazeProgressive.verticalGradient(
+                                startIntensity = 1f,
+                                endIntensity = lerp(0.92f, 1f, t),
+                                preferPerformance = false,
+                            )
+                        }
+                    }
                 } else {
                     Modifier
                 },
@@ -523,7 +552,7 @@ private fun FlightGlassPanel(
                         color = glass.strokeSoft,
                         topLeft = Offset(sw / 2f, sw / 2f),
                         size = Size(size.width - sw, size.height - sw),
-                        cornerRadius = CornerRadius(R.Player28.dp.toPx() - sw / 2f),
+                        cornerRadius = CornerRadius(FlightPanelRadiusPx() - sw / 2f),
                         style = Stroke(sw),
                         alpha = 1f - t2,
                     )
@@ -542,8 +571,22 @@ private fun FlightGlassPanel(
     )
 }
 
-/** 替身玻璃面板形状：两端真身（迷你条 / 控制台）都是 R.Player28，恒定不复用 lerp */
-private val FlightPanelShape = RoundedCornerShape(R.Player28.dp)
+/**
+ * 替身玻璃面板形状：两端真身现在都是 **20dp**（本轮重设计）。
+ *
+ * - 迷你条/底部控制底座：`GlassChrome` 的圆角 20dp（Chrome.kt）
+ * - 播放页控制台：`RoundedCornerShape(20.dp)`（PlayerScreen.kt）
+ *
+ * 两端同值，所以恒定不复用 lerp。旧值 28dp 对应的是旧的「两块胶囊」时代，
+ * 改真身必须同步改这里，否则落地帧圆角会跳变。
+ */
+private const val FlightPanelRadiusDp = 20f
+
+/** 同上，px 形态（绘制期用，避免每帧 with(density) 换算） */
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.FlightPanelRadiusPx(): Float =
+    FlightPanelRadiusDp * density
+
+private val FlightPanelShape = RoundedCornerShape(FlightPanelRadiusDp.dp)
 
 /**
  * 飞行替身的单行文字（歌名/作者共用）：字号 lerp 是 Text 的组合期参数（真布局渲染，

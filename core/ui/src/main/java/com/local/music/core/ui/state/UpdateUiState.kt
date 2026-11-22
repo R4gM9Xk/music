@@ -47,6 +47,16 @@ data class UpdateUiState(
     val failStage: FailStage = FailStage.None,
     /** 下载不定长（P3-50）：经代理转发丢 Content-Length 时算不出百分比，UI 应显示转圈而非恒 0% */
     val indeterminate: Boolean = false,
+    /**
+     * 正在等用户去系统设置授权「安装未知应用」。
+     *
+     * 为什么要这个状态位：安装器被系统拦住时 App 会跳 `ACTION_MANAGE_UNKNOWN_APP_SOURCES`，
+     * 而跳过去**没有任何解释**——用户看到的是「点了更新，屏幕跳到一堆看不懂的开关」，
+     * 回来之后也不会自动继续安装（旧实现的安装入口只在 ReadyToInstall 的点击里）。
+     * 设置页据此把副标题改成「去系统设置允许安装未知应用」并说明返回后会自动继续；
+     * 宿主在 ON_RESUME 里读它决定要不要补一次 install()。
+     */
+    val awaitingInstallPermission: Boolean = false,
 ) {
     enum class Status {
         Idle,            // 未检查（显示当前版本，点击开始检查）

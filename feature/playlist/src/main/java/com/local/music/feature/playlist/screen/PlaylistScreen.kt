@@ -33,6 +33,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import com.local.music.core.ui.components.ArtStyle
 import com.local.music.core.ui.components.ArtThumb
@@ -67,7 +68,19 @@ import com.local.music.core.ui.theme.S
  * 全部面板经 LocalModalState.show 挂 GlassApp 根层宿主（屏内不再渲染 GlassSheet）。
  */
 @Composable
-fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
+fun PlaylistScreen(
+    state: AppState,
+    modifier: Modifier = Modifier,
+    /**
+     * D2：导出 M3U（id, 标题, 曲目）——SAF 选择器由 app 层持有；null = 不提供入口。
+     *
+     * 为什么歌单墙也要这个口子：`CollectionActionsSheet` 里「导出 M3U 歌单」只在
+     * `onExportM3u != null` 时渲染（未接线就整项不出现，避免「点了没反应」）。此前只有
+     * 详情页接线，于是同一个歌单**长按卡片**没有导出、**进去再点更多**才有——同一动作
+     * 两个入口两种能力，用户无法理解这个差别。
+     */
+    onExportM3u: ((playlistId: String, title: String, tracks: List<DemoSong>) -> Unit)? = null,
+) {
     // 命名草稿：remember 于本屏，面板 show 后经闭包活读写（重开保留上次草稿，同旧行为）
     var newName by remember { mutableStateOf("") }
     // ── 滚动位置：提升到 AppState（P2 修复）──
@@ -100,9 +113,17 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                 title = title,
                 tracks = tracks,
                 onPlayAll = { shuffle ->
-                    state.playCollection(tracks, title, shuffle)
+                    // sourceTarget 必传：漏传会让 queueSourceTarget 置 null，
+                    // 播放页顶栏显示「来自「歌单名」」却点不动（曲库页/详情页都传了，
+                    // 同一动作三入口必须同行为）
+                    state.playCollection(tracks, title, shuffle, sourceTarget = target)
                     state.openPlayer()
                 },
+                // 与详情页同口径接线：未接线时 CollectionActionsSheet 会把该项整行隐藏。
+                // 注意 CollectionActionsSheet 的形参是 **() -> Unit**（目标/标题/曲目已在
+                // 调用点闭包捕获），与 PlaylistDetailScreen 的 (id, title, tracks) -> Unit
+                // 不是同一个签名——这里就地绑定当前这张卡的三个值。
+                onExportM3u = onExportM3u?.let { export -> { export(target.id, title, tracks) } },
             )
         }
     }
@@ -120,6 +141,11 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
             // PageHeader 现在有「标题，操作 1」的兜底描述，所以不漏但难听；
             // 这里补上精确文案才是正解（兜底是防遗漏的网，不是终态方案）。
             PageHeader(title = "歌单", actionIcon = GlassIcons.Plus, onAction = {
+                // 每次打开都从空草稿开始：旧实现把 newName 记在屏级、关闭不清，
+                // 点遮罩放弃后再点 ＋，被弃用的名字仍在输入框里且「创建歌单」是强调态——
+                // 一次误触就建出一个用户早已放弃的歌单。同仓 AddToPlaylistSheet /
+                // AddSongsSheet 都在关闭时自清，这里对齐。
+                newName = ""
                 // 新建歌单面板（含输入框：GlassSheet 的 imePadding 让其浮在键盘之上，机制不动）
                 modal.show {
                     ModalSheet(modal, "新建歌单") {
@@ -130,6 +156,10 @@ fun PlaylistScreen(state: AppState, modifier: Modifier = Modifier) {
                             onValueChange = { newName = it },
                             hint = "歌单名称",
                             leading = null,
+                            // 键盘动作键必须是「完成」：这是**命名**不是搜索，而默认值是
+                            // ImeAction.Search——键盘右下角会显示一个放大镜/「搜索」键，
+                            // 用户按下去以为在搜索歌单名，实际是提交创建。语义与动作必须一致。
+                            imeAction = ImeAction.Done,
                             onSearch = {
                                 if (newName.isNotBlank() && !duplicate) {
                                     val created = state.createPlaylist(newName)

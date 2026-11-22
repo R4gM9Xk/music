@@ -22,12 +22,17 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFontFamilyResolver
 import androidx.compose.ui.semantics.Role
@@ -62,6 +67,7 @@ import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.auroraAccentColor
 import com.local.music.core.ui.theme.onSeedColor
+import kotlin.math.roundToInt
 
 /**
  * SongRow 的行高（9dp 上下内边距 + 内容高度）——队列滚动定位与拖拽重排共享的数学基准。
@@ -269,7 +275,17 @@ fun PageHeader(
     }
 }
 
-/** 玻璃搜索胶囊：44h / 圆角 22（.searchbox） */
+/** 搜索框：48h / 圆角 16（本轮重设计：从「凸起胶囊」改为「浅凹槽」）
+ *
+ *  ## 为什么是凹槽而不是胶囊
+ *
+ *  搜索框在物理隐喻上是一个**能往里放东西的容器**，不是一个可以按下去的按钮。
+ *  上一版把它做成凸起的玻璃胶囊，与旁边的圆钮按钮同材质，用户分不清「这个能按」还是
+ *  「这个能输入」。新方案给它 [SkeuoRole.Well]：上沿暗、下沿亮、**没有任何外投影**——
+ *  这是「凹进去」的唯一可靠表达。
+ *
+ *  圆角从 22（Full）收到 16：Full 胶囊读作「按钮」，16dp 读作「输入槽」。
+ */
 @Composable
 fun GlassSearchBox(
     text: String,
@@ -278,10 +294,12 @@ fun GlassSearchBox(
     modifier: Modifier = Modifier,
 ) {
     GlassSurface(
-        modifier = modifier.fillMaxWidth().height(44.dp),
+        modifier = modifier.fillMaxWidth().height(48.dp),
         level = GlassLevel.Md,
-        shape = RoundedCornerShape(R.Full),
+        shape = RoundedCornerShape(16.dp),
         onClick = onClick,
+        // 拟物档：搜索框是凹槽（Well），不是机身面板
+        skeuoRole = com.local.music.core.ui.theme.SkeuoRole.Well,
     ) {
         Row(
             Modifier.fillMaxSize().padding(horizontal = S.Gap16.dp),
@@ -289,9 +307,7 @@ fun GlassSearchBox(
             horizontalArrangement = Arrangement.spacedBy(S.Gap8.dp),
         ) {
             // 装饰性图标，**有意 null、非遗漏**：整条胶囊作为 GlassSurface 的可点区域，
-            // 语义由同一行里的 text（占位符「搜索歌曲、专辑、艺术家」或已输入词）承担。
-            // 这里若再给「搜索」描述，读屏会念成「搜索，搜索歌曲、专辑、艺术家」——
-            // 同一件事说两遍。
+            // 语义由同一行里的 text（占位符或已输入词）承担。
             Icon(GlassIcons.Search, null, Modifier.size(18.dp),
                 tint = if (placeholder) LocalGlassColors.current.textSecondary else LocalGlassColors.current.textPrimary)
             Text(
@@ -303,7 +319,21 @@ fun GlassSearchBox(
     }
 }
 
-/** tab 胶囊行：选中填充 seed + 投影（.tabs/.tab） */
+/** tab 分类行：**统一轨道**，选中项用填充 + 强调色短线，不做六颗独立凸起胶囊。
+ *
+ *  ## 本轮重设计（2026-11）
+ *
+ *  旧实现每个 tab 都是 `shadow + background + border` 三件套，选中态还有 6dp 的彩色投影。
+ *  六个 tab 并排时读作六颗各自独立的按钮——它们其实是**同一个分类轴上的六个取值**，
+ *  本该是一个控件。
+ *
+ *  新方案：
+ *  - 未选项**无底色、无描边**，只有文字；
+ *  - 选中项使用低对比填充 + 底部 2dp 强调色短线；
+ *  - 整行共享一条底部分隔线，表达「这是一条分类轴」。
+ *
+ *  这样层级差从「六块玻璃」变成「一个选中标记」，视觉噪声大幅下降。
+ */
 @Composable
 fun GlassTabs(
     tabs: List<String>,
@@ -313,58 +343,80 @@ fun GlassTabs(
 ) {
     val palette = LocalAuroraPalette.current
     val glass = LocalGlassColors.current
-    // A4 视觉审计：选中 tab 的底色是 palette.seed **实底**，前景必须由 onSeedColor() 按
-    // WCAG 对比度在「白 vs 近黑」里二选一。旧实现硬编码 Color.White：琥珀 #E0A800 /
-    // 草绿 #57A94A 等浅 seed 上白字只有 2.15:1/2.93:1 —— 「当前在哪一页」这个最高频的
-    // 状态指示反而成了全屏最难读的元素。详情页播放胶囊（PlaylistDetailScreen）与空态
-    // CTA（EmptyState）早已接线，唯独这里漏了；onSeedColor 的 KDoc 明确把 tab 选中态
-    // 列为必须消费点，web 参考实现 Glass.jsx 的 Segmented 用的也是 var(--on-seed)。
-    // 取值必须在组合期（onSeedColor 是 @Composable，读 LocalAuroraPalette）。
-    val onSeed = onSeedColor()
+    val skeuoMode = com.local.music.core.ui.theme.LocalVisualStyle.current ==
+        com.local.music.core.ui.state.VisualStyle.Skeuomorph
+    val skeuo = com.local.music.core.ui.theme.LocalSkeuomorphColors.current
+    // 选中 tab 必须滚入视野（保留既有逻辑，见下方 LaunchedEffect）
+    val density = LocalDensity.current
+    val scrollState = rememberScrollState()
+    val tabWidths = remember { mutableStateMapOf<Int, Int>() }
+    var viewportPx by remember { mutableIntStateOf(0) }
+    LaunchedEffect(selected, viewportPx, tabWidths.size) {
+        if (viewportPx <= 0 || tabWidths.size < tabs.size) return@LaunchedEffect
+        val gapPx = with(density) { S.Gap8.dp.toPx() }.roundToInt()
+        val startPx = with(density) { S.Gap20.dp.toPx() }.roundToInt()
+        var left = startPx
+        for (i in 0 until selected) left += (tabWidths[i] ?: 0) + gapPx
+        val right = left + (tabWidths[selected] ?: return@LaunchedEffect)
+        val target = when {
+            left < scrollState.value -> left
+            right > scrollState.value + viewportPx -> right - viewportPx
+            else -> return@LaunchedEffect // 已完整可见：不动，避免每次重组都抖一下
+        }
+        scrollState.animateScrollTo(target.coerceIn(0, scrollState.maxValue))
+    }
     Row(
         modifier
             .fillMaxWidth()
-            .horizontalScroll(rememberScrollState())
-            .padding(start = S.Gap20.dp, end = S.Gap20.dp, bottom = S.Gap16.dp),
+            .onSizeChanged { viewportPx = it.width }
+            .horizontalScroll(scrollState)
+            .padding(start = S.Gap20.dp, end = S.Gap20.dp, bottom = S.Gap12.dp),
         horizontalArrangement = Arrangement.spacedBy(S.Gap8.dp),
     ) {
         tabs.forEachIndexed { index, label ->
             val on = index == selected
             val interactionSource = remember { MutableInteractionSource() }
-            // A3-02：选中态的填充/描边/文字色/投影四项全走 tweenHover——旧实现 if(on) 直接换
-            // Modifier 链，四者瞬变（投影突现突失最扎眼）。0dp 投影等价无投影
-            val bg by animateColorAsState(if (on) palette.seed else glass.lo, GlassMotion.tweenHover(), label = "tabBg$index")
-            val borderColor by animateColorAsState(
-                if (on) Color.Transparent else glass.strokeSoft, GlassMotion.tweenHover(), label = "tabBorder$index",
+            // 选中态填充：低对比即可——强调由短线承担，填充只负责「这一项被框住了」
+            val bg by animateColorAsState(
+                if (on) (if (skeuoMode) skeuo.faceRaised else glass.md) else Color.Transparent,
+                GlassMotion.tweenHover(), label = "tabBg$index",
             )
             val textColor by animateColorAsState(
-                if (on) onSeed else glass.textSecondary, GlassMotion.tweenHover(), label = "tabText$index",
+                if (on) (if (skeuoMode) skeuo.textPrimary else glass.textPrimary) else
+                    (if (skeuoMode) skeuo.textTertiary else glass.textSecondary),
+                GlassMotion.tweenHover(), label = "tabText$index",
             )
-            val shadowElevation by animateDpAsState(if (on) 6.dp else 0.dp, GlassMotion.tweenHover(), label = "tabShadow$index")
-            Box(
+            val indicatorAlpha by animateFloatAsState(
+                if (on) 1f else 0f, GlassMotion.tweenHover(), label = "tabIndicator$index",
+            )
+            Column(
                 Modifier
-                    .pressScale(interactionSource, pressed = 0.95f)
-                    // .tab.on：box-shadow 0 6px 16px seed 45%（elevation 动画，颜色恒定）
-                    .shadow(
-                        shadowElevation, RoundedCornerShape(R.Full), clip = false,
-                        ambientColor = palette.seed.copy(alpha = 0.45f),
-                        spotColor = palette.seed.copy(alpha = 0.45f),
-                    )
-                    .clip(RoundedCornerShape(R.Full))
+                    .onSizeChanged { tabWidths[index] = it.width }
+                    .clip(RoundedCornerShape(12.dp))
                     .background(bg)
-                    .border(1.dp, borderColor, RoundedCornerShape(R.Full))
+                    .pressScale(interactionSource, pressed = 0.95f)
                     .clickable(interactionSource = interactionSource, indication = null) { onSelect(index) }
                     .semantics {
-                        // 读屏语义：tab 角色 + 选中态（与 Chrome.kt 底导航 GlassNavBar 同款）
                         this.role = Role.Tab
                         this.selected = on
                     }
-                    .padding(horizontal = S.Gap16.dp, vertical = S.Gap8.dp),
+                    .padding(horizontal = S.Gap12.dp, vertical = S.Gap8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                // A1：13sp 档 token 化。选中态用 BodyMedium（13 Medium）、未选中用 Body（13 Normal）——
-                // 与改造前「fontSize 13 + 字重条件」的观感完全一致，只是把「选中加粗」这个层级
-                // 信号从裸 fontWeight 改成两个 token 的选择，字重不再是一个可以随手填的值。
-                Text(label, style = if (on) GlassText.BodyMedium else GlassText.Body, color = textColor)
+                Text(
+                    label,
+                    style = if (on) GlassText.BodyMedium else GlassText.Body,
+                    color = textColor,
+                )
+                // 强调短线：固定 2dp 高度占位（透明度动画控制显隐），不参与布局变化。
+                // 这是选中态唯一的高饱和信号，替代了旧的 seed 实底 + 彩色投影。
+                Spacer(Modifier.height(4.dp))
+                Box(
+                    Modifier
+                        .size(width = 16.dp, height = 2.dp)
+                        .clip(RoundedCornerShape(1.dp))
+                        .background(palette.seed.copy(alpha = indicatorAlpha)),
+                )
             }
         }
     }
@@ -405,12 +457,15 @@ fun SongRow(
     Row(
         modifier
             .fillMaxWidth()
-            .padding(horizontal = 6.dp)
-            // C4：14dp 是 R 刻度里的 Card14（列表行卡片），不再裸写数值
-            .clip(RoundedCornerShape(R.Card14.dp))
-            // A6：行级缩放改按压底色（见 rowPressFeedback 的 KDoc）。
-            // 旧实现 pressScale(0.98) 只把整行缩 2%，长列表里文字/封面一起位移，
-            // 视觉上更像「抖动」而不是「按下了」；底色反馈只动明度，位置完全静止。
+            // 本轮重设计（2026-11）：**行不再是一张卡片**。
+            //
+            // 旧实现每行都 `clip(RoundedCornerShape(Card14))` + 水平 6dp 外边距，
+            // 于是长列表里是一叠各自独立的圆角小卡——那是「卡片式列表」的语言，
+            // 它让每一行都在争夺注意力，而列表真正需要的是一列可扫视的条目。
+            //
+            // 现在：行通栏、无圆角、无底色，只在**按下**时出现一层明度；
+            // 行与行之间靠间距与内容对齐区分。当前播放行由标题色 + EQ 表达。
+            // 竖直 padding 必须与 [SongRowHeight] 的推导同源（那里写的是 `S.Gap8 * 2`）。
             .rowPressFeedback(interactionSource)
             .then(rowClickable)
             // ── 读屏语义（无障碍 P0-4）──

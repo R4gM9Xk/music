@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -146,6 +147,11 @@ fun <T> SettingDropdown(
     Box(modifier) {
         Row(
             Modifier
+                // 命中区下限 44dp（与 GlassIconButton / MiniBarButton 同档）：
+                // 胶囊视觉高度由 Body 行高 + 6dp padding 撑出（约 30dp），而它是
+                // 「玻璃强度 / 动效强度」这类行**唯一**的可点区域——整行没有 onClick，
+                // 30dp 的命中区在拇指操作下偏小。sizeIn 只抬下限，视觉尺寸不变。
+                .sizeIn(minHeight = 44.dp)
                 .clip(RoundedCornerShape(R.Full))
                 // lo 填充 + strokeSoft 描边：与 GlassIconButton 同一套「可点控件的边界定义」，
                 // 但形状取胶囊（它承载文字，不承载图标）
@@ -277,20 +283,18 @@ private fun <T> DropdownList(
         // 下拉列表浮在设置行**之上**，是真正的悬浮层 → Hi 档（描边 + 顶线全保留），
         // 与面板同一逻辑。
         //
-        // ## 必须传 scrim（模拟器全量测试发现的透字缺陷，2026-11-08）
+        // ## 从「chromeScrim 重遮罩」改为「靠模糊挡字」（2026-11-21 用户反馈）
         //
-        // 初版这里没传 scrim，注释写的是「它下面就是设置页本身，不需要压透字」——
-        // 这个判断是错的。实测下拉展开时，下层设置行文字（「动效强度」「过渡动画的快慢…」）
-        // 直接透上来与列表项文字重叠，可读性明显受损。
+        // 旧实现 `scrim = glass.chromeScrim`（深色 #1A1A24 @0.72 / 浅色 #F2F2F6 @0.66）。
+        // 那是本仓最早期的透字兜底方案，代价是浮层读作一块**实色板**——用户明确说
+        // 「我要的是模糊，不是遮挡」，并要求「下拉浮层也一样改」。
         //
-        // 错在哪：本项目自己那套 `chromeScrim` 的推导结论就是「haze blur 生效 ≠ 透字不可辨，
-        // 必须靠 scrim 压对比」。而下拉浮层比 chrome **更需要**它——chrome 压的是滚动列表，
-        // 下拉压的是**同样带文字的设置行**，两者都是高对比文字，叠加后字形互相干扰。
+        // 现在：blurVeil = Popup（24dp 均匀模糊、tint 只定调），遮挡职责交给模糊。
+        // **不传 scrim**：GlassSurface 在 blurVeil 生效时会忽略它，但显式不传更清楚。
         //
-        // 用 `chromeScrim` 同一档：语义都是「悬浮在别的内容之上、需要压掉背景文字」。
-        // 不新开 token，因为这正是 chromeScrim 定义要解决的场景。
-        blur = GlassLevel.Hi,
-        scrim = glass.chromeScrim,
+        // 为什么 Popup 不用 progressive：面积只有 ~200×150dp，竖向渐变在这个尺度上
+        // 看不出方向感，反而像「上清下糊」的瑕疵（见 BlurVeilKind.Popup 的注释）。
+        blurVeil = BlurVeilKind.Popup,
     ) {
         Column(Modifier.padding(vertical = 6.dp)) {
             options.forEach { option ->

@@ -17,6 +17,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -31,6 +32,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
@@ -77,6 +79,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -110,6 +113,7 @@ import com.local.music.core.ui.components.LocalModalState
 import com.local.music.core.ui.components.LocalSystemActions
 import com.local.music.core.ui.components.SongActionsSheet
 import com.local.music.core.ui.components.LocalPlayerFlight
+import com.local.music.core.ui.components.PlayerArtworkCache
 import com.local.music.core.ui.components.PlayerFlight
 import com.local.music.core.ui.components.ProgressTrack
 import com.local.music.core.ui.components.QueueSheet
@@ -117,6 +121,7 @@ import com.local.music.core.ui.components.SheetAction
 import com.local.music.core.ui.components.asTime
 import com.local.music.core.ui.components.glassHaze
 import com.local.music.core.ui.components.pressScale
+import com.local.music.core.ui.components.skeuomorphKey
 import com.local.music.core.ui.components.trackFlight
 import com.local.music.core.ui.state.AppState
 import com.local.music.core.ui.state.RepeatMode
@@ -236,19 +241,20 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
     // seek 反馈（「-10s」/「+10s」胶囊）的可见内容与时间戳。
     // 单独成 State 是因为它要在**手势结束后**驱动一个小浮层：若写进别的高频状态，
     // 整片舞台会跟着每帧重组（本仓的既有红线，见 ProgressTrack 注释）。
-    var seekHint by remember { mutableStateOf<String?>(null) }
+    // 文案与可见性**分成两个 State**：退场淡出期间 AnimatedVisibility 的内容仍在组合，
+    // 若把文案本身清成 null，Text 会立刻变成空串——用户看到「-10s」瞬间消失、
+    // 剩一个空黑胶囊再淡出 300ms。文案保留到下一次 seek 覆盖，只切可见性。
+    var seekHint by remember { mutableStateOf("") }
+    var seekHintVisible by remember { mutableStateOf(false) }
     // 用自增 token 而不是 Boolean：连续两次同类 seek（连划两下）都必须重新计时，
     // 而 `LaunchedEffect(hint)` 在文案相同时**不会重启** → 第二次的胶囊会提前消失。
     var seekHintToken by remember { mutableIntStateOf(0) }
     LaunchedEffect(seekHintToken) {
-        if (seekHint == null) return@LaunchedEffect
+        if (seekHintToken == 0) return@LaunchedEffect
         delay(600)
-        // 到点无条件清空：本 effect 的 key 就是 token，token 一变旧 effect 立刻被
+        // 到点只收可见性：本 effect 的 key 就是 token，token 一变旧 effect 立刻被
         // 取消（不会走到这里），所以能执行到这一行就说明「没有更新的 seek 接管」。
-        // （第一版写过 `if (seekHintToken == seekHintToken)` 这种恒真自比较，
-        //   纯属残留——真要判代次需要把旧 token 捕获成局部 val，而上面的取消语义
-        //   已经免费提供了同样的保证。）
-        seekHint = null
+        seekHintVisible = false
     }
 
     /**
@@ -317,11 +323,13 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         totalDx <= -seekThreshold -> {
                             state.seekBy(-SEEK_STEP_SEC)
                             seekHint = "-${SEEK_STEP_SEC.toInt()}s"
+                            seekHintVisible = true
                             seekHintToken++
                         }
                         totalDx >= seekThreshold -> {
                             state.seekBy(SEEK_STEP_SEC)
                             seekHint = "+${SEEK_STEP_SEC.toInt()}s"
+                            seekHintVisible = true
                             seekHintToken++
                         }
                     }
@@ -638,6 +646,24 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         // 照抄替身层 PlayerFlightOverlay 已验证的范式。原先 offset/size/shadow/
                         // border 全部吃组合期值，模式切换 500ms 内整个舞台逐帧重组。
                         val coverInteraction = remember { MutableInteractionSource() }
+                        // ── 大封面高分辨率补解码 ──
+                        //
+                        // 全库缩略图管线长边只有 160–319px（列表/迷你条/通知栏够用），
+                        // 而这块封面可达 360dp = 1080px @3x —— 直接用缩略图等于把 App 的
+                        // 视觉主角放大 3–4 倍插值。这里按需从当前曲音频重取内嵌封面解到
+                        // 1080px（PlayerArtworkCache，只缓存最近 2 张，磁盘管线不动）。
+                        //
+                        // 先画缩略图再换高清图：同一张图的内容不变，只是精度提升，
+                        // 不需要交叉淡化；解码在 IO，不卡舞台。无内嵌封面（目录 cover.jpg
+                        // 来源）时 load 返回 null，回落缩略图，与改造前一致。
+                        val coverContext = LocalContext.current
+                        var hiResCover by remember(song.mediaUri) {
+                            mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null)
+                        }
+                        LaunchedEffect(song.mediaUri) {
+                            hiResCover = PlayerArtworkCache.peek(song.mediaUri)
+                            PlayerArtworkCache.load(coverContext, song.mediaUri)?.let { hiResCover = it }
+                        }
                         Box(
                             Modifier
                                 .offset {
@@ -674,9 +700,15 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                     // 旧实现把 coverShape 放在组合期，这两个 modifier 每帧
                                     // 重建 Modifier 链 → 整段舞台重组。
                                     val t = modeT.value
-                                    shape = RoundedCornerShape(lerp(R.Player28.dp, R.Card18.dp, t))
+                                    // 本轮重设计：大封面圆角 28 → 16。
+                                    // 28dp 读作「一片贴在空中的曲面」（玻璃语言），
+                                    // 而 16dp 读作「一张有厚度的封套」——这正是拟物方案要的隐喻。
+                                    // 歌词端小窗同步收到 10（原本 18），保持两端弧线不跳变。
+                                    shape = RoundedCornerShape(lerp(16.dp, 10.dp, t))
                                     clip = true
-                                    shadowElevation = lerp(18.dp, 10.dp, t).toPx()
+                                    // 投影从 18dp 收到 10dp：封套贴在桌面上，不是悬浮在空中。
+                                    // 过大的投影会把它读成「浮起来的卡片」而不是「放着的唱片套」。
+                                    shadowElevation = lerp(10.dp, 6.dp, t).toPx()
                                 }
                                 .drawWithContent {
                                     // 描边改绘制期：**几何必须与 Modifier.border 逐像素一致**——
@@ -686,12 +718,14 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                     drawContent()
                                     val t = modeT.value
                                     val sw = 1.dp.toPx()
+                                    // 描边圆角必须与上面 graphicsLayer 的 shape 严格同源，
+                                    // 否则描边与裁切边缘在四角错开（改一处漏一处即露馅）。
                                     drawRoundRect(
                                         color = glass.stroke,
                                         topLeft = Offset(sw / 2f, sw / 2f),
                                         size = Size(size.width - sw, size.height - sw),
                                         cornerRadius = CornerRadius(
-                                            lerp(R.Player28.dp, R.Card18.dp, t).toPx(),
+                                            lerp(16.dp, 10.dp, t).toPx(),
                                         ),
                                         style = Stroke(sw),
                                     )
@@ -704,7 +738,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                 // 内层传 RectangleShape 避免把组合期 shape 带进 ArtThumb
                                 // ——与替身层同一做法（见 PlayerFlightOverlay 的封面替身）
                                 RectangleShape,
-                                bitmap = song.coverBitmap,
+                                bitmap = hiResCover ?: song.coverBitmap,
                                 artworkUri = song.artworkUri,
                             )
                         }
@@ -743,13 +777,13 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                         // 所以这里 contentDescription 留 null（读屏用户通过 TalkBack 的
                         // seek 无障碍动作走另一条路，见 LyricLineRow 的 semantics）。
                         androidx.compose.animation.AnimatedVisibility(
-                            visible = seekHint != null,
+                            visible = seekHintVisible,
                             enter = fadeIn(),
                             exit = fadeOut(),
                             modifier = Modifier.align(Alignment.Center),
                         ) {
                             Text(
-                                seekHint.orEmpty(),
+                                seekHint,
                                 color = LocalGlassColors.current.textPrimary,
                                 // Title（20 Bold）：足够在封面/歌词之上被读到，又不至于
                                 // 盖住内容（胶囊只是瞬态回执，不是内容）
@@ -923,6 +957,7 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                                     undoClearCount = if (state.canUndoClearUpNext) state.undoClearUpNextCount else 0,
                                     onUndoClearUpNext = state::undoClearUpNext,
                                     onDismissUndo = state::dismissUndoClearUpNext,
+                                    undoWindowMs = state::undoClearRemainingMs,
                                 )
                             }
                         },
@@ -952,23 +987,17 @@ fun PlayerScreen(state: AppState, modifier: Modifier = Modifier) {
                     .graphicsLayer { alpha = sharedAlpha() },
                 // 液态档（v11，第四档玻璃）：这块控制台是「液态层」的第一处落点。
                 //
-                // 为什么是它：它背后是封面位图 + 舞台（无滚动列表文字穿越），是本 App
-                // 唯一一块「玻璃后面有照片」的常驻面板——液态档的方向性斜面与 specular
-                // 只有在背后有内容时才读得出立体感，压在纯色极光上会像一圈没必要的亮边。
+                // 本轮重设计（2026-11）：控制台从 Liquid 降为 Md，并显式声明拟物角色。
                 //
-                // ⚠️ 对端：PlayerFlightOverlay 的 FlightGlassPanel 落点端必须同为 Liquid
-                // （tint 走 liquidHazeTint、描边/顶线淡出、斜面/specular 淡入，模糊 26dp）。
-                // 改这里的 level/blur/liquidMotion 必须同步改那边，否则落地交叉淡化窗内
-                // 玻璃明度/色相/描边会跳变（正是替身层 KDoc 警告的「差一档」）。
-                level = GlassLevel.Liquid,
-                shape = RoundedCornerShape(R.Player28.dp),
-                // 模糊档取 Liquid（半径与 Hi 同 26dp）： tint 走 Liquid 的「低浓度白霜+accent
-                // 色相」配方（见 HazeGlass.glassHaze），避免纯白霜把控制台罩成奶白/灰平板。
-                blur = GlassLevel.Liquid,
-                // 光影驱动：绑**播放进度**（已有连续值，零新增基础设施）。
-                // 传 lambda 而不是解构后的 Float —— 它在绘制期逐帧读取，不触发重组；
-                // 传值会让整块控制台在播放中每帧重组（本仓反复点名的错误写法）。
-                liquidMotion = { state.progressFraction },
+                // 为什么降档：Liquid 的方向性斜面 + specular 让控制台成为全屏第二个视觉焦点，
+                // 与封面争夺注意力。新方案里**封面是唯一主角**，控制台是它的底座。
+                // Md 的「一层描边、无顶线」正好表达「坐在地上」而不是「浮在空中」。
+                level = GlassLevel.Md,
+                shape = RoundedCornerShape(20.dp),
+                blur = GlassLevel.Md,
+                // 拟物档：控制台是**机身面板**（Body）——平放、不投影、只有一圈薄边。
+                // 若给它 Sleeve，它会带着大投影浮在封面上方，与「封面在前、控制在后」相反。
+                skeuoRole = com.local.music.core.ui.theme.SkeuoRole.Body,
             ) {
                 Column(
                     Modifier.padding(
@@ -1338,6 +1367,15 @@ private fun LyricRail(
             }
         }
 
+        // 淡出带内的行**不可见但仍可点**：positionalFade 只作用于 graphicsLayer 的 alpha，
+        // 而 alpha 不挡触摸。于是点「看起来是空白」的舞台顶部/底部会跳到某一句歌词，
+        // 用户完全无法理解播放为什么突然换了位置。这里在**事件期**按同一套衰减判据拦掉。
+        // 读 railOffset/lineCenters 发生在点击回调里，不建立组合期订阅 → 不引入逐帧重组。
+        fun tappable(index: Int): Boolean {
+            val center = lineCenters[index] ?: return false
+            return positionalFade(railOffset.value + center, stageHeightPx, topGuardPx) > 0.15f
+        }
+
         // 歌词 rail：自定义 Layout——子行一律以无界高度测量。
         // （Column.fillMaxSize 会把溢出行的剩余高度压成 0，真实 .lrc 三四十行时"后半部分无显示"；
         //   这里测出内容总高后按 (舞台高−内容高)/2 居中放置，行坐标仍是舞台坐标系，
@@ -1353,7 +1391,7 @@ private fun LyricRail(
                         positionalAlphaProvider = {
                             positionalFade(railOffset.value + (lineCenters[index] ?: 0f), stageHeightPx, topGuardPx)
                         },
-                        onClick = { onSelect(index) },
+                        onClick = { if (tappable(index)) onSelect(index) },
                         modifier = Modifier.onGloballyPositioned { coords ->
                             lineCenters[index] = coords.positionInParent().y + coords.size.height / 2f
                             // 同一次回调里盖几何戳：坐标与它成立时的舞台几何必须原子一致，
@@ -1515,6 +1553,43 @@ private fun PlayPauseButton(
 ) {
     val glass = LocalGlassColors.current
     val interactionSource = remember { MutableInteractionSource() }
+    // 拟物档：主播放键是**主题色实体按键**（本轮重设计）。
+    //
+    // 上一版拟物档的播放键与玻璃档完全一样（半透明渐变 + 描边），因为 GlassSurface 的
+    // 拟物分支只处理容器，这个按钮是手绘的。新方案要求它是整屏唯一的高饱和实体按键：
+    // 树脂质感、主题色、按下下沉 2dp。这是「播放键是主角」的唯一可靠表达。
+    val skeuoMode = com.local.music.core.ui.theme.LocalVisualStyle.current ==
+        com.local.music.core.ui.state.VisualStyle.Skeuomorph
+    val palette = com.local.music.core.ui.theme.LocalAuroraPalette.current
+    if (skeuoMode) {
+        val skeuo = com.local.music.core.ui.theme.LocalSkeuomorphColors.current
+        val pressed by interactionSource.collectIsPressedAsState()
+        val onSeed = com.local.music.core.ui.theme.onSeedColor()
+        Box(
+            modifier
+                .size(68.dp)
+                .skeuomorphKey(
+                    skeuo = skeuo,
+                    faceColor = palette.seed,
+                    pressed = pressed,
+                    shape = CircleShape,
+                )
+                .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+                .semantics {
+                    this.role = Role.Button
+                    contentDescription = if (playing) "暂停" else "播放"
+                    stateDescription = if (playing) "正在播放" else "已暂停"
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                if (playing) GlassIcons.Pause else GlassIcons.Play,
+                contentDescription = null,
+                Modifier.size(28.dp), tint = onSeed,
+            )
+        }
+        return
+    }
     Box(
         modifier
             // A6 未落地（有意跳过，非遗漏）：pressScale 的 animationSpec 在 Glass.kt 内部写死
@@ -1694,6 +1769,9 @@ private fun PlayModeButton(
     Box(
         modifier
             .pressScale(interactionSource, pressed = 0.88f)
+            // 热区 44dp：旧实现是 20dp 图标 + 6dp padding = 32dp，低于全 App 下限。
+            // 四态按钮需要连点遍历，命中区偏小会让「多点一档」变成常见误操作。
+            .sizeIn(minWidth = 44.dp, minHeight = 44.dp)
             .clickable(interactionSource = interactionSource, indication = null) {
                 state.cyclePlayMode()
                 onModeChanged(mode.next().label)
@@ -1792,6 +1870,11 @@ private fun ConsoleIcon(
     Box(
         modifier
             .pressScale(interactionSource, pressed = 0.88f)
+            // 热区 44dp（与 GlassIconButton / MiniBarButton 同一下限）：旧实现只有
+            // 图标 + 6dp padding（收藏 33dp / 队列 32dp / 上一首下一首 40dp），
+            // 而这些是播放页最高频的控制键，拇指操作下明显偏小。
+            // sizeIn 只抬布局下限，图标视觉尺寸与间距不变。
+            .sizeIn(minWidth = 44.dp, minHeight = 44.dp)
             .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
             // 语义挂在这个 Box 上（它就是 clickable 节点）：role=Button + 文案 + 可选状态。
             // 子 Icon 一律传 null，避免读屏把同一句话念两遍。
@@ -1799,8 +1882,8 @@ private fun ConsoleIcon(
                 this.role = Role.Button
                 this.contentDescription = contentDescription
                 if (stateDescription != null) this.stateDescription = stateDescription
-            }
-            .padding(6.dp),
+            },
+        contentAlignment = Alignment.Center,
     ) { content() }
 }
 

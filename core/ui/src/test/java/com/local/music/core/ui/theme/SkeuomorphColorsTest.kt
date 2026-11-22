@@ -178,6 +178,78 @@ class SkeuomorphColorsTest {
         assertNotEquals("中点 faceRecessed 也必须插值", dark.faceRecessed, mid.faceRecessed)
         assertNotEquals("中点 textSecondary 也必须插值", dark.textSecondary, mid.textSecondary)
         assertNotEquals("中点 textTertiary 也必须插值", dark.textTertiary, mid.textTertiary)
+        // 本轮新增的三个字段同样必须插值（漏掉会回落深色默认值）
+        assertNotEquals("中点 keyFace 也必须插值", dark.keyFace, mid.keyFace)
+        assertNotEquals("中点 wellFace 也必须插值", dark.wellFace, mid.wellFace)
+        assertNotEquals("中点 separator 也必须插值", dark.separator, mid.separator)
+    }
+
+    // ── 材质角色（2026-11 重设计）─────────────────────────────
+
+    @Test
+    fun `按键面比机身面更有实体感`() {
+        // 「按键」与「机身」必须真的不同——这是本轮重设计的核心：
+        // 上一版所有面共用 faceRaised，播放键和一张设置组卡长得一样厚。
+        assertTrue(
+            "深色：keyFace 应比 face 亮（按键从机身上抬起）",
+            dark.keyFace.luminance() > dark.face.luminance(),
+        )
+        assertTrue(
+            "浅色：keyFace 应比 face 亮（浅色机身按键靠更白表达抬起）",
+            light.keyFace.luminance() > light.face.luminance(),
+        )
+    }
+
+    @Test
+    fun `凹槽面比机身面更暗`() {
+        // 凹槽是「装东西的地方」，光进不去，必须比机身暗
+        assertTrue(
+            "深色：wellFace 应比 face 暗",
+            dark.wellFace.luminance() < dark.face.luminance(),
+        )
+        assertTrue(
+            "浅色：wellFace 应比 face 暗",
+            light.wellFace.luminance() < light.face.luminance(),
+        )
+    }
+
+    @Test
+    fun `机身面板的内高光必须极弱`() {
+        // 上一版内高光 6%（深）/50%（浅），每块面都像塑料注塑件。
+        // 新方案机身是平放的板子，面上不该有强烈的自上而下渐变。
+        assertTrue(
+            "深色 innerLight 应 ≤ 6%（当前 ${dark.innerLight.alpha}）",
+            dark.innerLight.alpha <= 0.06f,
+        )
+        assertTrue(
+            "浅色 innerLight 应 ≤ 40%（当前 ${light.innerLight.alpha}）",
+            light.innerLight.alpha <= 0.40f,
+        )
+    }
+
+    @Test
+    fun `分隔线是可辨但极弱的一层`() {
+        // 分隔线是「最弱的一层」：它只负责分组，不能抢过任何内容。
+        // 判据不是亮度差（那取决于机身明度），而是**对比度区间**：
+        // - 下界 > 1.05:1 —— 必须真的看得见，否则等于没画；
+        // - 上界 < 3:1 —— 必须远低于正文（正文 ≥ 4.5:1），否则会与内容争层级。
+        val darkSep = contrast(dark.separator, dark.face)
+        val lightSep = contrast(light.separator, light.face)
+        assertTrue("深色分隔线必须可辨（实测 $darkSep）", darkSep > 1.05f)
+        assertTrue("深色分隔线不能抢内容（实测 $darkSep）", darkSep < 3f)
+        assertTrue("浅色分隔线必须可辨（实测 $lightSep）", lightSep > 1.05f)
+        assertTrue("浅色分隔线不能抢内容（实测 $lightSep）", lightSep < 3f)
+    }
+
+    @Test
+    fun `材质角色枚举覆盖四种语义且缺一不可`() {
+        // 四个角色各自对应一种物理关系，删掉任何一个都会让某类表面无家可归
+        assertEquals("必须有四个角色", 4, SkeuoRole.entries.size)
+        assertEquals(
+            "角色集合必须恰好是 机身/按键/凹槽/封套",
+            listOf(SkeuoRole.Body, SkeuoRole.Key, SkeuoRole.Well, SkeuoRole.Sleeve),
+            SkeuoRole.entries.toList(),
+        )
     }
 
     // ── VisualStyle 枚举 ───────────────────────────────────

@@ -139,7 +139,13 @@ fun GlassTextField(
                     // 光标强调色用 auroraAccentColor()（浅色回退 seed）：seed3 过浅在浅色下近不可见
                     cursorBrush = SolidColor(auroraAccentColor()),
                     keyboardOptions = KeyboardOptions(imeAction = imeAction), // P3-76：不再硬编码 Search
-                    keyboardActions = KeyboardActions(onSearch = { onSearch?.invoke() }),
+                    // **onDone 必须与 onSearch 接同一个回调**：KeyboardActionRunner 按 imeAction
+                    // 取对应槽位，命名场景传的是 ImeAction.Done → 只注册 onSearch 时按「完成」
+                    // 落到 defaultKeyboardAction（仅收键盘），歌单没建、歌没加，用户以为提交了。
+                    keyboardActions = KeyboardActions(
+                        onSearch = { onSearch?.invoke() },
+                        onDone = { onSearch?.invoke() },
+                    ),
                     modifier = Modifier
                         .fillMaxWidth()
                         .focusRequester(focusRequester)
@@ -201,20 +207,31 @@ fun GlassTextField(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Spacer(Modifier.width(S.Gap8.dp))
                     val clearInteraction = remember { MutableInteractionSource() }
-                    Icon(
-                        GlassIcons.Close,
-                        // 读屏：可见图形没有文字，必须显式给描述。
-                        // 用「清空搜索内容」而不是「清除」——脱离上下文时后者依然歧义。
-                        contentDescription = "清空输入内容",
+                    // 热区 44dp、图标仍 18dp（与 GlassIconButton / MiniBarButton 同一下限）。
+                    // 旧写法把 clickable 直接挂在 18dp 的 Icon 上：清空查询的唯一快捷入口
+                    // 只有 18×18dp，拇指操作下极易落空——落到输入框里只是移动光标，
+                    // 用户以为「叉点了没反应」。输入框本身恒 44dp 高，热区不会撑高布局。
+                    Box(
                         Modifier
-                            .size(18.dp)
+                            .size(44.dp)
                             .clip(CircleShape)
                             .clickable(interactionSource = clearInteraction, indication = null) {
                                 onValueChange("")
                             }
-                            .semantics { this.role = Role.Button },
-                        tint = LocalGlassColors.current.textSecondary,
-                    )
+                            .semantics {
+                                this.role = Role.Button
+                                this.contentDescription = "清空输入内容"
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            GlassIcons.Close,
+                            // 语义已由外层可点 Box 承担，子 Icon 传 null 避免重复播报
+                            null,
+                            Modifier.size(18.dp),
+                            tint = LocalGlassColors.current.textSecondary,
+                        )
+                    }
                 }
             }
         }

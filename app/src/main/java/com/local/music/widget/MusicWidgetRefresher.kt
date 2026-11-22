@@ -2,7 +2,6 @@ package com.local.music.widget
 
 import android.content.Context
 import android.util.Log
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 播放状态变化 → 小部件刷新 的**唯一入口**。
@@ -16,7 +15,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * 所以这里提供一个**幂等、永不抛异常、可被高频调用**的入口：
  * 调用方只要在播放状态变化的回调里调 [onPlaybackStateChanged] 就行，
- * 其余（重复抑制、异常兜底、线程切换）全在这一层处理。
+ * 其余（重复抑制、异常兜底）在这一层处理，**线程切换与建连合并**在
+ * [MusicWidgetViews.refreshAll] 里处理（它异步派发到专用后台线程，立即返回）。
  *
  * ```kotlin
  * // MusicPlaybackService 里（示意，实际由 Lead 决定接哪条回调）
@@ -53,16 +53,6 @@ object MusicWidgetRefresher {
     private var lastRefreshAt = 0L
 
     /**
-     * 「正在判定是否要刷新」的互斥标记。
-     *
-     * **为什么需要**：刷新本身要建 controller，耗时几十毫秒；这期间若又来一个事件，
-     * 两个线程同时进 [refresh] 就会各建一个 controller（还可能互相覆盖 UI）。
-     * 用 CompareAndSet 直接**丢弃**并发的那一次即可 —— 播放状态是「最终一致」的，
-     * 丢掉的这次刷新与保留的那次读到的是同一状态。
-     */
-    private val inFlight = AtomicBoolean(false)
-
-    /**
      * 播放状态变化时调用。任何线程都可以调，任何异常都不会抛出去。
      *
      * 之所以「不抛」是硬要求：调用点在 `Player.Listener` 回调里，而 media3 的
@@ -78,14 +68,9 @@ object MusicWidgetRefresher {
         val now = android.os.SystemClock.uptimeMillis()
         // 抑制窗口内的重复事件直接丢弃（见类注释）
         if (now - lastRefreshAt < MIN_INTERVAL_MS) return
-        if (!inFlight.compareAndSet(false, true)) return
-        try {
-            // 进来才更新 lastRefreshAt：若 CAS 失败说明另一次刷新正在进行，
-            // 那一次会负责更新时间戳，这里不该改写它。
-            lastRefreshAt = now
-            MusicWidgetViews.refreshAll(app)
-        } finally {
-            inFlight.set(false)
-        }
+        lastRefreshAt = now
+        // 建连的互斥与合并在 refreshAll 内部（单线程执行器 + pending 标记）：
+        // 这里再套一层 CAS 只会把「异步派发」误当成「同步执行」，反而丢掉合并语义。
+        MusicWidgetViews.refreshAll(app)
     }
 }

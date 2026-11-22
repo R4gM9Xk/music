@@ -45,7 +45,7 @@ class MediaControllerEngine(
     private val context: Context,
 ) : PlayerEngine {
 
-    override var onPlayingChanged: ((Boolean) -> Unit)? = null
+    override var onPlayWhenReadyChanged: ((Boolean) -> Unit)? = null
     override var onFormatChanged: ((SongFormat?) -> Unit)? = null
     override var onMediaItemChanged: ((String?) -> Unit)? = null
     override var onAutoAdvanced: ((String?) -> Unit)? = null
@@ -100,7 +100,13 @@ class MediaControllerEngine(
                         consecutiveSkips = 0
                         autoSkipInFlight = false
                     }
-                    onPlayingChanged?.invoke(isPlaying)
+                    // **不向上回流 isPlaying**：它在 seek/缓冲/焦点瞬断时会瞬时变 false，
+                    // 宿主拿它当「用户暂停」会误撤定时、播放键图标也会闪。
+                    // 用户意图走下面的 onPlayWhenReadyChanged。
+                }
+
+                override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                    onPlayWhenReadyChanged?.invoke(playWhenReady)
                 }
 
                 override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -123,9 +129,14 @@ class MediaControllerEngine(
                     ) {
                         consecutiveSkips = 0
                     }
-                    // 完播计数（D1）：只有 AUTO 才算「播完上一首」——
-                    // 手动切歌(SEEK)/随机跳转/列表重建都不计，与「播放次数」的用户预期一致
-                    if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                    // 完播计数（D1）：AUTO 与 REPEAT 都算「播完上一首」——
+                    // 手动切歌(SEEK)/随机跳转/列表重建都不计，与「播放次数」的用户预期一致。
+                    // **REPEAT 必须计**：单曲循环下自然完播产生的是 REASON_REPEAT 而非 AUTO，
+                    // 漏掉它会让整夜循环的那首歌进不了「最常播放」（服务端定时两 reason 都认，
+                    // 演示模式 handleTrackEnd 也计数，三条路径必须同口径）。
+                    if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
+                        reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT
+                    ) {
                         onAutoAdvanced?.invoke(previous)
                     }
                     onMediaItemChanged?.invoke(mediaItem?.mediaId)

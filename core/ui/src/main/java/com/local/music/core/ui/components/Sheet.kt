@@ -8,6 +8,9 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,6 +28,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.ScrollState
@@ -56,11 +60,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.paneTitle
@@ -76,6 +81,7 @@ import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.S
 import com.local.music.core.ui.theme.LocalGlassColors
 import com.local.music.core.ui.theme.auroraAccentColor
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
@@ -575,23 +581,47 @@ private fun GlassSheetScaffold(
             //   'val maxHeight: Dp' cannot be called in this context with an implicit receiver
             // 接成普通 val 之后，下面任意深度的 lambda 都只是闭包捕获，不受接收者影响。
             val panelAvailableHeight = maxHeight
+            // ── 下拉收起手势的状态（见把手处的 KDoc）──
+            //
+            // 只做「松手判定」，不做面板跟随位移的视觉反馈：后者要把位移接进
+            // AnimatedVisibility 的 slideInVertically 偏移，而那条曲线正被入场/退场动画
+            // 独占——两个来源写同一个 translationY 会互相打架（入场时面板会从半空开始滑）。
+            // 收益（跟手的爽感）远小于风险（转场抖动），所以本轮只做判定：
+            // 视觉上面板不动、松手过阈值才收起。
+            var sheetDragOffset by remember { mutableStateOf(0f) }
+            // 阈值取面板可用高度的 1/4，钳在 [72dp, 160dp]：
+            // - 太小（横屏 244dp 面板的 1/4 只有 61dp）→ 轻微下滑就误关；
+            // - 太大（900dp 屏的 1/4 要拖 225dp）→ 拇指一次自然下滑到不了。
+            // 72–160dp 覆盖两者，是一次自然下滑的量级。
+            val sheetDragDismissPx = with(LocalDensity.current) {
+                (panelAvailableHeight * 0.25f).coerceIn(72.dp, 160.dp).toPx()
+            }
             // 面板本体：吃掉自身点击，避免透传到 scrim；imePadding 让输入面板浮在键盘之上
             Box(
                 Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .imePadding()
-                    // 语义清洗：这个 Box 存在的唯一目的是「吞掉打在面板上的点击」，
-                    // 防止透传到下面的 scrim 把面板关掉。它是纯手势挡板，
-                    // **有意无描述、且从无障碍树里摘掉**（clearAndSetSemantics {}）——
-                    // 否则读屏会在整片面板内容之前多插一个「无描述的可点节点」。
-                    // 注意 clearAndSetSemantics 只清本节点语义，子级（真正的菜单项）不受影响。
-                    .clearAndSetSemantics { }
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = {},
-                    ),
+                    // 手势挡板：这个 Box 存在的唯一目的是「吞掉打在面板上的点击」，
+                    // 防止透传到下面的 scrim 把面板关掉。
+                    //
+                    // **不能用 clearAndSetSemantics {}**：它清的是**整棵子树**的语义，
+                    // 而本 Box 是 GlassSurface（面板全部内容）的父节点——旧写法把标题、
+                    // 动作行、输入框、队列行全部从无障碍树里抹掉了，读屏在任意面板里
+                    // 只剩遮罩一个「关闭面板」节点，删除确认/加入歌单对盲用户完全不可达。
+                    //
+                    // 改用 Main 隧道消费：Main  pass 由子到父派发，子节点（动作行/列表滚动）
+                    // 先拿到事件，本层再把**仍未被消费**的事件吃掉，于是事件到不了 scrim。
+                    // pointerInput 不产生任何语义节点，正好满足「纯手势挡板、无描述」的原意。
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                awaitPointerEvent(PointerEventPass.Main)
+                                    .changes
+                                    .forEach { it.consume() }
+                            }
+                        }
+                    },
             ) {
                 GlassSurface(
                     modifier = Modifier
@@ -610,31 +640,88 @@ private fun GlassSheetScaffold(
                     // C4：面板顶部圆角改用 R.Player28 常量（原裸写 28.dp）。
                     // 底部两角为 0：面板贴在屏幕底边，圆角在那里没有可见意义。
                     shape = RoundedCornerShape(topStart = R.Player28.dp, topEnd = R.Player28.dp),
-                    blur = GlassLevel.Md,
+                    // ── 「模糊背景」而不是「用内衬盖住背景」（2026-11-21 用户反馈）──
+                    //
+                    // 用户要求「队列面板、下拉浮层也一样改」：与底部 chrome 统一到
+                    // 「靠模糊挡字」这套语言。
+                    //
+                    // 旧实现是 `blur = Md`（20dp）+ 下面 Column 里再叠一层
+                    // `.background(glassVeil())`（深色黑 32% / 浅色白 62%）。
+                    // 那层 veil 就是「遮挡」的来源——它把模糊结果整体压平，面板读作
+                    // 一块半透明实板，看不出背后被糊过。
+                    //
+                    // 现在：blurVeil = Panel（30dp、竖向 progressive、tint 只定调），
+                    // **下面 Column 的 veil 背景必须一起去掉**（否则等于没改）。
+                    blurVeil = BlurVeilKind.Panel,
                 ) {
-                    // 模态面板是最高层级：在玻璃压底之上再加一层内衬（深浅主题各配，
-                    // 浅色黑衬会蒙灰、压不住背景透入）。与底部 chrome 共用 glassVeil，
-                    // 按主题进度连续插值，避免主题渐变中点衬底「啪」一下变色。
-                    val veil = glassVeil()
+                    // 模态面板是最高层级：内衬已由 blurVeil = Panel 的 tint 承担
+                    // （2026-11-21：原实现这里再叠一层 glassVeil()，正是「遮挡感」的来源——
+                    //   深色黑 32% / 浅色白 62% 把模糊结果整体压平，面板读作半透明实板）。
+                    // **不要再往这里加 background**：加回去就等于撤销「模糊而非遮挡」这条修复。
+                    //
                     // 可用高度已在 GlassSurface 之前接成 panelAvailableHeight（见那里），
                     // 这里不再碰 maxHeight —— 本 lambda 的隐式接收者是 BoxScope 而非
                     // BoxWithConstraintsScope，读它会编译失败。
                     Column(
                         Modifier
                             .fillMaxWidth()
-                            .background(veil)
                             .navigationBarsPadding()
-                            .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap12.dp, bottom = S.Gap16.dp),
+                            // top 从 12 收到 4：把手命中区从 4dp 高变成 20dp 高（见下），
+                            // 4 + 20/2 = 14dp 恰好等于改前「12 + 4/2」的条中心 y，
+                            // 视觉位置零变化，只扩了命中区
+                            .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = 4.dp, bottom = S.Gap16.dp),
                     ) {
-                        // 顶部拖拽把手
+                        // 顶部拖拽把手 + 下拉收起手势。
+                        //
+                        // ## 为什么把手必须有手势（本轮修复）
+                        // 旧实现只画了一根 32×4dp 的圆角条，**全文件零拖拽手势**——它是纯装饰。
+                        // 而「顶部把手 = 可以往下拽」是用户对底部面板的既有心智（系统通知栏、
+                        // iOS sheet、几乎所有 Android 音乐 App 都是这样）。画了把手却拽不动，
+                        // 用户会先试两三次才放弃，然后把「这个面板关不掉」记成缺陷。
+                        //
+                        // 为什么不给整个面板挂拖拽：面板内部有 LazyColumn / 滚动列，整面拖拽
+                        // 会与滚动的手势竞争（向下滚列表 vs 向下拖面板无法区分）。把手是
+                        // **专属拖拽区**，它的存在意义正是「这里只负责关面板」。
+                        //
+                        // 热区 20dp 高 + 72dp 宽：把手视觉只有 32×4dp，命中区必须够大，
+                        // 但**不能**撑高布局——Column 的 top padding 是 12dp，这里把 4dp
+                        // 条放在 20dp 命中区正中，条的中心落在 12+10=22dp 处；
+                        // 改前是 12dp padding 后紧跟 4dp 条（中心 14dp）。
+                        // 所以同时把 Column 的 top padding 从 12 收到 4，让中心回到 14dp
+                        // ——视觉位置与改前逐像素一致，只多了命中区。
+                        val dismissDragState = rememberDraggableState { delta ->
+                            // 只累计向下位移；向上拖不产生任何效果（面板已经贴底，没有
+                            // 「往上展开」这个状态，允许向上拖会让手感变成「拖不动」）
+                            sheetDragOffset = (sheetDragOffset + delta).coerceAtLeast(0f)
+                        }
                         Box(
                             Modifier
                                 .align(Alignment.CenterHorizontally)
-                                .width(32.dp)
-                                .height(4.dp)
-                                .clip(RoundedCornerShape(2.dp))
-                                .background(LocalGlassColors.current.textTertiary.copy(alpha = 0.55f)),
-                        )
+                                .width(72.dp)
+                                .height(20.dp)
+                                .draggable(
+                                    state = dismissDragState,
+                                    orientation = Orientation.Vertical,
+                                    onDragStopped = { velocity ->
+                                        // 阈值双判据：位移过半（面板高度的 1/4 以上）
+                                        // 或**甩**出去（速度 > 1000px/s）——只看位移会
+                                        // 让快速轻扫失灵，只看速度会让慢拖无响应
+                                        val passed = sheetDragOffset > sheetDragDismissPx ||
+                                            velocity > 1_000f
+                                        sheetDragOffset = 0f
+                                        if (passed) onDismiss()
+                                    },
+                                ),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Box(
+                                Modifier
+                                    .width(32.dp)
+                                    .height(4.dp)
+                                    .clip(RoundedCornerShape(2.dp))
+                                    .background(LocalGlassColors.current.textTertiary.copy(alpha = 0.55f)),
+                            )
+                        }
                         // B1 标题层级倒挂修复：原为 12sp + textSecondary，比面板内的 15sp
                         // 动作行**还弱**——用户第一眼读到的是菜单项而不是「这个面板是什么」。
                         // 改 Heading（16 SemiBold）+ textPrimary：面板标题 > 动作行 > 段头，
@@ -876,6 +963,14 @@ fun QueueSheet(
     undoClearCount: Int = 0,
     onUndoClearUpNext: () -> Boolean = { false },
     onDismissUndo: () -> Unit = {},
+    /**
+     * 撤销窗口**剩余毫秒数**（由状态层按 deadline 现算）。
+     *
+     * 为什么面板需要它：`canUndoClearUpNext` 读的是注入时钟而非快照状态，
+     * 没有重组就不会重新求值——旧实现没有任何计时驱动，4 秒窗口过后撤销条仍挂着，
+     * 用户点它队列不恢复、条子消失、零提示。面板据此到期主动收条。
+     */
+    undoWindowMs: () -> Long = { 0L },
 ) {
     val listState = rememberLazyListState()
     val density = LocalDensity.current
@@ -887,6 +982,27 @@ fun QueueSheet(
     // 拖拽起点的陈旧基准，会把「接下来」段内的相对位置搬到错误的队列绝对索引上
     val liveSafeIndex by rememberUpdatedState(safeIndex)
     val upcomingCount = (queue.size - safeIndex - 1).coerceAtLeast(0)
+
+    // ── 撤销窗口的两条收口（都由面板驱动，状态层只负责真值）──
+    //
+    // 1. **到期收条**：canUndoClearUpNext 读注入时钟、非快照，无重组即不失效。
+    //    这里按状态层给的剩余时长计时，到点调 onDismissUndo 让条子消失。
+    // 2. **失败回执**：onUndoClearUpNext 返回 false = 现场已失效（超时/队列被改过）。
+    //    AppState 与 QueueSheet 的 KDoc 都要求给一句「队列已变化，无法撤销」，
+    //    旧调用点把 Boolean 直接丢了 —— 用户点了撤销，条子消失、队列没恢复、没有任何解释。
+    var undoFailed by remember { mutableStateOf(false) }
+    LaunchedEffect(undoClearCount) {
+        if (undoClearCount <= 0) return@LaunchedEffect
+        undoFailed = false // 新一次清空：清掉上一轮的失败提示
+        delay(undoWindowMs().coerceAtLeast(0L))
+        onDismissUndo()
+    }
+    LaunchedEffect(undoFailed) {
+        if (undoFailed) {
+            delay(2_500)
+            undoFailed = false
+        }
+    }
 
     // ── 「接下来」段顶部在列表内容坐标里的 y（px）──
     //
@@ -920,16 +1036,22 @@ fun QueueSheet(
     }
 
     // 拖拽状态：段内行数 = upcomingCount，段首位置由上面量得的 sectionTopPx 提供
+    //
+    // 内容版本指纹 = 「行下标 → 队列索引」映射的基准：只取「当前曲索引 + 当前曲 id」，
+    // 段内重排不会改变它，而自动切歌 / 引擎队列回流都会改变它 → 覆盖全部会导致错位的
+    // 场景，又不干扰刚落位的补间。
+    //
+    // **必须只有一份**：状态层（syncLive）与行级（beginDrag）拿它做相等比较来决定
+    // 「松手时基准有没有变」。两处各写一份表达式曾让一边是 Pair、另一边是 Int，
+    // 相等恒 false → endDrag 永远提前 return → 拖拽重排看着有让位预览、松手全部弹回。
+    val reorderVersion = safeIndex to queue.getOrNull(safeIndex)?.id
     val reorder = rememberReorderableLazyState(
         listState = listState,
         rowHeight = SongRowHeight,
         count = upcomingCount,
         sectionTopPx = { sectionTopPx },
         onMove = { from, to -> onMove(from + liveSafeIndex + 1, to + liveSafeIndex + 1) },
-        // 内容版本指纹 = 「行下标 → 队列索引」映射的基准（见原实现的详细推导）：
-        // 只取「当前曲索引 + 当前曲 id」，段内重排不会改变它，而自动切歌 / 引擎队列
-        // 回流都会改变它 → 覆盖全部会导致错位的场景，又不干扰刚落位的补间。
-        dataVersion = safeIndex to queue.getOrNull(safeIndex)?.id,
+        dataVersion = reorderVersion,
     )
 
     GlassSheetLazy(
@@ -939,18 +1061,24 @@ fun QueueSheet(
         // 撤销条走脚注槽（面板内、LazyColumn 之外）：
         // 它不能是列表 item —— 「接下来」段必须一直延伸到列表末尾，
         // 段内出现任何变高元素都会让拖拽的行数学（列表偏移 = 首可见下标 × 行高）失效。
-        footer = if (undoClearCount > 0) {
-            {
-                QueueUndoBar(
-                    count = undoClearCount,
-                    onUndo = {
-                        onUndoClearUpNext()
-                        onDismissUndo()
-                    },
-                )
+        footer = when {
+            undoFailed -> {
+                { QueueUndoFailedNote() }
             }
-        } else {
-            null
+            undoClearCount > 0 -> {
+                {
+                    QueueUndoBar(
+                        count = undoClearCount,
+                        onUndo = {
+                            // 返回值必须消费：false = 现场已失效，给用户一句解释，
+                            // 而不是让条子无声消失（见 AppState.undoClearUpNext 的 KDoc）
+                            if (!onUndoClearUpNext()) undoFailed = true
+                            onDismissUndo()
+                        },
+                    )
+                }
+            }
+            else -> null
         },
     ) {
         if (queue.isEmpty()) {
@@ -1065,7 +1193,7 @@ fun QueueSheet(
                 SongRow(
                     song = queue[queueIndex],
                     // 拖拽手势 + 让位/落位位移全挂在这一行的根节点上
-                    modifier = reorder.rowModifier(upcomingIndex, dataVersion = safeIndex),
+                    modifier = reorder.rowModifier(upcomingIndex, dataVersion = reorderVersion),
                     // ⚠ 拖拽期间**不可点击**：长按起拖后松手会同时触发 click（Compose 的
                     // clickable 与 detectDragGesturesAfterLongPress 会各自收到事件）。
                     // 原实现同样有此问题但被「拖完通常不在同一行」掩盖；Lazy 下更容易误触，
@@ -1099,7 +1227,7 @@ private fun QueueUndoBar(count: Int, onUndo: () -> Unit) {
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap8.dp, bottom = S.Gap8.dp),
+                .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = 4.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
@@ -1109,22 +1237,54 @@ private fun QueueUndoBar(count: Int, onUndo: () -> Unit) {
             )
             Spacer(Modifier.weight(1f))
             val undoInteraction = remember { MutableInteractionSource() }
-            Text(
-                "撤销",
-                // 用强调色而不是 destructive：撤销是**挽回**动作，与「删除」的风险
-                // 语义相反。红色在这里会让用户以为这一步也有风险。
-                color = auroraAccentColor(),
-                style = GlassText.CaptionMedium,
-                modifier = Modifier
+            // 热区 44dp（全 App 下限）：旧写法只有文字本体 + 4dp padding ≈ 36×24dp，
+            // 而它是一个**限时 4 秒**的动作——窗口本来就短，再难点中等于没有撤销。
+            // 用 sizeIn 而不是加大 padding：图标/文字视觉尺寸不变，只扩命中范围。
+            Box(
+                Modifier
+                    .sizeIn(minWidth = 44.dp, minHeight = 44.dp)
                     .pressScale(undoInteraction, pressed = 0.92f)
                     .clickable(interactionSource = undoInteraction, indication = null, onClick = onUndo)
                     // 读屏：可见文字只有「撤销」，脱离上下文同样歧义
                     .semantics {
                         this.role = Role.Button
                         this.contentDescription = "撤销清空，恢复 $count 首待播曲目"
-                    }
-                    .padding(horizontal = 6.dp, vertical = 4.dp),
-            )
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "撤销",
+                    // 用强调色而不是 destructive：撤销是**挽回**动作，与「删除」的风险
+                    // 语义相反。红色在这里会让用户以为这一步也有风险。
+                    color = auroraAccentColor(),
+                    style = GlassText.CaptionMedium,
+                )
+            }
         }
+    }
+}
+
+/**
+ * 撤销失败回执（占用撤销条同一个脚注槽）。
+ *
+ * 为什么必须有：`AppState.undoClearUpNext()` 返回 false 表示现场已失效
+ * （超时 / 队列在此期间被改过）。静默返回会让用户以为「撤销按钮坏了」——
+ * 他点了，条子消失，队列却没恢复，没有任何解释。
+ * 文案与 AppState KDoc 承诺的一致；用中性色而不是 destructive：
+ * 这不是操作失败，是「窗口已过」的事实陈述。
+ */
+@Composable
+private fun QueueUndoFailedNote() {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = S.Gap20.dp, end = S.Gap20.dp, top = S.Gap8.dp, bottom = S.Gap8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            "队列已变化，无法撤销",
+            color = LocalGlassColors.current.textTertiary,
+            style = GlassText.Caption,
+        )
     }
 }

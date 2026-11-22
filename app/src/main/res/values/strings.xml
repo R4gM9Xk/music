@@ -116,5 +116,6 @@
          此处若再定义会 Duplicate resources——两份描述文案取 widget_strings.xml 的详细版本） -->
     <string name="widget_label">音乐播放器</string>
     <string name="widget_not_playing">未在播放</string>
+    <string name="widget_unknown_title">未知歌曲</string>
 
 </resources>

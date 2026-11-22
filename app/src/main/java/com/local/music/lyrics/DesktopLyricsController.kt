@@ -147,7 +147,17 @@ class DesktopLyricsController(private val appContext: Context) {
                         if (sameView()) {
                             view.text = text
                             lastText = text // ← 唯一更新点：文字真的上屏了才认账
-                            view.animate().alpha(1f).setDuration(120).start()
+                            // 淡入目标必须是**用户选定的不透明度档**，不是硬编码 1f：
+                            // applyStyle/show 把窗口 alpha 设成 alphaOf(opacityStep)，
+                            // 而每次换行都走这条淡入——写死 1f 等于第一次换行就把
+                            // 「淡 60%」悄悄拉回全不透明，设置页却仍显示「淡」。
+                            view.animate()
+                                .alpha(
+                                    com.local.music.core.ui.components.DesktopLyricsStyle
+                                        .alphaOf(opacityStep) / 255f,
+                                )
+                                .setDuration(120)
+                                .start()
                         }
                     }.start()
                 }
@@ -265,6 +275,9 @@ class DesktopLyricsController(private val appContext: Context) {
                 @Suppress("ClickableViewAccessibility")
                 setOnTouchListener(
                     DragTouchListener(wm) { lp ->
+                        // 只在抬手/取消时落盘（见 DragTouchListener）：拖动过程中每个
+                        // ACTION_MOVE 都写一次 JSON 会在触摸主线程上做几十上百次磁盘 IO，
+                        // 低端机表现为歌词条拖动掉帧、跟手性差
                         DesktopLyricsPrefs.savePosition(appContext, lp.x, lp.y)
                     },
                 )

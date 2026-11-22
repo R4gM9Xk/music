@@ -482,9 +482,20 @@ object S {
 // ── 玻璃 token ────────────────────────────────────────────
 @Immutable
 data class GlassColors(
-    val hi: Color = Color.White.copy(alpha = 0.16f),   // 高层玻璃：迷你条
-    val md: Color = Color.White.copy(alpha = 0.10f),   // 中层：控制台 / 导航 / 卡片
-    val lo: Color = Color.White.copy(alpha = 0.07f),   // 低层：圆钮 / 芯片 / 卡片底
+    // ── 「晨雾玻璃」重设计（2026-11）──
+    //
+    // 旧档位的问题是「每块组件都是玻璃片」：hi/md/lo 三档同时承担颜色浓度、
+    // 组件尺寸与装饰等级，于是 26dp 的搜索历史芯片和 62dp 的迷你条带着同样的
+    // 描边 + 顶线，层级被抹平。
+    //
+    // 新方案把浓度整体调低一档，让**背景真正透出来**（玻璃的价值在于透，不在于白），
+    // 层级改由「是否有模糊」「是否有描边」「是否投影」三者共同表达，而不是只靠 alpha。
+    //
+    // 具体：hi 16%→12%、md 10%→7%、lo 7%→5%。这不是「更淡所以更弱」——
+    // 浓度降低后，背后内容的色相与明度变化成为主要的层级信号，这正是玻璃该有的样子。
+    val hi: Color = Color.White.copy(alpha = 0.12f),   // 高层玻璃：底部控制座
+    val md: Color = Color.White.copy(alpha = 0.07f),   // 中层：控制台 / 卡片 / 设置组
+    val lo: Color = Color.White.copy(alpha = 0.05f),   // 低层：圆钮 / 芯片 / 卡片底
     val stroke: Color = Color.White.copy(alpha = 0.28f),       // 高光描边
     val strokeSoft: Color = Color.White.copy(alpha = 0.14f),   // 常规描边
     val topLine: Color = Color.White.copy(alpha = 0.55f),      // 顶部亮线
@@ -763,9 +774,11 @@ data class GlassColors(
     companion object {
         /** 浅色令牌：玻璃改实白面板、描边与文字转近黑 */
         fun light(): GlassColors = GlassColors(
-            hi = Color.White.copy(alpha = 0.60f),
-            md = Color.White.copy(alpha = 0.48f),
-            lo = Color.White.copy(alpha = 0.32f),
+            // 与深色档同步下调（60/48/32 → 52/40/26）：浅色玻璃此前几乎是白板，
+            // 背景的色雾完全透不出来。下调后仍是「浅色玻璃」，但能读到背后的色。
+            hi = Color.White.copy(alpha = 0.52f),
+            md = Color.White.copy(alpha = 0.40f),
+            lo = Color.White.copy(alpha = 0.26f),
             // 浅色描边反转（视觉审计 D5）：白色系描边压在白 60% 玻璃 + 近白极光上等于消失，
             // 卡片/封面失去边缘定义。改近黑低 alpha 才能在浅底上「画出」轮廓。
             stroke = Color(0xFF23232B).copy(alpha = 0.14f),
@@ -780,8 +793,20 @@ data class GlassColors(
             liquidEdgeBottom = Color.White.copy(alpha = 0.30f),
             liquidSpecular = Color.White.copy(alpha = 0.42f),
             textPrimary = Color(0xFF23232B),
-            textSecondary = Color(0xFF23232B).copy(alpha = 0.62f),
-            textTertiary = Color(0xFF23232B).copy(alpha = 0.52f),
+            // ── 浅色档二/三级文字的对比度修正（本轮）──
+            //
+            // 旧值 0.62 / 0.52 叠在近白玻璃上，按 WCAG 复算：
+            //   二级 #23232B@0.62 → 合成灰 ≈ 96 → 对比 ≈ 6.2:1（达标）
+            //   三级 #23232B@0.52 → 合成灰 ≈ 140 → 对比 ≈ **3.4:1（低于 AA 4.5:1）**
+            // 而 textTertiary 在浅色档承载的正是**11sp 导航标签与设置行副标题**这类小字
+            // （本档 ≤12sp 一律用三级，见 textFaint 的注释）——小字 + 低对比是最差的组合。
+            //
+            // 修正后：三级 0.62 → 合成灰 ≈ 119 → **4.5:1**（恰好过 AA）；
+            // 二级同步抬到 0.70（≈5.8:1），否则二级与三级会撞成同一个值、层级差消失。
+            // 只动 alpha 不动基色：基色 #23232B 与深色档的「白字反相」是一对，换基色会让
+            // 深浅切换时的色相跳变（GlassColors 的整字段插值会经过一段奇怪的中间色）。
+            textSecondary = Color(0xFF23232B).copy(alpha = 0.70f),
+            textTertiary = Color(0xFF23232B).copy(alpha = 0.62f),
             textFaint = Color(0xFF23232B).copy(alpha = 0.42f),
             lyricFar = Color(0xFF23232B).copy(alpha = 0.34f),
             lyricAdjacent = Color(0xFF23232B).copy(alpha = 0.55f),

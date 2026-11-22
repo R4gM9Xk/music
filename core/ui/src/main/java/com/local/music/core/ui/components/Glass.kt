@@ -44,6 +44,7 @@ import com.local.music.core.ui.theme.LocalThemeFraction
 import com.local.music.core.ui.theme.LocalVisualStyle
 import com.local.music.core.ui.theme.R
 import com.local.music.core.ui.theme.SkeuoElevation
+import com.local.music.core.ui.theme.SkeuoRole
 import com.local.music.core.ui.theme.SkeuomorphColors
 import com.local.music.core.ui.theme.onSeedColor
 
@@ -427,6 +428,39 @@ fun GlassSurface(
      * 这与「Lo 靠形状自证、Liquid 用方向性斜面」的既有规则一致，不是遗漏。
      */
     strokeColor: Color? = null,
+    /**
+     * 用**「靠模糊挡字」配方**替代 [blur] 的常规层级模糊（默认 null = 零回归）。
+     *
+     * ## 为什么需要这个口子（2026-11-21 用户反馈，两轮迭代）
+     *
+     * 用户原话：「Chrome 太暗/亮了，遮住下方文字，我要的是**模糊**下方文字，不是遮挡」，
+     * 随后：「模糊程度再低一点」「队列面板、下拉浮层也一样改」。
+     *
+     * 旧配方是「haze tint + scrim」两层叠遮光，以 chrome 为例：
+     * | 层 | 深色 | 浅色 |
+     * |---|---|---|
+     * | haze tint（Hi = `hi`） | 白 16% | 白 **60%** |
+     * | `scrim = glassVeil()` | 黑 32% | 白 62% |
+     * | **合计** | ≈43% | ≈**85%** |
+     *
+     * 浅色档只剩 15% 的模糊内容能透出来——玻璃读作一块白板。模糊一直在跑，只是被遮死了。
+     *
+     * 传非 null 时切到 [blurVeil] 配方：tint 只定调、遮挡层整体去掉、遮挡职责交给模糊。
+     * **同时调用方必须传 `scrim = null`**——遮挡层是问题的另一半，只换 haze 不撤 scrim
+     * 等于没改（本实现会在 haze 真挂上时忽略 scrim，但调用点仍应显式传 null 以免误读）。
+     *
+     * @param blurVeil 档位（Chrome / Panel / Popup），见 [BlurVeilKind] 的对比表。
+     *   退化路径（无 haze 源）下仍走普通 fill + scrim，否则整块表面会变透明。
+     */
+    blurVeil: BlurVeilKind? = null,
+    /**
+     * 拟物材质角色（仅 [com.local.music.core.ui.state.VisualStyle.Skeuomorph] 生效）。
+     *
+     * 为什么需要显式声明：拟物档下「这个面是机身、按键、凹槽还是封套」决定了它该不该
+     * 投影、该不该有斜面、按下时该怎么动——这些语义无法从 [level] 推出。
+     * 默认 null 时按 level 推导（见函数体内），保证既有调用点零改动。
+     */
+    skeuoRole: SkeuoRole? = null,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val glass = LocalGlassColors.current
@@ -444,13 +478,35 @@ fun GlassSurface(
     val skeuoStyle = LocalVisualStyle.current
     if (skeuoStyle == com.local.music.core.ui.state.VisualStyle.Skeuomorph) {
         val skeuo = LocalSkeuomorphColors.current
+        // 角色决定画什么（见 [SkeuoRole]）：机身不投影、按键投影且按下位移、
+        // 凹槽反光方向相反、封套用静置投影。
+        //
+        // 未显式声明角色时的推导规则（保持既有调用点零改动）：
+        // - Liquid / Hi  → Sleeve（播放页控制台、迷你条这类「浮起来的实体」）
+        // - Lo           → Well（低层底、芯片：压在面上的浅槽）
+        // - Md           → Body（设置组卡、卡片：平放的机身面板）
+        val role = skeuoRole ?: when (level) {
+            GlassLevel.Hi, GlassLevel.Liquid -> SkeuoRole.Sleeve
+            GlassLevel.Lo -> SkeuoRole.Well
+            GlassLevel.Md -> SkeuoRole.Body
+        }
+        // 按下位移只对 Key 生效：读取 interactionSource 的按下态
+        val pressed by interactionSource.collectIsPressedAsState()
+        val isKey = role == SkeuoRole.Key
         // **投影挂在 clip 之前**：它要画到节点边界以外（这是「厚度」信号），
-        // 而 clip 会裁掉越界部分。这也是本仓「clip 是内部链第一笔」规则的唯一例外，
-        // 见 skeuomorphShadow 的 KDoc。
+        // 而 clip 会裁掉越界部分。这也是本仓「clip 是内部链第一笔」规则的唯一例外。
         var sm = modifier
-            .skeuomorphShadow(skeuo, shape)
+            .skeuomorphShadow(skeuo, shape, role, pressed = pressed && isKey)
             .clip(shape)
-            .skeuomorphFace(skeuo, raised = level != GlassLevel.Lo)
+            .skeuomorphFace(skeuo, role, pressed = pressed && isKey)
+        // 按键的按下位移：只移动自身，不缩放（缩放在长列表里读作抖动）。
+        // 用 graphicsLayer 的 translationY——它在绘制期生效，不参与布局。
+        if (isKey) {
+            val travel = if (pressed) SkeuoElevation.PressTravel.dp else 0.dp
+            sm = sm.graphicsLayer {
+                translationY = travel.toPx()
+            }
+        }
         if (onClick != null || onLongClick != null) {
             sm = sm.combinedClickable(
                 interactionSource = interactionSource,
@@ -458,6 +514,9 @@ fun GlassSurface(
                 onClick = onClick ?: {},
                 onLongClick = onLongClick,
             )
+            // 与玻璃档同一处补齐：拟物档的可点面按下同样必须有色层反馈。
+            // Key 角色已经有位移 + 压暗，不再叠一层底色（会过重）。
+            if (!isKey) sm = sm.rowPressFeedback(interactionSource)
         }
         Box(sm, content = content)
         return
@@ -475,7 +534,11 @@ fun GlassSurface(
     // 但 LocalHazeState 为 null 时 glassHaze 是 no-op（HazeGlass.kt 退化路径），
     // 此时必须回退到普通 background，否则整块面板变透明（底色直接透出）。
     var hazed = false
-    if (blur != null && LocalHazeState.current != null) {
+    if (blurVeil != null && LocalHazeState.current != null) {
+        // 「靠模糊挡字」配方：三个表面共用（见 BlurVeilKind 的对比表）
+        m = m.blurVeil(blurVeil)
+        hazed = true
+    } else if (blur != null && LocalHazeState.current != null) {
         m = m.glassHaze(blur)
         hazed = true
     }
@@ -510,7 +573,10 @@ fun GlassSurface(
     // 仍可辨）。scrim 必须是这一层**最后一笔**背景，玻璃的通透色调由 scrim 自身的
     // 深色 + 上方的描边/顶光线承担，不再靠白色 fill 提亮。
     if (!hazed) m = m.background(glass.fill(level))
-    if (scrim != null) m = m.background(scrim)
+    // blurVeil 生效时**不叠 scrim**：遮挡层正是用户抱怨的那一半（见 blurVeil 的 KDoc）。
+    // 但退化路径（无 haze 源 / 无 RenderEffect）必须保留——那时模糊恒为 0，不叠就等于
+    // 一条透明玻璃上压着列表文字，可读性直接崩掉。判据用 hazed（= 真的挂上了 haze）。
+    if (scrim != null && !(blurVeil != null && hazed)) m = m.background(scrim)
     // ── 装饰按层级递减（视觉审计 D3，本轮全 App 视觉收敛的最高杠杆点）──
     //
     // 改前：任何 level 一律 `border(strokeSoft) + glassTopLine(topLine)`。
@@ -550,91 +616,257 @@ fun GlassSurface(
             onClick = onClick ?: {},
             onLongClick = onLongClick,
         )
+        // 按压反馈（本轮补齐）：上面明确 `indication = null`（Material 的水波纹与玻璃
+        // 材质不兼容），而**这之后没有任何替代反馈**——于是全 App 所有可点玻璃面
+        // （专辑卡 / 歌单卡 / 搜索胶囊 / 搜索历史芯片 / 空歌单卡）按下时毫无变化，
+        // 与同仓 SettingRow（rowPressFeedback 底色层）、SheetAction（pressScale 0.98）、
+        // ConsoleIcon（pressScale 0.88）的按压语言完全断裂。
+        //
+        // 复用 SettingRow 那一档「底色层」而不是 pressScale：玻璃卡内部有封面与文字，
+        // 整块等比缩放会让内容一起位移（A6 已在 SettingRow 上踩过同一个坑）。
+        // 底色层只在绘制期读动画值，按下/松手不产生重组（rowPressFeedback 的 KDoc）。
+        //
+        // 顺序在 combinedClickable **之后**：rowPressFeedback 只读 interactionSource，
+        // 而 interactionSource 必须先被 clickable 订阅才会有按压事件。
+        m = m.rowPressFeedback(interactionSource)
     }
     Box(m, content = content)
 }
 
 /**
- * 拟物贴面的绘制修饰符：不透明面 + 面内高光渐变 + 方向性斜面。
+ * 拟物贴面的绘制修饰符：按**角色**选笔，而不是按「凸起/凹陷」二分。
+ *
+ * ## 为什么必须按角色（2026-11 重设计）
+ *
+ * 上一版只有 `raised: Boolean` 一个维度，于是设置组卡（Card）与播放键（Key）走同一条
+ * 绘制路径，只是尺寸不同——它们看起来一样厚，只是大小不同。这正是「整屏浮雕」的来源。
+ *
+ * 新方案由调用方声明意图（[SkeuoRole]），材质层按角色决定画什么：
+ *
+ * | 角色 | 面 | 斜面 | 面内高光 | 投影 |
+ * |---|---|---|---|---|
+ * | [SkeuoRole.Body] | face | **无**（只有一圈 1dp 边） | 极淡 | **无** |
+ * | [SkeuoRole.Key] | keyFace | 上亮下弱亮 | 有 | 短投影（由调用方挂） |
+ * | [SkeuoRole.Well] | wellFace | **上暗下亮** | 无 | **无**（凹槽不投外影） |
+ * | [SkeuoRole.Sleeve] | faceRaised | **无** | 有 | 静置投影（由调用方挂） |
+ *
+ * 关键判断：**机身面板不投影**。真实桌面上，一张平放的板子不会在自己周围投出影子——
+ * 只有离开表面的东西才会。上一版给所有面都挂投影，是「所有东西都浮起来」的元凶。
  *
  * ## 为什么在 `drawWithCache` 里建 Brush
  *
- * 本仓红线：绘制期零 Shader 分配（见 [com.local.music.core.ui.components.AuroraBackground]
- * 与 glassTopLine 的同款说明）。这里所有笔刷只依赖 (skeuo, size)，尺寸/配色变化才重算，
- * 帧间复用——与液态档的 liquidGlassDecor 完全同一套手法，只是画的东西不同。
+ * 本仓红线：绘制期零 Shader 分配。这里所有笔刷只依赖 (skeuo, size)，尺寸/配色变化才重算，
+ * 帧间复用——与液态档的 liquidGlassDecor 完全同一套手法。
  *
- * ## 层序（从下到上，不可颠倒）
- *
- * 1. **面**：不透明填充，覆盖一切背后内容。这一笔是拟物与玻璃的分水岭——
- *    只要它不透明，背后有没有内容、糊没糊都不重要了。
- * 2. **面内高光**：自顶部向下衰减的竖向渐变。真实物体的表面反射是**面状**的，
- *    只画边缘会读成「描了一圈线」而不是「有厚度的材质」。
- * 3. **斜面**：上沿 + 下沿各一笔（**凸起**：上亮下弱亮；**凹陷**：上暗下亮）。
- *    2dp 宽而不是 1dp：拟物的倒角是有宽度的，1dp 会读成描边。
- *
- * 投影**不在这里**画：它必须画在贴面**之外**（节点边界以远），而 drawBehind 会被
- * clip 裁掉。投影由调用方在 clip 之前挂（见 [skeuomorphShadow]）。
- *
- * @param raised true = 凸起（按钮/卡片）；false = 凹陷（凹槽/输入框内底/轨道）
+ * @param role 材质角色，见 [SkeuoRole]
+ * @param pressed 按下态（仅 [SkeuoRole.Key] 有意义）：按下时斜面反转、面压暗
  */
 private fun Modifier.skeuomorphFace(
     skeuo: SkeuomorphColors,
-    raised: Boolean,
+    role: SkeuoRole,
+    pressed: Boolean = false,
 ): Modifier = drawWithCache {
     val h = size.height.coerceAtLeast(1f)
     val w = size.width.coerceAtLeast(1f)
-    val bevelPx = 2.dp.toPx()
-    // 面内高光：从顶部衰减到透明，只覆盖上半 60% 高度。
-    // 为什么不是整高渐变：真实反射衰减很快，整高渐变会让下半部分也被提亮，
-    // 读作「整块都浮起来」——而我们需要的是「上面受光、下面背光」的方向感。
-    val innerBrush = Brush.verticalGradient(
-        0f to skeuo.innerLight,
-        0.6f to Color.Transparent,
-        endY = h,
-    )
-    // 斜面笔刷：横向渐变，两端渐隐（避免在圆角处与弧线交叉成直角）
+
+    // 面内高光：只有「有厚度的实体」（Key / Sleeve）才画。
+    // Body 是平放的机身，面上不该有自上而下的渐变；Well 是凹的，光不会照进底部。
+    val drawInner = role == SkeuoRole.Key || role == SkeuoRole.Sleeve
+    val innerBrush = if (drawInner) {
+        // 按下时内高光收弱：实体被压进机身，迎光面变小
+        val topAlpha = if (pressed) skeuo.innerLight.alpha * 0.4f else skeuo.innerLight.alpha
+        Brush.verticalGradient(
+            0f to skeuo.innerLight.copy(alpha = topAlpha),
+            // 上半 55% 衰减到透明：真实反射衰减很快，整高渐变会读作「整块浮起」
+            0.55f to Color.Transparent,
+            endY = h,
+        )
+    } else {
+        null
+    }
+
+    val bevelPx = 1.5.dp.toPx()
     val sideInset = w * 0.06f
-    val topColor = if (raised) skeuo.bevelTop else skeuo.recessTop
-    val bottomColor = if (raised) skeuo.bevelBottom else skeuo.recessBottom
-    val topBrush = Brush.horizontalGradient(
-        listOf(Color.Transparent, topColor, Color.Transparent),
-        startX = sideInset, endX = w - sideInset,
-    )
-    val bottomBrush = Brush.horizontalGradient(
-        listOf(Color.Transparent, bottomColor, Color.Transparent),
-        startX = sideInset, endX = w - sideInset,
-    )
-    val faceColor = if (raised) skeuo.faceRaised else skeuo.face
+    // 斜面颜色按角色取：
+    // - Key：凸起（上亮下弱亮）；按下时反转成「被压平」——上沿失去高光
+    // - Well：凹陷（上暗下亮），方向与凸起相反
+    // - Body / Sleeve：不画斜面（Body 只画一圈细边，Sleeve 是纸张，边缘靠投影）
+    val (topColor, bottomColor) = when (role) {
+        SkeuoRole.Key -> if (pressed) {
+            skeuo.recessTop.copy(alpha = skeuo.recessTop.alpha * 0.5f) to
+                skeuo.recessBottom.copy(alpha = skeuo.recessBottom.alpha * 0.5f)
+        } else {
+            skeuo.bevelTop to skeuo.bevelBottom
+        }
+        SkeuoRole.Well -> skeuo.recessTop to skeuo.recessBottom
+        SkeuoRole.Body, SkeuoRole.Sleeve -> Color.Transparent to Color.Transparent
+    }
+    val drawBevel = role == SkeuoRole.Key || role == SkeuoRole.Well
+    val topBrush = if (drawBevel) {
+        Brush.horizontalGradient(
+            listOf(Color.Transparent, topColor, Color.Transparent),
+            startX = sideInset, endX = w - sideInset,
+        )
+    } else {
+        null
+    }
+    val bottomBrush = if (drawBevel) {
+        Brush.horizontalGradient(
+            listOf(Color.Transparent, bottomColor, Color.Transparent),
+            startX = sideInset, endX = w - sideInset,
+        )
+    } else {
+        null
+    }
+
+    // Body 的「边」：一圈 1dp 低对比线，用来把面板与背景分开，但不制造厚度
+    val bodyEdgeBrush = if (role == SkeuoRole.Body) {
+        Brush.verticalGradient(
+            listOf(skeuo.bevelTop.copy(alpha = skeuo.bevelTop.alpha * 0.5f), Color.Transparent),
+            endY = h,
+        )
+    } else {
+        null
+    }
+
+    val faceColor = when (role) {
+        SkeuoRole.Key -> if (pressed) {
+            // 按下时压暗一档：这是「按下去」的第二重信号（第一重是位移）
+            lerp(skeuo.keyFace, skeuo.faceRecessed, 0.35f)
+        } else {
+            skeuo.keyFace
+        }
+        SkeuoRole.Well -> skeuo.wellFace
+        SkeuoRole.Sleeve -> skeuo.faceRaised
+        SkeuoRole.Body -> skeuo.face
+    }
+
     onDrawBehind {
-        // 1. 面（不透明）
+        // 1. 面（不透明）——拟物与玻璃的分水岭
         drawRect(color = faceColor)
-        // 2. 面内高光
-        drawRect(brush = innerBrush)
-        // 3. 斜面：上沿 + 下沿各 bevelPx 宽
-        drawLine(topBrush, Offset(0f, bevelPx / 2f), Offset(w, bevelPx / 2f), bevelPx)
-        drawLine(bottomBrush, Offset(0f, h - bevelPx / 2f), Offset(w, h - bevelPx / 2f), bevelPx)
+        // 2. 面内高光（仅 Key / Sleeve）
+        innerBrush?.let { drawRect(brush = it) }
+        // 3. Body 的顶边：一条极淡的上亮渐变，不是完整描边
+        if (bodyEdgeBrush != null) {
+            drawRect(brush = bodyEdgeBrush, size = androidx.compose.ui.geometry.Size(w, 1.dp.toPx()))
+        }
+        // 4. 斜面（仅 Key / Well）
+        if (topBrush != null && bottomBrush != null) {
+            drawLine(topBrush, Offset(0f, bevelPx / 2f), Offset(w, bevelPx / 2f), bevelPx)
+            drawLine(bottomBrush, Offset(0f, h - bevelPx / 2f), Offset(w, h - bevelPx / 2f), bevelPx)
+        }
     }
 }
 
 /**
- * 拟物投影。
+ * 拟物主按键的绘制修饰符：**主题色实体键**（本轮新增）。
  *
- * **必须在 clip 之前挂**：它要画到节点边界以外，而 clip 会把越界部分裁掉。
- * 拟物的「厚度」信号主要就来自边界之外的投影，裁掉它等于取消这个风格。
+ * ## 为什么单独抽出来，而不复用 [skeuomorphFace]
  *
- * 用 androidx.compose.ui.draw.shadow 而不是自己画：它已经把「近/远两笔」拆成
- * ambientColor / spotColor（Material 的 elevation 模型），我们要的双笔阴影正好
- * 落在它的语义里。手写 drawBehind 需要自己算 blur 蒙版，而在 RenderEffect 之外
- * 没有低成本实现。
+ * 材质层的 Key 角色画的是**机身色**的按键（圆钮、开关滑块）——它们是设备的一部分，
+ * 与机身同族。而主播放键是**唯一一个被涂成主题色的部件**：它是整屏的视觉中心，
+ * 不能是「又一颗灰色小圆钮」。所以它需要一套独立的笔：
+ *
+ * 1. 面：`faceColor`（主题色）而不是 keyFace；
+ * 2. 内高光：顶部一层白 12%，让树脂有厚度；
+ * 3. 底边：一层暗色（不是亮色），表达「圆角转进侧面」；
+ * 4. 投影：短而紧，按下时归零 + 整体下移 [SkeuoElevation.PressTravel]。
+ *
+ * 这套笔与材质层的 Key 角色共享同一个物理模型，只是换了一套颜色来源。
+ *
+ * @param faceColor 按键面色（通常是 `palette.seed`）
+ * @param pressed 按下态：面压暗、内高光收弱、投影归零、整体下移
  */
-private fun Modifier.skeuomorphShadow(skeuo: SkeuomorphColors, shape: Shape): Modifier =
-    shadow(
-        elevation = SkeuoElevation.FarBlur.dp,
+@Composable
+fun Modifier.skeuomorphKey(
+    skeuo: SkeuomorphColors,
+    faceColor: Color,
+    pressed: Boolean,
+    shape: Shape,
+): Modifier {
+    // 投影必须挂在 clip 之前（要画到边界之外）
+    val shadowPart = shadow(
+        elevation = if (pressed) 0.dp else SkeuoElevation.KeyBlur.dp,
         shape = shape,
-        clip = false, // 由调用方紧接着 clip(shape)；这里再裁一次是重复工作
+        clip = false,
         ambientColor = skeuo.shadow,
         spotColor = skeuo.shadow,
     )
+    // 按下时面压暗 12%：与位移配合，形成「按进去了」的双重信号
+    val face = if (pressed) lerp(faceColor, Color.Black, 0.12f) else faceColor
+    return this
+        .then(shadowPart)
+        .clip(shape)
+        .drawWithCache {
+            val h = size.height.coerceAtLeast(1f)
+            // 内高光：顶部白 12% → 55% 处透明
+            val inner = Brush.verticalGradient(
+                0f to Color.White.copy(alpha = if (pressed) 0.05f else 0.12f),
+                0.55f to Color.Transparent,
+                endY = h,
+            )
+            // 底边：暗色而非亮色——圆角转向侧面时背光
+            val bottomBrush = Brush.horizontalGradient(
+                listOf(Color.Transparent, Color.Black.copy(alpha = 0.16f), Color.Transparent),
+                startX = size.width * 0.08f,
+                endX = size.width * 0.92f,
+            )
+            val bevelPx = 1.5.dp.toPx()
+            onDrawBehind {
+                drawRect(color = face)
+                drawRect(brush = inner)
+                drawLine(
+                    bottomBrush,
+                    Offset(0f, h - bevelPx / 2f),
+                    Offset(size.width, h - bevelPx / 2f),
+                    bevelPx,
+                )
+            }
+        }
+        .graphicsLayer {
+            translationY = if (pressed) SkeuoElevation.PressTravel.dp.toPx() else 0f
+        }
+}
+
+/**
+ * 拟物投影：**只有离开表面的东西才投影**（本轮重设计）。
+ *
+ * 上一版对所有凸起面都挂 [SkeuoElevation.FarBlur] 的投影，包括设置组卡与列表卡，
+ * 于是整屏每块东西都「浮」在背景上——那是廉价拟物最典型的症状。
+ *
+ * 现在按角色分档：
+ * - [SkeuoRole.Key]：短而紧（[SkeuoElevation.KeyBlur]），按下时归零；
+ * - [SkeuoRole.Sleeve]：静置的双层投影（近锐远柔）；
+ * - [SkeuoRole.Body] / [SkeuoRole.Well]：**完全不投影**。
+ *
+ * **必须在 clip 之前挂**：投影要画到节点边界以外，而 clip 会把越界部分裁掉。
+ */
+private fun Modifier.skeuomorphShadow(
+    skeuo: SkeuomorphColors,
+    shape: Shape,
+    role: SkeuoRole,
+    pressed: Boolean = false,
+): Modifier = when (role) {
+    // 按键：短投影，按下时收掉（东西被压进机身，不再高于表面）
+    SkeuoRole.Key -> shadow(
+        elevation = if (pressed) 0.dp else SkeuoElevation.KeyBlur.dp,
+        shape = shape,
+        clip = false,
+        ambientColor = skeuo.shadow,
+        spotColor = skeuo.shadow,
+    )
+    // 封套：静置的双层感——Compose 的 shadow 用同一 elevation 画 ambient/spot，
+    // 这里用远投影的半径，近投影的锐度由材质面的高光承担
+    SkeuoRole.Sleeve -> shadow(
+        elevation = SkeuoElevation.FarBlur.dp,
+        shape = shape,
+        clip = false,
+        ambientColor = skeuo.shadow.copy(alpha = skeuo.shadow.alpha * 0.7f),
+        spotColor = skeuo.shadow,
+    )
+    // 机身与凹槽：不投影
+    SkeuoRole.Body, SkeuoRole.Well -> this
+}
 
 /** 玻璃圆形按钮：40dp，lo 填充 + 细描边，按压 scale(.92)
  *
@@ -665,13 +897,18 @@ fun GlassIconButton(
     // 两者目的相同（边界 + 可点性），手段必须各自成立，所以这里分流而不是叠加。
     if (LocalVisualStyle.current == com.local.music.core.ui.state.VisualStyle.Skeuomorph) {
         val skeuo = LocalSkeuomorphColors.current
+        // 圆钮是**按键**角色（不是封套）：它要能被按下去，所以有短投影 + 按下位移。
+        // 上一版这里用 raised=true 的通用路径，与卡片同材质；现在用 Key 角色区分开。
+        val pressed by interactionSource.collectIsPressedAsState()
         Box(
             modifier
-                .pressScale(interactionSource)
                 .size(size)
-                .skeuomorphShadow(skeuo, CircleShape)
+                .skeuomorphShadow(skeuo, CircleShape, SkeuoRole.Key, pressed = pressed)
                 .clip(CircleShape)
-                .skeuomorphFace(skeuo, raised = true)
+                .skeuomorphFace(skeuo, SkeuoRole.Key, pressed = pressed)
+                .graphicsLayer {
+                    translationY = if (pressed) SkeuoElevation.PressTravel.dp.toPx() else 0f
+                }
                 .clickable(interactionSource = interactionSource, indication = null, onClick = onClick),
             contentAlignment = Alignment.Center,
             content = content,
@@ -719,7 +956,7 @@ fun GlassToggle(
     val skeuomorphToggle = LocalVisualStyle.current == com.local.music.core.ui.state.VisualStyle.Skeuomorph
     Box(
         modifier
-            .size(42.dp, 25.dp)
+            .size(46.dp, 28.dp)
             .then(
                 if (skeuomorphToggle) {
                     val skeuo = LocalSkeuomorphColors.current
@@ -729,12 +966,12 @@ fun GlassToggle(
                         // 但把它压成「凹槽里的色光」而不是「轨道本色」
                         .background(
                             androidx.compose.ui.graphics.lerp(
-                                skeuo.faceRecessed,
+                                skeuo.wellFace,
                                 palette.seed.copy(alpha = 0.85f),
                                 fraction,
                             ),
                         )
-                        .skeuomorphFace(skeuo, raised = false)
+                        .skeuomorphFace(skeuo, SkeuoRole.Well)
                 } else {
                     Modifier
                         .clip(track)
@@ -751,8 +988,8 @@ fun GlassToggle(
                 this.toggleableState = if (checked) ToggleableState.On else ToggleableState.Off
             },
     ) {
-        val thumbSize = 19.dp
-        val travel = 42.dp - thumbSize - 6.dp
+        val thumbSize = 22.dp
+        val travel = 46.dp - thumbSize - 6.dp
         Box(
             Modifier
                 .graphicsLayer { translationX = (3.dp + travel * fraction).toPx() }
@@ -764,8 +1001,8 @@ fun GlassToggle(
                         // 拟物滑块：凸起实体 + 投影（投影是「滑块高于轨道」的唯一信号）
                         val skeuo = LocalSkeuomorphColors.current
                         Modifier
-                            .skeuomorphShadow(skeuo, CircleShape)
-                            .skeuomorphFace(skeuo, raised = true)
+                            .skeuomorphShadow(skeuo, CircleShape, SkeuoRole.Key)
+                            .skeuomorphFace(skeuo, SkeuoRole.Key)
                     } else {
                         Modifier.background(androidx.compose.ui.graphics.lerp(Color.White, onSeed, fraction))
                     },

@@ -81,6 +81,14 @@ fun LibraryScreen(
     modifier: Modifier = Modifier,
     audioDenied: Boolean = false,
     onRequestAudioPermission: () -> Unit = {},
+    /**
+     * D2：导出 M3U（id, 标题, 曲目）——SAF 选择器由 app 层持有；null = 不提供入口。
+     *
+     * 曲库的「歌单」tab 长按卡片同样会打开集合操作面板，而「导出 M3U 歌单」那一行
+     * 只在接线时渲染。不接的话，同一张歌单卡在曲库长按没有导出、在歌单页长按有——
+     * 用户无法理解这个差别（本仓对「同动作不同入口行为不一致」的判据一贯是缺陷）。
+     */
+    onExportM3u: ((playlistId: String, title: String, tracks: List<DemoSong>) -> Unit)? = null,
 ) {
     // ── tab 与滚动位置：提升到 AppState（P2 修复）──
     //
@@ -183,6 +191,11 @@ fun LibraryScreen(
                     state.playCollection(tracks, title, shuffle, sourceTarget = target)
                     state.openPlayer()
                 },
+                // 与详情页同口径接线：未接线时 CollectionActionsSheet 会把「导出 M3U」
+                // 整行隐藏（它明确拒绝渲染一个点了没反应的菜单项）。漏传的话，
+                // 同一个歌单在曲库页长按没有导出、进详情页更多才有——同动作两入口两种能力。
+                // 注意形参是 **() -> Unit**（目标/标题/曲目由本闭包捕获）。
+                onExportM3u = onExportM3u?.let { export -> { export(target.id, title, tracks) } },
             )
         }
     }
@@ -264,7 +277,11 @@ fun LibraryScreen(
                         )
                     }
                 } else {
-                    items(songs, key = { it.id }) { song ->
+                    // 按 id 去重后再进 LazyColumn：key 必须唯一，重复 id 会直接抛
+                    // IllegalArgumentException 崩溃。搜索页早已这么做（P3-40），
+                    // 而曲库是**全量**列表、比重名过滤后的搜索结果更容易含重复条目，
+                    // 不能只有搜索自保、曲库裸奔。
+                    items(songs.distinctBy { it.id }, key = { it.id }) { song ->
                         SongRow(
                             song = song,
                             playing = song.id == state.currentSong.id,

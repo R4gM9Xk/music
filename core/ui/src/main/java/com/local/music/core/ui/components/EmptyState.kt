@@ -339,8 +339,10 @@ private fun CompactEmptyState(
  * 改 PlaylistCard 的圆角/封面比例/文字带内距时，这里要同步。正解是给 PlaylistCard
  * 加一个 `coverOverlay: @Composable BoxScope.() -> Unit?` 插槽，让本函数改回一次普通
  * 调用 —— 那需要动 `Lists.kt`，属下一轮。
- * 文字带内距 `top = 10.dp` 刻意与 PlaylistCard 保持一致而非归位到 12：两张卡在同一行
- * 并排，2dp 的高差会让文字带基线错开，而「两列等高」是 §11.1 已验收过的观感红线。
+ * 文字带内距现在**四处都是 S.Gap12**（与 PlaylistCard 逐项一致）：旧值 top=10.dp 声称
+ * 「刻意与 PlaylistCard 保持一致」，实际那边一直是 12dp —— 于是空卡与正常卡并排时
+ * 标题基线差 2dp，恰好违反了它自己援引的「两列等高」红线。注释与代码同时是错的，
+ * 这类「注释自证合理」的偏差只有逐像素量才看得出来。
  *
  * ## 不新增交互路径
  *
@@ -383,8 +385,9 @@ fun EmptyPlaylistCard(
                 Modifier
                     .fillMaxWidth()
                     .background(glass.lo)
-                    // top 10dp 与 PlaylistCard 逐字一致（理由见函数 KDoc「已知代价」）
-                    .padding(start = S.Gap12.dp, end = S.Gap12.dp, top = 10.dp, bottom = S.Gap12.dp),
+                    // 与 PlaylistCard 逐项一致（Lists.kt 的卡内 padding 是 S.Gap12）：
+                    // 旧值 10dp 让空态卡与正常卡并排时标题基线差 2dp，恰违反「两列等高」
+                    .padding(start = S.Gap12.dp, end = S.Gap12.dp, top = S.Gap12.dp, bottom = S.Gap12.dp),
             ) {
                 Text(
                     title, color = glass.textPrimary, style = GlassText.BodyMedium,

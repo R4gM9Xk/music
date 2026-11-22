@@ -48,8 +48,7 @@ internal data class WidgetState(
             durationMs = 0L,
         )
 
-        /** 兜底文案：曲目存在但元数据缺标题时**不要**显示空字符串（会让整行塌掉） */
-        private const val UNKNOWN_TITLE = "未知歌曲"
+        /** 兜底文案走 R.string.widget_unknown_title（见 [read]）：小部件在英文系统下也要可读 */
 
         /**
          * 从 controller 抠一份快照。controller 为 null（未连接 / 服务没起来）⇒ 空态。
@@ -58,8 +57,11 @@ internal data class WidgetState(
          * 任何一个 getter 都可能抛 IllegalStateException / DeadObjectException。
          * 小部件这种「后台随手被拉起」的场景撞上这个概率不低，不能让它冒到
          * AppWidgetHost 那边（那会表现为小部件卡在加载态）。
+         *
+         * [context] 只用于取本地化的兜底标题：小部件是桌面常驻可见面，
+         * 硬编码中文会让英文系统用户看到一句中文。
          */
-        fun read(controller: MediaController?): WidgetState {
+        fun read(context: android.content.Context, controller: MediaController?): WidgetState {
             if (controller == null) return EMPTY
             return runCatching {
                 val item = controller.currentMediaItem ?: return EMPTY
@@ -68,7 +70,9 @@ internal data class WidgetState(
                 val artist = metadata.artist?.toString()?.trim().orEmpty()
                 WidgetState(
                     hasCurrent = true,
-                    title = rawTitle.ifEmpty { UNKNOWN_TITLE },
+                    title = rawTitle.ifEmpty {
+                        context.getString(com.local.music.R.string.widget_unknown_title)
+                    },
                     artist = artist,
                     isPlaying = controller.isPlaying,
                     art = decodeArt(metadata.artworkData),

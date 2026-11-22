@@ -105,6 +105,7 @@
          失败（Lint 默认把 MissingTranslation 定为 error）。补齐后 lint 的 i18n 面清零。 -->
     <string name="widget_label">Music Player</string>
     <string name="widget_not_playing">Not playing</string>
+    <string name="widget_unknown_title">Unknown track</string>
     <string name="widget_desc_wide">4×1 playback bar: cover, title, previous / play-pause / next</string>
     <string name="widget_desc_square">4×2 cover version: large cover, title, progress and full controls</string>
     <string name="widget_label_wide">Music Bar</string>
