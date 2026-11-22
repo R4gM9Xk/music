@@ -1,9 +1,9 @@
 {
-  "versionCode": 8,
-  "versionName": "1.3.1",
-  "changelog": "优化底部玻璃通透质感，与播放队列面板统一；修复若干观感细节。",
+  "versionCode": 9,
+  "versionName": "1.3.2",
+  "changelog": "界面重设计：拟物与玻璃双材质重做，底部合并为统一控制底座，支持详情逐级返回",
   "apk": "https://gh-proxy.com/https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
   "apkMirror": "https://ghfast.top/https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
   "apkAlt": "https://raw.githubusercontent.com/R4gM9Xk/music/main/apk/app-release.apk",
-  "sha256": "e726845063f406a5d10331dc5df912060181d5eed0b75aa057031ee7ead8c53c"
+  "sha256": "9698454c04fa9d1c28132d63fc274daa5caeb07541c74d1557f5d6532b852140"
 }
